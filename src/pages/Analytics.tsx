@@ -1,10 +1,17 @@
 import Navbar from "@/components/Navbar";
 import MovementMap from "@/components/MovementMap";
+import VideoUpload from "@/components/VideoUpload";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Calendar, Download, Filter, Play, Pause, RotateCcw } from "lucide-react";
 import { useState } from "react";
+
+interface PathPoint {
+  x: number;
+  y: number;
+  time?: string;
+}
 
 const timelineData = [
   { time: "08:00", zone: "Офис", duration: "30 мин", type: "safe" },
@@ -16,7 +23,11 @@ const timelineData = [
 
 const Analytics = () => {
   const [isPlaying, setIsPlaying] = useState(false);
+  const [analyzedPath, setAnalyzedPath] = useState<PathPoint[] | undefined>(undefined);
 
+  const handleVideoAnalyzed = (coordinates: PathPoint[]) => {
+    setAnalyzedPath(coordinates);
+  };
   return (
     <div className="min-h-screen bg-gradient-dark">
       <Navbar />
@@ -57,52 +68,58 @@ const Analytics = () => {
           </div>
         </div>
 
-        {/* Map and Timeline */}
+        {/* Main content grid */}
         <div className="grid lg:grid-cols-4 gap-6">
           {/* Map */}
           <div className="lg:col-span-3 h-[500px]">
-            <MovementMap />
+            <MovementMap externalPath={analyzedPath} />
           </div>
           
-          {/* Timeline */}
-          <div className="p-6 rounded-2xl bg-gradient-card border border-border/50">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold">История</h3>
-              <div className="flex gap-1">
-                <Button 
-                  variant="ghost" 
-                  size="icon" 
-                  className="h-8 w-8"
-                  onClick={() => setIsPlaying(!isPlaying)}
-                >
-                  {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                </Button>
-                <Button variant="ghost" size="icon" className="h-8 w-8">
-                  <RotateCcw className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
+          {/* Right sidebar */}
+          <div className="space-y-6">
+            {/* Video Upload */}
+            <VideoUpload onVideoAnalyzed={handleVideoAnalyzed} />
             
-            <div className="space-y-4">
-              {timelineData.map((item, i) => (
-                <div key={i} className="relative pl-6 pb-4 last:pb-0">
-                  {/* Timeline line */}
-                  {i < timelineData.length - 1 && (
-                    <div className="absolute left-2 top-3 bottom-0 w-px bg-border" />
-                  )}
-                  
-                  {/* Dot */}
-                  <div className={`absolute left-0 top-1.5 h-4 w-4 rounded-full border-2 border-card ${
-                    item.type === "safe" ? "bg-analytics-safe" :
-                    item.type === "warning" ? "bg-analytics-warning" :
-                    "bg-analytics-danger"
-                  }`} />
-                  
-                  <div className="text-sm text-muted-foreground mb-1">{item.time}</div>
-                  <div className="font-medium mb-1">{item.zone}</div>
-                  <Badge variant="secondary" className="text-xs">{item.duration}</Badge>
+            {/* Timeline */}
+            <div className="p-6 rounded-2xl bg-gradient-card border border-border/50">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold">История</h3>
+                <div className="flex gap-1">
+                  <Button 
+                    variant="ghost" 
+                    size="icon" 
+                    className="h-8 w-8"
+                    onClick={() => setIsPlaying(!isPlaying)}
+                  >
+                    {isPlaying ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                  </Button>
+                  <Button variant="ghost" size="icon" className="h-8 w-8">
+                    <RotateCcw className="h-4 w-4" />
+                  </Button>
                 </div>
-              ))}
+              </div>
+              
+              <div className="space-y-4">
+                {timelineData.map((item, i) => (
+                  <div key={i} className="relative pl-6 pb-4 last:pb-0">
+                    {/* Timeline line */}
+                    {i < timelineData.length - 1 && (
+                      <div className="absolute left-2 top-3 bottom-0 w-px bg-border" />
+                    )}
+                    
+                    {/* Dot */}
+                    <div className={`absolute left-0 top-1.5 h-4 w-4 rounded-full border-2 border-card ${
+                      item.type === "safe" ? "bg-analytics-safe" :
+                      item.type === "warning" ? "bg-analytics-warning" :
+                      "bg-analytics-danger"
+                    }`} />
+                    
+                    <div className="text-sm text-muted-foreground mb-1">{item.time}</div>
+                    <div className="font-medium mb-1">{item.zone}</div>
+                    <Badge variant="secondary" className="text-xs">{item.duration}</Badge>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </div>
