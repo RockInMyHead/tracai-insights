@@ -31,7 +31,7 @@ const HeroSection = () => {
           
           {/* CTA Buttons */}
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16 animate-fade-in" style={{ animationDelay: "0.3s" }}>
-            <Link to="/analytics">
+            <Link to="/trajectory">
               <Button variant="hero" size="xl" className="gap-2">
                 Начать анализ
                 <ArrowRight className="h-5 w-5" />
@@ -79,6 +79,18 @@ const HeroSection = () => {
               <p className="text-muted-foreground">{feature.desc}</p>
             </div>
           ))}
+        </div>
+
+        {/* Footer note */}
+        <div className="mt-16 pt-8 border-t border-border/50">
+          <div className="text-center">
+            <p className="text-lg font-medium text-primary mb-2">
+              Специально для
+            </p>
+            <p className="text-2xl font-bold text-gradient">
+              Kerama Marazzi
+            </p>
+          </div>
         </div>
       </div>
     </section>

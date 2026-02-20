@@ -1,6 +1,5 @@
 import Navbar from "@/components/Navbar";
 import StatsCard from "@/components/StatsCard";
-import WorkersList from "@/components/WorkersList";
 import ActivityChart from "@/components/ActivityChart";
 import { Users, MapPin, AlertTriangle, Clock, Settings, Bell } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -43,18 +42,6 @@ const Dashboard = () => {
             icon={Users}
           />
           <StatsCard
-            title="Зон контроля"
-            value="12"
-            icon={MapPin}
-          />
-          <StatsCard
-            title="Нарушения сегодня"
-            value="2"
-            change="-5 к вчера"
-            changeType="positive"
-            icon={AlertTriangle}
-          />
-          <StatsCard
             title="Среднее время в зоне"
             value="47 мин"
             change="+8%"
@@ -67,9 +54,6 @@ const Dashboard = () => {
         <div className="grid lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
             <ActivityChart />
-          </div>
-          <div>
-            <WorkersList />
           </div>
         </div>
       </main>

@@ -1,73 +1,92 @@
-# Welcome to your Lovable project
+# TrackAI - Анализ траектории движения
 
-## Project info
+Интеллектуальная система анализа траектории движения с использованием компьютерного зрения и машинного обучения.
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+## 🚀 Возможности
 
-## How can I edit this code?
+- **Анализ траектории движения** из видео файлов
+- **Программная стабилизация** видео для точного анализа
+- **Множественная обработка** видео с разными пользователями
+- **Визуализация траекторий** на интерактивной карте
+- **Поддержка планов помещений** (изображения и PDF)
+- **Админ-панель** для мониторинга предприятия
+- **Экспорт результатов** анализа
 
-There are several ways of editing your application.
+## 🛠️ Технологии
 
-**Use Lovable**
+- **Frontend:** React, TypeScript, Vite
+- **UI Framework:** shadcn/ui, Tailwind CSS
+- **Backend:** FastAPI, Python
+- **Computer Vision:** OpenCV, Video Tracker
+- **Database:** JSON-based storage
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+## 📦 Установка и запуск
 
-Changes made via Lovable will be committed automatically to this repo.
+### Требования
+- Node.js 18+
+- Python 3.8+
+- npm или yarn
 
-**Use your preferred IDE**
+### Frontend
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+```bash
+# Установка зависимостей
+npm install
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
-
-Follow these steps:
-
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
-
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
-
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
+# Запуск в режиме разработки
 npm run dev
+
+# Сборка для продакшена
+npm run build
 ```
 
-**Edit a file directly in GitHub**
+### Backend
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+```bash
+# Переход в директорию backend
+cd backend
 
-**Use GitHub Codespaces**
+# Создание виртуального окружения
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+# или
+venv\Scripts\activate     # Windows
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+# Установка зависимостей
+pip install -r requirements.txt
 
-## What technologies are used for this project?
+# Запуск сервера
+python -m uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+```
 
-This project is built with:
+## 🎯 Использование
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+1. **Загрузите план помещения** (изображение или PDF)
+2. **Установите точку отсчета** кликом на плане
+3. **Добавьте видео** пользователей с именами
+4. **Запустите анализ** траекторий
+5. **Просмотрите результаты** на интерактивной карте
 
-## How can I deploy this project?
+## 📁 Структура проекта
 
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
+```
+trackAI/
+├── src/
+│   ├── components/     # React компоненты
+│   ├── pages/         # Страницы приложения
+│   ├── lib/           # Утилиты и API клиенты
+│   └── hooks/         # Пользовательские хуки
+├── backend/
+│   ├── main.py        # FastAPI приложение
+│   └── video_tracker/ # Модуль анализа видео
+├── public/            # Статические файлы
+└── docs/              # Документация
+```
 
-## Can I connect a custom domain to my Lovable project?
+## 🤝 Вклад в проект
 
-Yes, you can!
+Мы приветствуем вклад в развитие проекта! Пожалуйста, ознакомьтесь с нашими правилами и создайте pull request.
 
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
+## 📄 Лицензия
 
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+Этот проект распространяется под лицензией MIT. Подробности в файле LICENSE.

@@ -1,0 +1,13 @@
+[Unit]
+Description=TrackAI Backend Service
+After=network.target
+
+[Service]
+User=user1
+Group=user1
+WorkingDirectory=/home/user1/backend
+Environment="PATH=/home/user1/backend/venv/bin"
+ExecStart=/home/user1/backend/venv/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+[Install]
+WantedBy=multi-user.target

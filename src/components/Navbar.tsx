@@ -1,6 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { Activity, LayoutDashboard, Map, User } from "lucide-react";
+import { Activity, LayoutDashboard, Route, MessageCircle } from "lucide-react";
 
 const Navbar = () => {
   const location = useLocation();
@@ -16,7 +16,7 @@ const Navbar = () => {
               <Activity className="h-5 w-5 text-primary-foreground" />
             </div>
             <span className="text-xl font-bold text-foreground">
-              Trac<span className="text-gradient">AI</span>
+              Track<span className="text-gradient">AI</span>
             </span>
           </Link>
           
@@ -39,23 +39,24 @@ const Navbar = () => {
                 Кабинет
               </Button>
             </Link>
-            <Link to="/analytics">
-              <Button 
-                variant={isActive("/analytics") ? "secondary" : "ghost"} 
+            <Link to="/trajectory">
+              <Button
+                variant={isActive("/trajectory") ? "secondary" : "ghost"}
                 size="sm"
                 className="gap-2"
               >
-                <Map className="h-4 w-4" />
-                Аналитика
+                <Route className="h-4 w-4" />
+                Траектория
               </Button>
             </Link>
-          </div>
-          
-          <div className="flex items-center gap-3">
-            <Link to="/dashboard">
-              <Button variant="glass" size="sm" className="gap-2">
-                <User className="h-4 w-4" />
-                <span className="hidden sm:inline">Войти</span>
+            <Link to="/support">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-2"
+              >
+                <MessageCircle className="h-4 w-4" />
+                Техническая поддержка
               </Button>
             </Link>
           </div>
