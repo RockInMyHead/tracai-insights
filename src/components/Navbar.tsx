@@ -1,6 +1,6 @@
 import { Link, useLocation } from "react-router-dom";
 import { Button } from "@/components/ui/button";
-import { Activity, LayoutDashboard, Route, MessageCircle } from "lucide-react";
+import { Activity, LayoutDashboard, Route, MessageCircle, Download } from "lucide-react";
 
 const Navbar = () => {
   const location = useLocation();
@@ -47,6 +47,16 @@ const Navbar = () => {
               >
                 <Route className="h-4 w-4" />
                 Траектория
+              </Button>
+            </Link>
+            <Link to="/download">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-2"
+              >
+                <Download className="h-4 w-4" />
+                Скачать
               </Button>
             </Link>
             <Link to="/support">

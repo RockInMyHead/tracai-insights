@@ -2,31 +2,44 @@ import { useState, useRef, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Video, Library, Upload, Map, X, ZoomIn, ZoomOut, RotateCcw, Navigation } from "lucide-react";
+import { Video, Library, Upload, Map, X, ZoomIn, ZoomOut, RotateCcw, Navigation, Download, FileJson } from "lucide-react";
 import Navbar from "@/components/Navbar";
 import TrajectoryAnalysis from "@/components/TrajectoryAnalysis";
-import TrajectoryMap from "@/components/TrajectoryMap";
+import TrajectoryMap, {
+  type TrajectoryData,
+  type TrajectoryPoint,
+  type TurnPoint,
+} from "@/components/TrajectoryMap";
 import VideoLibrary from "@/components/VideoLibrary";
+import RealtimeTrajectoryVideo, { type TrajPoint } from "@/components/RealtimeTrajectoryVideo";
 import { apiClient, VideoListItem, Plan } from "@/lib/api";
 import { toast } from "sonner";
 import PlanEditor from "@/components/PlanEditor";
 import PlanLibrary from "@/components/PlanLibrary";
 import { PenTool, Library as LibraryIcon } from "lucide-react";
+import { finiteNum } from "@/lib/numbers";
+
+/** Линия/прямоугольник с плана из PlanEditor */
+interface DrawnPlanShape {
+  id: string;
+  type: string;
+  points: { x: number; y: number }[];
+}
 
 const TrajectoryAnalysisPage = () => {
-  const [trajectory, setTrajectory] = useState([]);
-  const [turnPoints, setTurnPoints] = useState([]);
-  const [stats, setStats] = useState(null);
-  const [selectedVideo, setSelectedVideo] = useState(null);
+  const [trajectory, setTrajectory] = useState<unknown[]>([]);
+  const [turnPoints, setTurnPoints] = useState<Record<string, unknown>[]>([]);
+  const [stats, setStats] = useState<Record<string, unknown> | null>(null);
+  const [selectedVideo, setSelectedVideo] = useState<VideoListItem | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
-  const [floorPlan, setFloorPlan] = useState(null);
-  const [floorPlanFile, setFloorPlanFile] = useState(null);
-  const [drawnPlan, setDrawnPlan] = useState<any[] | null>(null);
+  const [floorPlan, setFloorPlan] = useState<string | null>(null);
+  const [floorPlanFile, setFloorPlanFile] = useState<{ name: string; type: string } | null>(null);
+  const [drawnPlan, setDrawnPlan] = useState<DrawnPlanShape[] | null>(null);
   const [activePlanId, setActivePlanId] = useState<number | null>(null);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [planMode, setPlanMode] = useState<'upload' | 'draw' | 'library'>('upload');
-  const [referencePoint, setReferencePoint] = useState(null); // {x, y} - точка отсчета на плане
-  const [directionPoint, setDirectionPoint] = useState(null); // {x, y} - направление движения от точки отсчета
+  const [referencePoint, setReferencePoint] = useState<{ x: number; y: number } | null>(null);
+  const [directionPoint, setDirectionPoint] = useState<{ x: number; y: number } | null>(null);
   const [setDirectionMode, setSetDirectionMode] = useState(false);
   const [planScale, setPlanScale] = useState(1); // Масштаб превью плана
   const floorPlanInputRef = useRef(null);
@@ -114,9 +127,12 @@ const TrajectoryAnalysisPage = () => {
     measurePlanImgLayout();
     const img = planImgRef.current;
     if (!img) return;
-    const ro = new ResizeObserver(measurePlanImgLayout);
+    const ro = new ResizeObserver(() => {
+      requestAnimationFrame(measurePlanImgLayout);
+    });
     ro.observe(img);
     return () => ro.disconnect();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- remeasure only when plan source changes
   }, [floorPlan, floorPlanFile?.type]);
 
   const handleFloorPlanUpload = async (e) => {
@@ -204,9 +220,9 @@ const TrajectoryAnalysisPage = () => {
 
     const reader = new FileReader();
     reader.onload = (event) => {
-      let result = event.target?.result;
+      const result = event.target?.result;
 
-      setFloorPlan(result);
+      setFloorPlan(typeof result === "string" ? result : null);
       setFloorPlanFile(file);
       setReferencePoint(null);
       setDirectionPoint(null);
@@ -318,7 +334,7 @@ const TrajectoryAnalysisPage = () => {
   };
 
   const handlePlanSelect = (plan: Plan) => {
-    setDrawnPlan(plan.data);
+    setDrawnPlan(plan.data as DrawnPlanShape[]);
     setActivePlanId(plan.id || null);
     setFloorPlan(null); // Сбрасываем загруженное изображение
     setFloorPlanFile({ name: plan.name, type: 'drawn' });
@@ -338,7 +354,12 @@ const TrajectoryAnalysisPage = () => {
     setIsEditorOpen(false);
   };
 
-  const handleTrajectoryAnalyzed = (newTrajectory, newTurnPoints, newStats, trajectories) => {
+  const handleTrajectoryAnalyzed = (
+    newTrajectory: number[][] | { x: number; y: number; z?: number }[],
+    newTurnPoints: Record<string, unknown>[],
+    newStats: Record<string, unknown>,
+    trajectories?: { trajectory: unknown; turnPoints: Record<string, unknown>[]; ownerName: string; color: string; mapAligned?: boolean }[]
+  ) => {
     console.log('📥 handleTrajectoryAnalyzed called with:', {
       newTrajectory: newTrajectory ? newTrajectory.length : 'null/undefined',
       newTurnPoints: newTurnPoints ? newTurnPoints.length : 'null/undefined',
@@ -359,24 +380,75 @@ const TrajectoryAnalysisPage = () => {
     setStats(newStats);
   };
 
-  const handleVideoSelected = (video) => {
+  const handleVideoSelected = (video: VideoListItem) => {
     setSelectedVideo(video);
     setVideoUrl(apiClient.getVideoDownloadUrl(video.video_id));
   };
 
-  const handleAnalysisLoaded = (newTrajectory, newTurnPoints, newStats) => {
+  // Сырой массив точек траектории для вывода и выгрузки (поддержка одного и нескольких треков)
+  const getTrajectoryPoints = (): number[][] => {
+    if (!trajectory || trajectory.length === 0) return [];
+    const first = trajectory[0];
+    if (Array.isArray(first) && (first.length === 0 || typeof first[0] === "number")) {
+      return trajectory as number[][];
+    }
+    if (typeof first === "object" && first !== null && "trajectory" in first) {
+      const t = (first as { trajectory: unknown[] }).trajectory;
+      if (!t || !Array.isArray(t)) return [];
+      return t.map((p: unknown) => {
+        if (Array.isArray(p)) return [finiteNum(p[0]), finiteNum(p[1]), finiteNum(p[2])];
+        const o = p as Record<string, unknown> & { 0?: unknown; 1?: unknown; 2?: unknown };
+        return [finiteNum(o.x ?? o[0]), finiteNum(o.y ?? o[1]), finiteNum(o.z ?? o[2])];
+      });
+    }
+    return [];
+  };
+
+  const handleDownloadTrajectory = () => {
+    const points = getTrajectoryPoints();
+    const blob = new Blob([JSON.stringify(points, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "trajectory.json";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success("trajectory.json скачан");
+  };
+
+  const handleDownloadTurnPoints = () => {
+    const blob = new Blob([JSON.stringify(turnPoints, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "turn_points.json";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success("turn_points.json скачан");
+  };
+
+  const handleAnalysisLoaded = (
+    newTrajectory: unknown,
+    newTurnPoints: Record<string, unknown>[],
+    newStats: Record<string, unknown> | undefined
+  ) => {
     // Конвертируем [[x,y,z], ...] в [{x,y,z}, ...] для TrajectoryMap
-    const convertTrajectory = (traj) => {
+    const convertTrajectory = (traj: unknown): { x: number; y: number; z?: number }[] => {
       if (!traj || !Array.isArray(traj)) return [];
       if (traj.length === 0) return [];
       if (Array.isArray(traj[0])) {
-        return traj.map((p) => ({
-          x: Number(p[0]) ?? 0,
-          y: Number(p[1]) ?? 0,
-          z: Number(p[2]) ?? 0
-        }));
+        return traj.map((p: unknown) => {
+          const arr = p as number[];
+          return {
+            x: finiteNum(arr[0]),
+            y: finiteNum(arr[1]),
+            z: finiteNum(arr[2]),
+          };
+        });
       }
-      if (typeof traj[0] === 'object' && traj[0] && 'x' in traj[0]) return traj;
+      if (typeof traj[0] === "object" && traj[0] && "x" in traj[0]) {
+        return traj as { x: number; y: number; z?: number }[];
+      }
       return [];
     };
     const converted = convertTrajectory(newTrajectory);
@@ -384,11 +456,12 @@ const TrajectoryAnalysisPage = () => {
       trajectory: converted,
       turnPoints: newTurnPoints || [],
       ownerName: 'Библиотека',
-      color: '#3b82f6'
+      color: '#3b82f6',
+      mapAligned: Boolean(newStats?.map_matching_applied)
     }];
     setTrajectory(trajectoriesData);
     setTurnPoints(newTurnPoints || []);
-    setStats(newStats);
+    setStats(newStats ?? null);
   };
 
   return (
@@ -545,7 +618,7 @@ const TrajectoryAnalysisPage = () => {
                     {drawnPlan ? (
                       <div className="bg-slate-950 p-8 rounded-lg bg-[radial-gradient(#1e293b_1px,transparent_1px)] [background-size:20px_20px] min-w-[800px] relative">
                         <svg viewBox="0 0 800 600" className="w-full h-auto cursor-crosshair" onClick={handleFloorPlanClick}>
-                          {drawnPlan.map((s: any) => s.type === 'rect' ?
+                          {drawnPlan.map((s) => s.type === 'rect' ?
                             <rect key={s.id} x={Math.min(s.points[0].x, s.points[1].x)} y={Math.min(s.points[0].y, s.points[1].y)} width={Math.abs(s.points[1].x - s.points[0].x)} height={Math.abs(s.points[1].y - s.points[0].y)} fill="rgba(56, 189, 248, 0.2)" stroke="#38bdf8" strokeWidth="2" /> :
                             <line key={s.id} x1={s.points[0].x} y1={s.points[0].y} x2={s.points[1].x} y2={s.points[1].y} stroke="white" strokeWidth="3" strokeLinecap="round" />
                           )}
@@ -760,7 +833,13 @@ const TrajectoryAnalysisPage = () => {
           <TabsContent value="upload" className="space-y-6">
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
               <div className="space-y-6">
-                <TrajectoryAnalysis onTrajectoryAnalyzed={handleTrajectoryAnalyzed} />
+                <TrajectoryAnalysis
+                  onTrajectoryAnalyzed={handleTrajectoryAnalyzed}
+                  floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
+                  drawnPlan={drawnPlan}
+                  referencePoint={referencePoint}
+                  directionPoint={directionPoint}
+                />
 
                 {stats && (
                   <Card>
@@ -771,7 +850,7 @@ const TrajectoryAnalysisPage = () => {
                       <div className="grid grid-cols-2 gap-4">
                         <div className="text-center p-4 bg-secondary rounded-lg">
                           <div className="text-2xl font-bold text-primary">
-                            {stats.estimated_distance?.toFixed(1)}
+                            {finiteNum(stats.estimated_distance).toFixed(1)}
                           </div>
                           <div className="text-sm text-muted-foreground">метров пройдено</div>
                         </div>
@@ -783,13 +862,13 @@ const TrajectoryAnalysisPage = () => {
                         </div>
                         <div className="text-center p-4 bg-secondary rounded-lg">
                           <div className="text-2xl font-bold text-primary">
-                            {stats.fps?.toFixed(1)}
+                            {finiteNum(stats.fps).toFixed(1)}
                           </div>
                           <div className="text-sm text-muted-foreground">FPS обработки</div>
                         </div>
                         <div className="text-center p-4 bg-secondary rounded-lg">
                           <div className="text-2xl font-bold text-primary">
-                            {stats.scale_factor}
+                            {String(stats.scale_factor ?? "")}
                           </div>
                           <div className="text-sm text-muted-foreground">масштаб</div>
                         </div>
@@ -803,10 +882,26 @@ const TrajectoryAnalysisPage = () => {
                 <Card className="h-[600px]">
                   <CardContent className="p-0 h-full">
                     <TrajectoryMap
-                      trajectories={Array.isArray(trajectory) && trajectory.length > 0 && typeof trajectory[0] === 'object' && 'trajectory' in trajectory[0] ? trajectory : undefined}
-                      trajectory={!Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== 'object') ? trajectory : undefined}
-                      turnPoints={!Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== 'object') ? turnPoints : undefined}
-                      stats={stats}
+                      trajectories={
+                        Array.isArray(trajectory) &&
+                        trajectory.length > 0 &&
+                        typeof trajectory[0] === "object" &&
+                        trajectory[0] !== null &&
+                        "trajectory" in trajectory[0]
+                          ? (trajectory as TrajectoryData[])
+                          : undefined
+                      }
+                      trajectory={
+                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                          ? (trajectory as unknown as TrajectoryPoint[])
+                          : undefined
+                      }
+                      turnPoints={
+                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                          ? (turnPoints as unknown as TurnPoint[])
+                          : undefined
+                      }
+                      stats={stats ?? undefined}
                       floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
                       drawnPlan={drawnPlan}
                       referencePoint={referencePoint}
@@ -819,6 +914,27 @@ const TrajectoryAnalysisPage = () => {
                 </Card>
               </div>
             </div>
+
+            {/* Real-time video with trajectory overlay */}
+            {trajectory && trajectory.length > 0 && videoUrl && (
+              <div className="mt-6">
+                <RealtimeTrajectoryVideo
+                  videoUrl={videoUrl}
+                  trajectory={
+                    (Array.isArray(trajectory) && trajectory.length > 0 && typeof trajectory[0] !== "object"
+                      ? trajectory
+                      : Array.isArray(trajectory) &&
+                          trajectory[0] &&
+                          typeof trajectory[0] === "object" &&
+                          "trajectory" in trajectory[0]
+                        ? (trajectory[0] as TrajectoryData).trajectory
+                        : []) as TrajPoint[]
+                  }
+                  turnPoints={turnPoints}
+                  scaleFactor={finiteNum(stats?.scale_factor, 12.306)}
+                />
+              </div>
+            )}
           </TabsContent>
 
           <TabsContent value="library" className="space-y-6">
@@ -884,10 +1000,26 @@ const TrajectoryAnalysisPage = () => {
                 <Card className="h-[400px]">
                   <CardContent className="p-0 h-full">
                     <TrajectoryMap
-                      trajectories={Array.isArray(trajectory) && trajectory.length > 0 && typeof trajectory[0] === 'object' && 'trajectory' in trajectory[0] ? trajectory : undefined}
-                      trajectory={!Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== 'object') ? trajectory : undefined}
-                      turnPoints={!Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== 'object') ? turnPoints : undefined}
-                      stats={stats}
+                      trajectories={
+                        Array.isArray(trajectory) &&
+                        trajectory.length > 0 &&
+                        typeof trajectory[0] === "object" &&
+                        trajectory[0] !== null &&
+                        "trajectory" in trajectory[0]
+                          ? (trajectory as TrajectoryData[])
+                          : undefined
+                      }
+                      trajectory={
+                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                          ? (trajectory as unknown as TrajectoryPoint[])
+                          : undefined
+                      }
+                      turnPoints={
+                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                          ? (turnPoints as unknown as TurnPoint[])
+                          : undefined
+                      }
+                      stats={stats ?? undefined}
                       floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
                       drawnPlan={drawnPlan}
                       referencePoint={referencePoint}
@@ -898,47 +1030,134 @@ const TrajectoryAnalysisPage = () => {
                     />
                   </CardContent>
                 </Card>
+
+                {/* Real-time video with trajectory overlay in library tab */}
+                {trajectory && trajectory.length > 0 && videoUrl && (
+                  <div className="mt-6">
+                    <RealtimeTrajectoryVideo
+                      videoUrl={videoUrl}
+                      trajectory={
+                        (Array.isArray(trajectory) && trajectory.length > 0 && typeof trajectory[0] !== "object"
+                          ? trajectory
+                          : Array.isArray(trajectory) &&
+                              trajectory[0] &&
+                              typeof trajectory[0] === "object" &&
+                              "trajectory" in trajectory[0]
+                            ? (trajectory[0] as TrajectoryData).trajectory
+                            : []) as TrajPoint[]
+                      }
+                      turnPoints={turnPoints}
+                      scaleFactor={finiteNum(stats?.scale_factor, 12.306)}
+                    />
+                  </div>
+                )}
               </div>
             </div>
           </TabsContent>
         </Tabs>
 
-        {turnPoints.length > 0 && (
+        {/* Вывод и выгрузка trajectory / turn points */}
+        {(getTrajectoryPoints().length > 0 || turnPoints.length > 0) && (
           <Card className="mt-8">
             <CardHeader>
-              <CardTitle>Детали поворотов</CardTitle>
+              <CardTitle className="flex items-center gap-2">
+                <FileJson className="h-5 w-5" />
+                Данные траектории и выгрузка
+              </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b">
-                      <th className="text-left p-2">#</th>
-                      <th className="text-left p-2">Тип</th>
-                      <th className="text-left p-2">Угол (°)</th>
-                      <th className="text-left p-2">Координаты</th>
-                      <th className="text-left p-2">Кадр</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {turnPoints.map((turn, index) => (
-                      <tr key={index} className="border-b">
-                        <td className="p-2 font-medium">{index + 1}</td>
-                        <td className="p-2">
-                          <span className={`px-2 py-1 rounded text-xs ${turn.turn_type === 'left' ? 'bg-orange-100 text-orange-800' : 'bg-purple-100 text-purple-800'}`}>
-                            {turn.turn_type === 'left' ? 'Влево' : 'Вправо'}
-                          </span>
-                        </td>
-                        <td className="p-2">{turn.angle_degrees?.toFixed(1)}°</td>
-                        <td className="p-2">
-                          ({turn.position?.[0]?.toFixed(1)}, {turn.position?.[1]?.toFixed(1)})
-                        </td>
-                        <td className="p-2">{turn.frame_index}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+            <CardContent className="space-y-8">
+              {/* Точки траектории */}
+              {getTrajectoryPoints().length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-4 flex-wrap">
+                    <h3 className="font-semibold text-sm text-muted-foreground uppercase tracking-wide">
+                      Траектория ({getTrajectoryPoints().length} точек)
+                    </h3>
+                    <Button variant="outline" size="sm" className="gap-2" onClick={handleDownloadTrajectory}>
+                      <Download className="h-4 w-4" />
+                      Скачать trajectory.json
+                    </Button>
+                  </div>
+                  <div className="overflow-x-auto max-h-[280px] overflow-y-auto border rounded-lg">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-muted/95 backdrop-blur supports-[backdrop-filter]:bg-muted/80">
+                        <tr className="border-b">
+                          <th className="text-left p-2 font-medium">#</th>
+                          <th className="text-left p-2 font-medium">x</th>
+                          <th className="text-left p-2 font-medium">y</th>
+                          <th className="text-left p-2 font-medium">z</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {getTrajectoryPoints()
+                          .slice(0, 200)
+                          .map((p, index) => (
+                            <tr key={index} className="border-b last:border-0">
+                              <td className="p-2 font-mono text-muted-foreground">{index + 1}</td>
+                              <td className="p-2 font-mono">{Number(p[0]).toFixed(3)}</td>
+                              <td className="p-2 font-mono">{Number(p[1]).toFixed(3)}</td>
+                              <td className="p-2 font-mono">{Number(p[2]).toFixed(3)}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {getTrajectoryPoints().length > 200 && (
+                    <p className="text-xs text-muted-foreground">
+                      Показано первые 200 из {getTrajectoryPoints().length} точек. Полные данные — в trajectory.json
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Повороты */}
+              {turnPoints.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-4 flex-wrap">
+                    <h3 className="font-semibold text-sm text-muted-foreground uppercase tracking-wide">
+                      Повороты (turn points) — {turnPoints.length} шт.
+                    </h3>
+                    <Button variant="outline" size="sm" className="gap-2" onClick={handleDownloadTurnPoints}>
+                      <Download className="h-4 w-4" />
+                      Скачать turn_points.json
+                    </Button>
+                  </div>
+                  <div className="overflow-x-auto border rounded-lg">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b">
+                          <th className="text-left p-2">#</th>
+                          <th className="text-left p-2">Тип</th>
+                          <th className="text-left p-2">Угол (°)</th>
+                          <th className="text-left p-2">Координаты</th>
+                          <th className="text-left p-2">Кадр</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {turnPoints.map((turn, index) => (
+                          <tr key={index} className="border-b last:border-0">
+                            <td className="p-2 font-medium">{index + 1}</td>
+                            <td className="p-2">
+                              <span className={`px-2 py-1 rounded text-xs ${turn.turn_type === "left" ? "bg-orange-100 text-orange-800" : "bg-purple-100 text-purple-800"}`}>
+                                {turn.turn_type === "left" ? "Влево" : "Вправо"}
+                              </span>
+                            </td>
+                            <td className="p-2">{finiteNum(turn.angle_degrees).toFixed(1)}°</td>
+                            <td className="p-2 font-mono">
+                              (
+                              {Array.isArray(turn.position)
+                                ? `${finiteNum(turn.position[0]).toFixed(1)}, ${finiteNum(turn.position[1]).toFixed(1)}`
+                                : "—"}
+                              )
+                            </td>
+                            <td className="p-2">{String(turn.frame_index ?? "")}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}

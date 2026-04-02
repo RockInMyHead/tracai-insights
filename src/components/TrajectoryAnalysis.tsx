@@ -7,16 +7,22 @@ import { Slider } from "@/components/ui/slider";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
-import { Video, MapPin, Activity, Clock, Navigation, Loader2, User, X, Plus } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { Video, MapPin, Activity, Clock, Navigation, Loader2, User, X, Plus, FolderOpen } from "lucide-react";
 import { toast } from "sonner";
-import { apiClient, VideoAnalysisResult } from "@/lib/api";
+import { apiClient, VideoAnalysisResult, VideoListItem } from "@/lib/api";
+import { finiteNum } from "@/lib/numbers";
 
-// Интерфейс для видео с владельцем
+type AnalysisData = NonNullable<VideoAnalysisResult["data"]>;
+
+// Интерфейс для видео с владельцем (локальный файл или с сервера)
 interface VideoWithOwner {
   id: string;
-  file: File;
+  file?: File;
+  video_id?: string; // ID на сервере (если уже загружено)
+  serverFilename?: string; // имя файла на сервере
   ownerName: string;
-  analysisResult?: any;
+  analysisResult?: AnalysisData;
   isAnalyzing?: boolean;
   uploadProgress?: number;
   color: string;
@@ -29,17 +35,27 @@ interface Employee {
 }
 
 interface TrajectoryData {
-  trajectory: number[][];
-  turnPoints: any[];
+  trajectory: number[][] | { x: number; y: number; z?: number }[];
+  turnPoints: Record<string, unknown>[];
   ownerName: string;
   color: string;
+  mapAligned?: boolean;
 }
 
 interface TrajectoryAnalysisProps {
-  onTrajectoryAnalyzed?: (trajectory: number[][], turnPoints: any[], stats: any, trajectories?: TrajectoryData[]) => void;
+  onTrajectoryAnalyzed?: (
+    trajectory: number[][] | { x: number; y: number; z?: number }[],
+    turnPoints: Record<string, unknown>[],
+    stats: Record<string, unknown>,
+    trajectories?: TrajectoryData[]
+  ) => void;
+  floorPlan?: string | null;
+  drawnPlan?: unknown[] | null;
+  referencePoint?: { x: number; y: number } | null;
+  directionPoint?: { x: number; y: number } | null;
 }
 
-const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) => {
+const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan, drawnPlan, referencePoint: externalReferencePoint, directionPoint: externalDirectionPoint }: TrajectoryAnalysisProps) => {
   const [videos, setVideos] = useState<VideoWithOwner[]>([]);
   const [currentOwnerName, setCurrentOwnerName] = useState('');
   const [scaleFactor, setScaleFactor] = useState<number>(12.306);
@@ -47,7 +63,14 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [currentStep, setCurrentStep] = useState('');
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [serverVideos, setServerVideos] = useState<VideoListItem[]>([]);
+  const [selectedServerVideos, setSelectedServerVideos] = useState<VideoListItem[]>([]);
+  const [showServerPicker, setShowServerPicker] = useState(false);
+  const [loadingServerVideos, setLoadingServerVideos] = useState(false);
   const [stabilizationEnabled, setStabilizationEnabled] = useState<boolean>(true);
+  const [detectInterval, setDetectInterval] = useState<number>(5);
+  const [turnVoteThreshold, setTurnVoteThreshold] = useState<number>(3);
+  const [useMlRoi, setUseMlRoi] = useState<boolean>(true);
   const [floorPlan, setFloorPlan] = useState<string | null>(null);
   const [floorPlanFile, setFloorPlanFile] = useState<File | null>(null);
   const [referencePoint, setReferencePoint] = useState(null);
@@ -184,6 +207,61 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
     setSelectedFiles([]);
   };
 
+  const fetchServerVideos = async () => {
+    setLoadingServerVideos(true);
+    try {
+      const res = await apiClient.getUploadedVideosList();
+      setServerVideos(res.videos || []);
+      setSelectedServerVideos([]);
+      setShowServerPicker(true);
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : "Не удалось загрузить список видео");
+    } finally {
+      setLoadingServerVideos(false);
+    }
+  };
+
+  const toggleServerVideoSelection = (v: VideoListItem) => {
+    setSelectedServerVideos(prev =>
+      prev.some(x => x.video_id === v.video_id)
+        ? prev.filter(x => x.video_id !== v.video_id)
+        : [...prev, v]
+    );
+  };
+
+  const addServerVideosToList = () => {
+    if (selectedServerVideos.length === 0) {
+      toast.error("Выберите одно или несколько видео");
+      return;
+    }
+    if (!currentOwnerName.trim()) {
+      toast.error("Введите имя сотрудника");
+      return;
+    }
+    const ownerName = currentOwnerName.trim();
+    if (!existingOwners.includes(ownerName)) {
+      const newOwners = [...existingOwners, ownerName];
+      setExistingOwners(newOwners);
+      localStorage.setItem('trackai_owners', JSON.stringify(newOwners));
+    }
+    const timestamp = Date.now();
+    const existingOwner = videos.find(v => v.ownerName === ownerName);
+    const ownerColor = existingOwner ? existingOwner.color : userColors[Array.from(new Set(videos.map(v => v.ownerName))).length % userColors.length];
+    const newVideos: VideoWithOwner[] = selectedServerVideos.map((v, i) => ({
+      id: `server-${v.video_id}-${timestamp}-${i}`,
+      video_id: v.video_id,
+      serverFilename: v.filename,
+      ownerName,
+      color: ownerColor,
+      isAnalyzing: false,
+      uploadedAt: timestamp
+    }));
+    setVideos(prev => [...prev, ...newVideos]);
+    setShowServerPicker(false);
+    setSelectedServerVideos([]);
+    toast.success(`Добавлено ${newVideos.length} видео с сервера для ${ownerName}`);
+  };
+
   const addVideoToList = () => {
     if (selectedFiles.length === 0) {
       toast.error("Сначала выберите один или несколько видео файлов");
@@ -269,47 +347,82 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
         setVideos(prev => prev.map(v =>
           v.id === video.id ? { ...v, isAnalyzing: true } : v
         ));
-        setCurrentStep(`Анализ видео ${video.ownerName} (${video.file.name})...`);
+        const displayName = video.file?.name || video.serverFilename || 'video';
+        setCurrentStep(`Анализ видео ${video.ownerName} (${displayName})...`);
 
         try {
-          // Start polling for progress (будет использовать uploadedVideoId после загрузки)
           let processingId: string | null = null;
+          let uploadedVideoId: string;
+
+          if (video.video_id) {
+            // Видео уже на сервере — пропускаем загрузку
+            uploadedVideoId = video.video_id;
+            processingId = uploadedVideoId;
+            // Синхронизируем контекст (план/чертёж) для задачи, уже созданной при загрузке
+            apiClient.updateTaskContext(uploadedVideoId, {
+              floor_plan_data: externalFloorPlan || floorPlan,
+              drawn_plan: drawnPlan || null,
+              reference_point: externalReferencePoint || referencePoint,
+              direction_point: externalDirectionPoint || null,
+              employee_name: video.ownerName,
+            }).catch(() => {});
+          } else if (video.file) {
+            // Шаг 1: Загружаем видео на сервер
+            setCurrentStep(`Загрузка ${video.file.name} на сервер...`);
+            const uploadResult = await apiClient.uploadVideo(
+              video.file,
+              (progress) => {
+                setVideos(prev => prev.map(v =>
+                  v.id === video.id ? { ...v, uploadProgress: progress } : v
+                ));
+                setCurrentStep(`Загрузка ${video.file.name}: ${progress.toFixed(0)}%`);
+              },
+              video.ownerName
+            );
+            uploadedVideoId = uploadResult.video_id;
+            processingId = uploadedVideoId;
+            // Сразу после загрузки — синхронизируем контекст плана/чертежа
+            apiClient.updateTaskContext(uploadedVideoId, {
+              floor_plan_data: externalFloorPlan || floorPlan,
+              drawn_plan: drawnPlan || null,
+              reference_point: externalReferencePoint || referencePoint,
+              direction_point: externalDirectionPoint || null,
+            }).catch(() => {});
+
+          } else {
+            throw new Error("Нет файла или video_id");
+          }
+
           const pollInterval = setInterval(async () => {
             if (!processingId) return;
             try {
               const status = await apiClient.getProcessingStatus(processingId);
-              if (status && status.progress > 0) {
-                if (status.message) {
-                  setCurrentStep(`[${video.ownerName}] ${status.message} (${status.progress}%)`);
-                }
+              if (status && status.progress > 0 && status.message) {
+                setCurrentStep(`[${video.ownerName}] ${status.message} (${status.progress}%)`);
               }
-            } catch (e) {
-              // ignore polling errors
-            }
+            } catch (e) { /* ignore */ }
           }, 1000);
 
-          // Шаг 1: Загружаем видео на сервер (отдельно, таймаут 2 часа)
-          setCurrentStep(`Загрузка ${video.file.name} на сервер...`);
-          const uploadResult = await apiClient.uploadVideo(
-            video.file,
-            (progress) => {
-              setVideos(prev => prev.map(v =>
-                v.id === video.id ? { ...v, uploadProgress: progress } : v
-              ));
-              setCurrentStep(`Загрузка ${video.file.name}: ${progress.toFixed(0)}%`);
-            }
-          );
-
-          const uploadedVideoId = uploadResult.video_id;
-          processingId = uploadedVideoId;
-
-          // Шаг 2: Запускаем анализ уже загруженного видео
+          // Запускаем анализ уже загруженного видео
           let result = await apiClient.analyzeVideoById(
             uploadedVideoId,
             scaleFactor,
             stabilizationEnabled,
-            video.file.name
+            displayName,
+            {
+              detect_interval: detectInterval,
+              turn_vote_threshold: turnVoteThreshold,
+              use_ml_roi: useMlRoi
+            },
+            {
+              floor_plan_data: externalFloorPlan || floorPlan,
+              drawn_plan: drawnPlan || null,
+              reference_point: externalReferencePoint || referencePoint,
+              direction_point: externalDirectionPoint || null,
+            },
+            video.ownerName
           );
+
 
           // Если видео поставлено в очередь, ждем завершения через поллинг
           if (result.status === 'queued') {
@@ -355,9 +468,9 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
           setAnalysisProgress(prev => prev + (100 / videosToAnalyze.length));
 
           return analyzedVideo;
-        } catch (err: any) {
+        } catch (err: unknown) {
           console.error(`Error analyzing video ${video.id}:`, err);
-          toast.error(`Ошибка при анализе ${video.file.name}: ${err.message || 'Неизвестная ошибка'}`);
+          toast.error(`Ошибка при анализе ${displayName}: ${err instanceof Error ? err.message : "Неизвестная ошибка"}`);
 
           const errorVideo = { ...video, isAnalyzing: false };
           setVideos(prev => prev.map(v =>
@@ -383,22 +496,30 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
       console.log(`   • Общее время: ${totalTime.toFixed(1)} сек`);
       console.log(`   • Среднее время на видео: ${(totalTime / finalizedVideos.length).toFixed(1)} сек`);
 
-      const convertTrajectory = (traj: any) => {
+      const convertTrajectory = (traj: unknown): { x: number; y: number; z?: number }[] => {
         if (!traj) return [];
-
-        // Если это массив массивов [[x,y,z], ...]
-        if (Array.isArray(traj) && traj.length > 0) {
-          if (Array.isArray(traj[0])) {
-            return traj.map((point: any) => ({
-              x: Number(point[0]) || 0,
-              y: Number(point[1]) || 0,
-              z: Number(point[2]) || 0
-            }));
-          }
-          // Если уже объекты {x,y,z}
-          if (typeof traj[0] === 'object' && 'x' in traj[0]) {
-            return traj;
-          }
+        if (!Array.isArray(traj) || traj.length === 0) return [];
+        // Массив массивов [[x,y,z], ...]
+        if (Array.isArray(traj[0])) {
+          return traj.map((point: unknown) => {
+            const arr = point as number[];
+            return {
+              x: finiteNum(arr[0]),
+              y: finiteNum(arr[1]),
+              z: finiteNum(arr[2]),
+            };
+          });
+        }
+        // Уже объекты {x,y,z} или {0,1,2}
+        if (typeof traj[0] === "object" && traj[0] !== null) {
+          return traj.map((p: unknown) => {
+            const o = p as Record<string, unknown> & { 0?: unknown; 1?: unknown; 2?: unknown };
+            return {
+              x: finiteNum(o.x ?? o[0]),
+              y: finiteNum(o.y ?? o[1]),
+              z: finiteNum(o.z ?? o[2]),
+            };
+          });
         }
         return [];
       };
@@ -406,19 +527,23 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
       const finalAnalyzedVideos = finalizedVideos.filter(v => v.analysisResult);
 
       if (finalAnalyzedVideos.length > 0 && onTrajectoryAnalyzed) {
-        // Подготавливаем данные для всех траекторий
         const trajectoriesData = finalAnalyzedVideos.map(video => ({
-          trajectory: convertTrajectory(video.analysisResult.trajectory),
-          turnPoints: video.analysisResult.turn_points || [],
+          trajectory: convertTrajectory(video.analysisResult.map_trajectory || video.analysisResult.trajectory),
+          turnPoints: video.analysisResult.map_turn_points || video.analysisResult.turn_points || [],
           ownerName: video.ownerName,
-          color: video.color
+          color: video.color,
+          mapAligned: Boolean(video.analysisResult.map_trajectory)
         }));
 
-        // Передаем результаты
+        const totalPoints = trajectoriesData.reduce((sum, t) => sum + t.trajectory.length, 0);
+        if (totalPoints === 0) {
+          toast.warning("Траектория пуста: точек пути нет. Попробуйте другое видео или отключите стабилизацию.");
+        }
+
         onTrajectoryAnalyzed(
           trajectoriesData[0].trajectory,
           trajectoriesData[0].turnPoints,
-          finalAnalyzedVideos[0].analysisResult.processing_stats || {},
+          (finalAnalyzedVideos[0].analysisResult.processing_stats || {}) as Record<string, unknown>,
           trajectoriesData
         );
       }
@@ -572,15 +697,28 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
               </div>
               <div className="space-y-2">
                 <Label htmlFor="video-file" className="text-sm font-semibold">Видео файлы (можно несколько)</Label>
-                <Input
-                  ref={fileInputRef}
-                  id="video-file"
-                  type="file"
-                  accept="video/*"
-                  multiple
-                  onChange={handleFileSelect}
-                  className="mt-1 bg-background"
-                />
+                <div className="flex gap-2 mt-1">
+                  <Input
+                    ref={fileInputRef}
+                    id="video-file"
+                    type="file"
+                    accept="video/*"
+                    multiple
+                    onChange={handleFileSelect}
+                    className="flex-1 bg-background"
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0 gap-1.5"
+                    onClick={fetchServerVideos}
+                    disabled={loadingServerVideos}
+                  >
+                    {loadingServerVideos ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FolderOpen className="h-3.5 w-3.5" />}
+                    Из загруженных
+                  </Button>
+                </div>
                 {selectedFiles.length > 0 && (
                   <div className="mt-2 p-3 bg-primary/5 rounded-lg border border-primary/20 space-y-2">
                     <div className="flex items-center justify-between">
@@ -618,14 +756,63 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
               </div>
             </div>
 
-            <Button
-              onClick={addVideoToList}
-              disabled={!currentOwnerName.trim()}
-              className="w-full bg-primary/90 hover:bg-primary"
-            >
-              <Plus className="h-4 w-4 mr-2" />
-              Добавить видео для этого сотрудника
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                onClick={addVideoToList}
+                disabled={!currentOwnerName.trim() || selectedFiles.length === 0}
+                className="flex-1 bg-primary/90 hover:bg-primary"
+              >
+                <Plus className="h-4 w-4 mr-2" />
+                Добавить видео для этого сотрудника
+              </Button>
+            </div>
+
+            <Dialog open={showServerPicker} onOpenChange={setShowServerPicker}>
+              <DialogContent className="max-w-md max-h-[80vh] flex flex-col">
+                <DialogHeader>
+                  <DialogTitle>Выбрать из загруженных видео</DialogTitle>
+                </DialogHeader>
+                <p className="text-sm text-muted-foreground">
+                  Сотрудник: <strong>{currentOwnerName || '— введите выше'}</strong>
+                </p>
+                {serverVideos.length === 0 ? (
+                  <p className="text-sm text-muted-foreground py-4">Сервер не вернул видео. Загрузите видео через форму выше.</p>
+                ) : (
+                  <ul className="space-y-2 overflow-y-auto max-h-60 flex-1 pr-2">
+                    {serverVideos.map((v, idx) => {
+                      const isSelected = selectedServerVideos.some(x => x.video_id === v.video_id);
+                      return (
+                        <li
+                          key={`${v.video_id}-${v.filename || idx}`}
+                          onClick={() => toggleServerVideoSelection(v)}
+                          className={`flex items-center gap-3 p-2 rounded-lg border cursor-pointer transition-colors ${
+                            isSelected ? 'bg-primary/10 border-primary/30' : 'hover:bg-secondary/50'
+                          }`}
+                        >
+                          <div className={`w-4 h-4 rounded border flex items-center justify-center ${isSelected ? 'bg-primary' : ''}`}>
+                            {isSelected && <span className="text-white text-xs">✓</span>}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <span className="text-sm font-medium truncate block">{v.filename}</span>
+                            <span className="text-muted-foreground text-xs">{(v.file_size / 1024 / 1024).toFixed(1)} MB</span>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+                <DialogFooter>
+                  <Button variant="outline" onClick={() => setShowServerPicker(false)}>Отмена</Button>
+                  <Button
+                    onClick={addServerVideosToList}
+                    disabled={!currentOwnerName.trim() || selectedServerVideos.length === 0}
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    Добавить ({selectedServerVideos.length})
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
 
           {/* Video list grouped by owner */}
@@ -655,9 +842,9 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
                           <div className="flex items-center gap-3 overflow-hidden flex-1">
                             <Video className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                             <div className="flex flex-col overflow-hidden min-w-0">
-                              <span className="text-sm font-medium truncate">{video.file.name}</span>
+                              <span className="text-sm font-medium truncate">{video.file?.name || video.serverFilename || 'video'}</span>
                               <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                                <span>{(video.file.size / 1024 / 1024).toFixed(1)} MB</span>
+                                <span>{video.file ? `${(video.file.size / 1024 / 1024).toFixed(1)} MB` : 'на сервере'}</span>
                                 {video.uploadedAt && (
                                   <>
                                     <span>•</span>
@@ -750,6 +937,42 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
             >
               Сбросить
             </Button>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="detect-interval" className="text-xs text-muted-foreground">Detect interval (кадры)</Label>
+              <Input
+                id="detect-interval"
+                type="number"
+                min="1"
+                max="30"
+                value={detectInterval}
+                onChange={(e) => setDetectInterval(Math.max(1, Math.min(30, Number(e.target.value) || 5)))}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="turn-vote-threshold" className="text-xs text-muted-foreground">Turn vote threshold</Label>
+              <Input
+                id="turn-vote-threshold"
+                type="number"
+                min="1"
+                max="5"
+                value={turnVoteThreshold}
+                onChange={(e) => setTurnVoteThreshold(Math.max(1, Math.min(5, Number(e.target.value) || 3)))}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="use-ml-roi" className="text-xs text-muted-foreground">ML ROI (YOLO+Tracker)</Label>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="use-ml-roi"
+                  checked={useMlRoi}
+                  onCheckedChange={(v) => setUseMlRoi(!!v)}
+                />
+                <span className="text-sm">{useMlRoi ? 'Вкл' : 'Выкл'}</span>
+              </div>
+            </div>
           </div>
 
           <p className="text-sm text-muted-foreground">
@@ -930,6 +1153,20 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
                     {analysisResult?.data?.video_info?.frame_count || 0}
                   </span>
                 </div>
+                <div>
+                  <span className="text-muted-foreground">Matches/кадр:</span>
+                  <span className="ml-2 font-medium">
+                    {analysisResult?.data?.processing_stats?.avg_matches_per_frame?.toFixed?.(1) || "0.0"}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Gating fail rate:</span>
+                  <span className="ml-2 font-medium">
+                    {analysisResult?.data?.processing_stats?.gating_failure_rate !== undefined
+                      ? `${(analysisResult.data.processing_stats.gating_failure_rate * 100).toFixed(1)}%`
+                      : "0.0%"}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -938,13 +1175,19 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed }: TrajectoryAnalysisProps) =
               <div className="p-4 bg-secondary rounded-lg">
                 <h4 className="font-medium mb-2">Обнаруженные повороты</h4>
                 <div className="space-y-2">
-                  {analysisResult.data.turn_points.map((turn: any, index: number) => (
+                  {analysisResult.data.turn_points.map((turn: Record<string, unknown>, index: number) => (
                     <div key={index} className="flex items-center justify-between text-sm">
                       <span>Поворот {index + 1}</span>
                       <div className="flex gap-4">
-                        <span>{turn.angle_degrees?.toFixed(1) || "0.0"}°</span>
-                        <span className="capitalize">{turn.turn_type === 'left' ? 'Влево' : 'Вправо'}</span>
-                        <span>({turn.position?.[0]?.toFixed(1) || '0.0'}, {turn.position?.[1]?.toFixed(1) || '0.0'})</span>
+                        <span>{Number(turn.angle_degrees).toFixed(1) || "0.0"}°</span>
+                        <span className="capitalize">{turn.turn_type === "left" ? "Влево" : "Вправо"}</span>
+                        <span>
+                          (
+                          {Array.isArray(turn.position)
+                            ? `${finiteNum(turn.position[0]).toFixed(1)}, ${finiteNum(turn.position[1]).toFixed(1)}`
+                            : "0.0, 0.0"}
+                          )
+                        </span>
                       </div>
                     </div>
                   ))}

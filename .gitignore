@@ -39,6 +39,9 @@ backend/data/
 *.deb
 *.tar.gz
 
+# Electron build output
+release/
+
 # Temp / test
 test.txt
 test_small.txt

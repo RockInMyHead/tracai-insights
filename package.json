@@ -1,14 +1,18 @@
 {
   "name": "trackai",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "build:dev": "vite build --mode development",
+    "build:desktop": "vite build --mode desktop && npx electron-builder",
+    "build:desktop:win": "vite build --mode desktop && npx electron-builder --win",
+    "build:desktop:mac": "vite build --mode desktop && npx electron-builder --mac",
+    "preview": "vite preview",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "electron": "electron ."
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -69,6 +73,8 @@
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react-swc": "^3.11.0",
     "autoprefixer": "^10.4.21",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8",
     "eslint": "^9.32.0",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
@@ -78,5 +84,38 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
     "vite": "^5.4.19"
+  },
+  "main": "electron/main.js",
+  "build": {
+    "appId": "com.trackai.app",
+    "productName": "TrackAI",
+    "publish": null,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "public/favicon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "artifactName": "TrackAI-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "artifactName": "TrackAI-${version}.${ext}",
+      "category": "public.app-category.business"
+    }
   }
 }

@@ -42,9 +42,10 @@ const SupportChat = ({ isOpen, onClose, fullPage = false }: SupportChatProps) =>
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        return parsed.map((msg: any) => ({
+        return (parsed as Array<{ id: string; content: string; sender: string; timestamp: string | Date }>).map((msg) => ({
           ...msg,
-          timestamp: new Date(msg.timestamp)
+          sender: msg.sender === "user" || msg.sender === "bot" ? msg.sender : "bot",
+          timestamp: new Date(msg.timestamp),
         }));
       } catch (e) {
         console.error('Failed to load chat history:', e);

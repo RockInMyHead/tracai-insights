@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { Thermometer, Route, ZoomIn, ZoomOut, RotateCcw, Maximize, X, Map as MapIcon, Footprints, Ruler, Compass } from "lucide-react";
+import { Thermometer, Route, ZoomIn, ZoomOut, RotateCcw, Maximize, Maximize2, Minimize2, X, Map as MapIcon, Footprints, Ruler, Compass } from "lucide-react";
 import { correctPathWithFloorPlan } from "@/lib/pathfinding";
+import { finiteNum } from "@/lib/numbers";
 
-interface TrajectoryPoint {
+export interface TrajectoryPoint {
   x: number;
   y: number;
   z: number;
 }
 
-interface TurnPoint {
+export interface TurnPoint {
   frame_index: number;
   trajectory_index: number;
   angle_degrees: number;
@@ -17,20 +18,28 @@ interface TurnPoint {
   turn_type: string;
 }
 
-interface TrajectoryData {
+/** Элемент нарисованного плана в PlanEditor */
+interface DrawnPlanShape {
+  id: string;
+  type: string;
+  points: { x: number; y: number }[];
+}
+
+export interface TrajectoryData {
   trajectory: TrajectoryPoint[];
   turnPoints: TurnPoint[];
   ownerName: string;
   color: string;
+  mapAligned?: boolean;
 }
 
 interface TrajectoryMapProps {
   trajectory?: TrajectoryPoint[]; // Для обратной совместимости
   turnPoints?: TurnPoint[]; // Для обратной совместимости
   trajectories?: TrajectoryData[]; // Новый формат для множественных траекторий
-  stats?: any;
+  stats?: Record<string, unknown>;
   floorPlan?: string | null;
-  drawnPlan?: any[] | null;
+  drawnPlan?: unknown[] | null;
   referencePoint?: { x: number; y: number } | null;
   directionPoint?: { x: number; y: number } | null;
   setDirectionMode?: boolean;
@@ -38,14 +47,42 @@ interface TrajectoryMapProps {
   onDirectionPointSet?: (point: { x: number; y: number }) => void;
 }
 
+function normalizeTrajectoryPoints(traj: unknown): TrajectoryPoint[] {
+  if (!traj || !Array.isArray(traj) || traj.length === 0) return [];
+  const first = traj[0];
+  if (Array.isArray(first)) {
+    return traj.map((p: unknown) => {
+      const arr = p as number[];
+      return { x: finiteNum(arr[0]), y: finiteNum(arr[1]), z: finiteNum(arr[2]) };
+    });
+  }
+  if (typeof first === 'object' && first !== null && ('x' in first || 0 in first)) {
+    return traj.map((p: unknown) => {
+      const o = p as Record<string, unknown> & { 0?: unknown; 1?: unknown; 2?: unknown };
+      return {
+        x: finiteNum(o.x ?? o[0]),
+        y: finiteNum(o.y ?? o[1]),
+        z: finiteNum(o.z ?? o[2]),
+      };
+    });
+  }
+  return [];
+}
+
 const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
-  // Поддержка старого формата для обратной совместимости
-  const trajectoryData = useMemo(() => trajectories || (trajectory && turnPoints ? [{
-    trajectory: trajectory,
-    turnPoints: turnPoints || [],
-    ownerName: 'Пользователь',
-    color: '#3b82f6'
-  }] : []), [trajectories, trajectory, turnPoints]);
+  // Поддержка старого формата + нормализация точек (массив массивов → {x,y,z}[])
+  const trajectoryData = useMemo(() => {
+    const raw = trajectories || (trajectory ? [{
+      trajectory: Array.isArray(trajectory) ? trajectory : [],
+      turnPoints: turnPoints || [],
+      ownerName: 'Пользователь',
+      color: '#3b82f6'
+    }] : []);
+    return raw.map((item) => ({
+      ...item,
+      trajectory: normalizeTrajectoryPoints(item.trajectory),
+    }));
+  }, [trajectories, trajectory, turnPoints]);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -66,6 +103,44 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
   const [trajScale, setTrajScale] = useState(1);
   const [trajOffset, setTrajOffset] = useState({ x: 0, y: 0 });
   const [showCalibration, setShowCalibration] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Нативный полноэкранный режим (Fullscreen API) — чертёж на весь экран
+  const enterFullscreen = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const req = el.requestFullscreen ?? (el as HTMLElement & { webkitRequestFullscreen?: () => Promise<void> }).webkitRequestFullscreen;
+    if (req && !document.fullscreenElement && !(document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement) {
+      req.call(el).then(() => setIsFullscreen(true)).catch(() => setIsFullscreen(false));
+    } else {
+      setIsFullscreen(true);
+    }
+  };
+  const exitFullscreen = () => {
+    const ex = document.exitFullscreen ?? (document as Document & { webkitExitFullscreen?: () => Promise<void> }).webkitExitFullscreen;
+    if (ex && (document.fullscreenElement || (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement)) {
+      ex.call(document).then(() => setIsFullscreen(false)).catch(() => setIsFullscreen(false));
+    } else {
+      setIsFullscreen(false);
+    }
+  };
+  useEffect(() => {
+    const isFs = () => !!(document.fullscreenElement ?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
+    const onFullscreenChange = () => setIsFullscreen(isFs());
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isFs()) exitFullscreen();
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+    window.addEventListener("keydown", onKeyDown);
+    document.body.style.overflow = isFullscreen ? "hidden" : "";
+    return () => {
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", onFullscreenChange);
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = "";
+    };
+  }, [isFullscreen]);
 
   // Pathfinding: траектория следует плану, не проходит сквозь стены
   const [usePathfinding, setUsePathfinding] = useState(true);
@@ -84,6 +159,33 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       return saved ? parseFloat(saved) : 0;
     } catch { return 0; }
   });
+
+  // Разворот траектории на 180° при несовпадении с указанным направлением (SLAM/камера)
+  const [directionFlip180, setDirectionFlip180] = useState(() => {
+    try {
+      return localStorage.getItem('directionFlip180') === 'true';
+    } catch { return false; }
+  });
+
+  // Ручная подстройка угла траектории относительно стрелки направления (градусы)
+  const [directionAngleOffset, setDirectionAngleOffset] = useState(() => {
+    try {
+      const v = localStorage.getItem('directionAngleOffset');
+      return v ? parseFloat(v) : 0;
+    } catch { return 0; }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('directionFlip180', String(directionFlip180));
+    } catch { /* ignore */ }
+  }, [directionFlip180]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('directionAngleOffset', String(directionAngleOffset));
+    } catch { /* ignore */ }
+  }, [directionAngleOffset]);
 
   // Load image size when floorPlan changes
   useEffect(() => {
@@ -110,6 +212,13 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       );
 
       if (validPoints.length === 0) return { ...data, trajectory: [] };
+      if (data.mapAligned) {
+        return {
+          ...data,
+          trajectory: validPoints,
+          turnPoints: data.turnPoints || []
+        };
+      }
 
       // Base coordinates from the first point of THIS trajectory
       const startX = validPoints[0].x;
@@ -138,26 +247,34 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         }));
       }
 
-      // Вычисляем угол поворота: направление на плане + компас
-      let rotationRad = (compassAngle * Math.PI) / 180;
-
+      // Вычисляем угол поворота: при указанном направлении — только оно; иначе — компас
+      let rotationRad: number;
       if (directionPoint && referencePoint) {
         const dirX = (directionPoint.x / 100) * viewBox.width;
         const dirY = (directionPoint.y / 100) * viewBox.height;
         const dist = Math.hypot(dirX - refX, dirY - refY);
-        // Игнорируем направление если точка слишком близко к точке отсчёта
-        if (dist > viewBox.width * 0.02) {
+        if (dist <= viewBox.width * 0.02) {
+          rotationRad = (compassAngle * Math.PI) / 180 + (directionAngleOffset * Math.PI) / 180;
+        } else {
           const directionAngle = Math.atan2(dirY - refY, dirX - refX);
-
           if (validPoints.length >= 2) {
+            // Берём угол по более длинному сегменту (первые ~10% точек), чтобы уменьшить влияние шума
+            const segLen = Math.max(2, Math.min(20, Math.floor(validPoints.length * 0.1)));
             const p0 = validPoints[0];
-            const p1 = validPoints[1];
-            const trajAngle = Math.atan2((p1.y - p0.y) * trajScale, (p1.x - p0.x) * trajScale);
-            rotationRad += directionAngle - trajAngle;
+            const pN = validPoints[segLen - 1];
+            const dx = (pN.x - p0.x) * trajScale;
+            const dy = (pN.y - p0.y) * trajScale;
+            const segDist = Math.hypot(dx, dy);
+            const trajAngle = segDist > 1e-6 ? Math.atan2(dy, dx) : Math.atan2((validPoints[1].y - p0.y) * trajScale, (validPoints[1].x - p0.x) * trajScale);
+            rotationRad = directionAngle - trajAngle;
+            if (directionFlip180) rotationRad += Math.PI;
+            rotationRad += (directionAngleOffset * Math.PI) / 180;
           } else {
-            rotationRad += directionAngle;
+            rotationRad = directionAngle + (directionAngleOffset * Math.PI) / 180;
           }
         }
+      } else {
+        rotationRad = (compassAngle * Math.PI) / 180;
       }
 
       const cos = Math.cos(rotationRad);
@@ -182,8 +299,11 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       const transformedTurnPoints = (data.turnPoints || []).map(turn => {
         const pos = turn.position;
         if (!pos || !Array.isArray(pos)) return turn;
-        const pxVal = typeof pos[0] === 'number' ? pos[0] : (pos as any).x;
-        const pyVal = typeof pos[1] === 'number' ? pos[1] : (pos as any).y;
+        const posRec = pos as number[] | Record<string, unknown>;
+        const pxVal =
+          typeof pos[0] === "number" ? pos[0] : finiteNum((posRec as Record<string, unknown>).x);
+        const pyVal =
+          typeof pos[1] === "number" ? pos[1] : finiteNum((posRec as Record<string, unknown>).y);
         if (typeof pxVal !== 'number' || typeof pyVal !== 'number' || isNaN(pxVal) || isNaN(pyVal)) return turn;
         const px = (pxVal - startX) * trajScale + refX + trajOffset.x;
         const py = (pyVal - startY) * trajScale + refY + trajOffset.y;
@@ -197,7 +317,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         turnPoints: transformedTurnPoints
       };
     });
-  }, [trajectoryData, referencePoint, directionPoint, viewBox.width, viewBox.height, trajScale, trajOffset, compassAngle]);
+  }, [trajectoryData, referencePoint, directionPoint, viewBox.width, viewBox.height, trajScale, trajOffset, compassAngle, directionFlip180, directionAngleOffset]);
 
   // Get transformed turn points for all trajectories
   const getAllTransformedTurnPoints = useMemo(() => {
@@ -220,6 +340,10 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         const data = getTransformedTrajectories[i];
         const points = data.trajectory.map(p => ({ x: p.x, y: p.y }));
         if (points.length < 2) continue;
+        if (data.mapAligned) {
+          next.set(i, points);
+          continue;
+        }
         try {
           const corrected = await correctPathWithFloorPlan(
             floorPlan,
@@ -282,7 +406,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
     if (allTrajectories.length < 2) return null;
 
     let totalDistance = 0;
-    let totalTime = allTrajectories.length * 0.033; // Assuming 30fps
+    const totalTime = allTrajectories.length * 0.033; // Assuming 30fps
     let maxSpeed = 0;
     let avgSpeed = 0;
 
@@ -353,7 +477,28 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
     }
   }, [trajectoryData, imageSize, floorPlan, drawnPlan]);
 
-  const getPathString = (trajectory: any[]) => {
+  // Авто-масштаб траектории при наличии плана: если линия получается < 30px — подобрать масштаб
+  useEffect(() => {
+    if (!floorPlan || !trajectoryData.length) return;
+    const allPoints = trajectoryData.flatMap(d => d.trajectory).filter(
+      p => p && typeof p.x === 'number' && !isNaN(p.x) && typeof p.y === 'number' && !isNaN(p.y)
+    );
+    if (allPoints.length < 2) return;
+    const xs = allPoints.map(p => p.x);
+    const ys = allPoints.map(p => p.y);
+    const extentX = Math.max(Math.max(...xs) - Math.min(...xs), 1e-6);
+    const extentY = Math.max(Math.max(...ys) - Math.min(...ys), 1e-6);
+    const extent = Math.max(extentX, extentY);
+    const targetSize = Math.min(viewBox.width, viewBox.height) * 0.4;
+    const suggestedScale = targetSize / extent;
+    setTrajScale(prev => {
+      const currentSpan = extent * prev;
+      if (currentSpan < 30 && suggestedScale > 0.5 && suggestedScale < 500) return suggestedScale;
+      return prev;
+    });
+  }, [floorPlan, trajectoryData, viewBox.width, viewBox.height]);
+
+  const getPathString = (trajectory: { x: number; y: number }[]) => {
     if (trajectory.length === 0) return "";
 
     return trajectory.reduce((acc, point, i) => {
@@ -466,13 +611,29 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full rounded-2xl bg-gradient-card border border-border/50 overflow-hidden cursor-move"
+      className={`relative w-full h-full rounded-2xl bg-gradient-card border border-border/50 overflow-hidden cursor-move ${isFullscreen ? "fixed inset-0 z-[100] rounded-none border-0 bg-background min-w-full min-h-full" : ""}`}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseUp={handleMouseUp}
       onMouseLeave={handleMouseUp}
       onWheel={handleWheel}
     >
+      {/* Кнопка выхода из полноэкранного режима */}
+      {isFullscreen && (
+        <div className="absolute top-4 right-4 z-50 flex items-center gap-2 bg-background/90 backdrop-blur-md px-3 py-2 rounded-lg border border-border/50 shadow-xl">
+          <span className="text-sm font-medium text-muted-foreground">Чертёж на весь экран</span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5"
+            onClick={(e) => { e.stopPropagation(); exitFullscreen(); }}
+            title="Выйти (Escape)"
+          >
+            <Minimize2 className="h-4 w-4" />
+            Выйти
+          </Button>
+        </div>
+      )}
 
       {/* Floor Plan Controls (Top-Left) */}
       {(floorPlan || drawnPlan) && (
@@ -489,6 +650,39 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
               <Compass className="h-3.5 w-3.5" />
               {setDirectionMode ? "Кликните на карту..." : "Указать направление"}
             </Button>
+          )}
+          {referencePoint && directionPoint && (
+            <>
+              <Button
+                variant={directionFlip180 ? "default" : "ghost"}
+                size="sm"
+                className="h-8 gap-1.5 text-[10px]"
+                onClick={(e) => { e.stopPropagation(); setDirectionFlip180(v => !v); }}
+                title="Развернуть траекторию на 180°, если она идёт в противоположную сторону"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Развернуть 180°
+              </Button>
+              <div className="flex items-center gap-1" title="Подстройка угла траектории относительно стрелки направления">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-[10px]"
+                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 15); }}
+                >
+                  −15°
+                </Button>
+                <span className="text-[10px] font-mono min-w-[3ch] text-center">{directionAngleOffset}°</span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-[10px]"
+                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 15); }}
+                >
+                  +15°
+                </Button>
+              </div>
+            </>
           )}
           {floorPlan && !floorPlan.includes("application/pdf") && (
             <Button
@@ -589,6 +783,19 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           title="Калибровка траектории"
         >
           <Maximize className="h-5 w-5 text-orange-500" />
+        </Button>
+        <Button
+          variant={isFullscreen ? "default" : "outline"}
+          size="icon"
+          className="h-10 w-10 shadow-lg backdrop-blur-md"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (isFullscreen) exitFullscreen();
+            else enterFullscreen();
+          }}
+          title={isFullscreen ? "Выйти с полноэкранного режима" : "Чертёж на полный экран"}
+        >
+          {isFullscreen ? <Minimize2 className="h-5 w-5" /> : <Maximize2 className="h-5 w-5" />}
         </Button>
       </div>
 
@@ -724,7 +931,11 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
               onChange={(e) => {
                 const v = parseFloat(e.target.value);
                 setCompassAngle(v);
-                try { localStorage.setItem('compassAngle', String(v)); } catch {}
+                try {
+                  localStorage.setItem("compassAngle", String(v));
+                } catch {
+                  /* storage unavailable */
+                }
               }}
               className="w-24 accent-primary"
             />
@@ -798,7 +1009,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
               <>
                 {drawnPlan ? (
                   <g>
-                    {drawnPlan.map((s: any) => s.type === 'rect' ?
+                    {(drawnPlan as DrawnPlanShape[]).map((s) => s.type === "rect" ?
                       <rect
                         key={s.id}
                         x={Math.min(s.points[0].x, s.points[1].x)}
@@ -903,12 +1114,13 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       d={getPathString(pathPoints)}
                       fill="none"
                       stroke={data.color}
-                      strokeWidth="4"
+                      strokeWidth={floorPlan ? 5 : 4}
                       strokeLinecap="round"
                       strokeLinejoin="round"
                       strokeDasharray={data.ownerName.includes('Тестовые') ? "4 4" : "none"}
                       filter="url(#trajectoryGlow)"
                       className="animate-path-draw"
+                      opacity={0.95}
                     />
 
                     {/* Trajectory points along the path */}

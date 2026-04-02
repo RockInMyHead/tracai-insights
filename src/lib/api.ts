@@ -1,6 +1,47 @@
 // API client for TrackAI backend
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
+// #region agent log
+async function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const urlStr =
+    typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.href
+        : (input as Request).url;
+  const res = await globalThis.fetch(input, init);
+  fetch('http://127.0.0.1:7343/ingest/767aed2a-4a75-4bf7-922d-0437d34eb3ef', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '64890b' },
+    body: JSON.stringify({
+      sessionId: '64890b',
+      runId: 'run1',
+      hypothesisId: 'H3',
+      location: 'api.ts:agentFetch',
+      message: 'fetch_response',
+      data: { url: urlStr.slice(0, 400), status: res.status, ok: res.ok },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  return res;
+}
+function agentLogXhr(hypothesisId: string, path: string, status: number, ok: boolean): void {
+  fetch('http://127.0.0.1:7343/ingest/767aed2a-4a75-4bf7-922d-0437d34eb3ef', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '64890b' },
+    body: JSON.stringify({
+      sessionId: '64890b',
+      runId: 'run1',
+      hypothesisId,
+      location: 'api.ts:xhr',
+      message: 'xhr_response',
+      data: { path: path.slice(0, 400), status, ok },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+}
+// #endregion
+
 export interface VideoAnalysisResult {
   success: boolean;
   status?: string;
@@ -8,7 +49,15 @@ export interface VideoAnalysisResult {
   data?: {
     method: string;
     trajectory: number[][];
+    map_trajectory?: number[][];
     turn_points: Array<{
+      frame_index: number;
+      trajectory_index: number;
+      angle_degrees: number;
+      position: number[];
+      turn_type: string;
+    }>;
+    map_turn_points?: Array<{
       frame_index: number;
       trajectory_index: number;
       angle_degrees: number;
@@ -22,6 +71,19 @@ export interface VideoAnalysisResult {
       scale_factor: number;
       fps: number;
       turns_detected: number;
+      avg_matches_per_frame?: number;
+      ransac_failure_rate?: number;
+      gating_failure_rate?: number;
+      map_matching_applied?: boolean;
+      map_trajectory_points?: number;
+      map_auto_scale?: number;
+    };
+    map_metadata?: {
+      plan_width: number;
+      plan_height: number;
+      grid_cell: number;
+      auto_scale: number;
+      source: string;
     };
     total_processing_time: number;
     video_info: {
@@ -33,6 +95,19 @@ export interface VideoAnalysisResult {
     };
   };
   message: string;
+}
+
+export interface TrackingOptions {
+  detect_interval?: number;
+  turn_vote_threshold?: number;
+  use_ml_roi?: boolean;
+}
+
+export interface MapContext {
+  floor_plan_data?: string | null;
+  drawn_plan?: unknown[] | null;
+  reference_point?: { x: number; y: number } | null;
+  direction_point?: { x: number; y: number } | null;
 }
 
 export interface VideoListItem {
@@ -48,7 +123,7 @@ export interface VideoListItem {
 export interface Plan {
   id?: number;
   name: string;
-  data: any[];
+  data: unknown[];
   preview_svg?: string;
   created_at?: string;
 }
@@ -56,6 +131,25 @@ export interface Plan {
 export interface VideoListResponse {
   success: boolean;
   videos: VideoListItem[];
+}
+
+export interface TrackingTask {
+  id: string;
+  employee_name?: string;
+  original_filename: string;
+  status: string;
+  created_at: string;
+  map_context?: MapContext;
+}
+
+
+export interface ManualTrajectoryResponse {
+  success: boolean;
+  video_id: string;
+  exists: boolean;
+  trajectory?: number[][];
+  turn_points?: Record<string, unknown>[];
+  updated_at?: string;
 }
 
 export class ApiClient {
@@ -68,10 +162,14 @@ export class ApiClient {
   /** Загрузить видео на сервер (без анализа). Таймаут 2 часа для больших файлов. */
   async uploadVideo(
     file: File,
-    onUploadProgress?: (progress: number) => void
+    onUploadProgress?: (progress: number) => void,
+    employeeName?: string
   ): Promise<{ success: boolean; video_id: string; filename: string; original_filename: string; file_size: number }> {
     const formData = new FormData();
     formData.append('file', file);
+    if (employeeName) {
+      formData.append('employee_name', employeeName);
+    }
 
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -86,6 +184,9 @@ export class ApiClient {
       }
 
       xhr.onload = () => {
+        // #region agent log
+        agentLogXhr('H4', `${this.baseUrl}/api/upload-video`, xhr.status, xhr.status >= 200 && xhr.status < 300);
+        // #endregion
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
             resolve(JSON.parse(xhr.responseText));
@@ -113,18 +214,30 @@ export class ApiClient {
     videoId: string,
     scaleFactor: number = 12.306,
     stabilize: boolean = true,
-    originalFilename?: string
+    originalFilename?: string,
+    trackingOptions?: TrackingOptions,
+    mapContext?: MapContext,
+    employeeName?: string
   ): Promise<VideoAnalysisResult> {
-    const response = await fetch(`${this.baseUrl}/api/analyze-video-by-id`, {
+    const response = await agentFetch(`${this.baseUrl}/api/analyze-video-by-id`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         video_id: videoId,
         scale_factor: scaleFactor,
         stabilize,
-        original_filename: originalFilename || 'video'
+        original_filename: originalFilename || 'video',
+        detect_interval: trackingOptions?.detect_interval ?? 5,
+        turn_vote_threshold: trackingOptions?.turn_vote_threshold ?? 3,
+        use_ml_roi: trackingOptions?.use_ml_roi ?? true,
+        floor_plan_data: mapContext?.floor_plan_data ?? null,
+        drawn_plan: mapContext?.drawn_plan ?? null,
+        reference_point: mapContext?.reference_point ?? null,
+        direction_point: mapContext?.direction_point ?? null,
+        employee_name: employeeName
       }),
     });
+
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
       throw new Error(err.detail || `Ошибка ${response.status}`);
@@ -137,7 +250,10 @@ export class ApiClient {
     scaleFactor: number = 12.306,
     stabilize: boolean = true,
     clientId?: string,
-    onUploadProgress?: (progress: number) => void
+    onUploadProgress?: (progress: number) => void,
+    trackingOptions?: TrackingOptions,
+    mapContext?: MapContext,
+    employeeName?: string
   ): Promise<VideoAnalysisResult> {
     console.log(`🔗 API: Отправка запроса на анализ видео`);
     console.log(`   📄 Файл: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
@@ -149,6 +265,25 @@ export class ApiClient {
     formData.append('file', file);
     formData.append('scale_factor', scaleFactor.toString());
     formData.append('stabilize', stabilize.toString());
+    formData.append('detect_interval', String(trackingOptions?.detect_interval ?? 5));
+    formData.append('turn_vote_threshold', String(trackingOptions?.turn_vote_threshold ?? 3));
+    formData.append('use_ml_roi', String(trackingOptions?.use_ml_roi ?? true));
+    if (employeeName) {
+      formData.append('employee_name', employeeName);
+    }
+
+    if (mapContext?.floor_plan_data) {
+      formData.append('floor_plan_data', mapContext.floor_plan_data);
+    }
+    if (mapContext?.drawn_plan) {
+      formData.append('drawn_plan', JSON.stringify(mapContext.drawn_plan));
+    }
+    if (mapContext?.reference_point) {
+      formData.append('reference_point', JSON.stringify(mapContext.reference_point));
+    }
+    if (mapContext?.direction_point) {
+      formData.append('direction_point', JSON.stringify(mapContext.direction_point));
+    }
     if (clientId) {
       formData.append('client_id', clientId);
     }
@@ -172,6 +307,9 @@ export class ApiClient {
         const endTime = Date.now();
         const responseTime = (endTime - startTime) / 1000;
         console.log(`📡 API: Получен ответ от сервера (${xhr.status}) за ${responseTime.toFixed(1)} сек`);
+        // #region agent log
+        agentLogXhr('H4', `${this.baseUrl}/api/analyze-video`, xhr.status, xhr.status >= 200 && xhr.status < 300);
+        // #endregion
 
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
@@ -213,23 +351,102 @@ export class ApiClient {
   }
 
   async healthCheck(): Promise<{ status: string; service: string }> {
-    const response = await fetch(`${this.baseUrl}/api/health`);
+    const response = await agentFetch(`${this.baseUrl}/api/health`);
     if (!response.ok) {
       throw new Error('Backend is not available');
     }
     return response.json();
   }
 
+  /** Список загруженных на сервер видео (для выбора перед анализом) */
+  async getUploadedVideosList(): Promise<VideoListResponse> {
+    const response = await agentFetch(`${this.baseUrl}/api/uploaded-videos`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch uploaded videos list');
+    }
+    return response.json();
+  }
+
+  async getAdminTasks(): Promise<TrackingTask[]> {
+    const response = await agentFetch(`${this.baseUrl}/api/admin/tasks`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch admin tasks');
+    }
+    return response.json();
+  }
+
+  async getAdminTask(id: string): Promise<TrackingTask> {
+    const response = await agentFetch(`${this.baseUrl}/api/admin/tasks/${id}`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch admin task');
+    }
+    return response.json();
+  }
+
+  async updateTaskContext(taskId: string, context: {
+    floor_plan_data?: string | null;
+    drawn_plan?: unknown[] | null;
+    reference_point?: { x: number; y: number } | null;
+    direction_point?: { x: number; y: number } | null;
+    employee_name?: string;
+  }): Promise<{ success: boolean }> {
+    const response = await agentFetch(`${this.baseUrl}/api/admin/tasks/${taskId}/context`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(context),
+    });
+    if (!response.ok) {
+      // Silently fail — context sync is best-effort
+      console.warn(`Failed to update task context for ${taskId}`);
+      return { success: false };
+    }
+    return response.json();
+  }
+
   async getVideosList(): Promise<VideoListResponse> {
-    const response = await fetch(`${this.baseUrl}/api/videos`);
+    const response = await agentFetch(`${this.baseUrl}/api/videos`);
     if (!response.ok) {
       throw new Error('Failed to fetch videos list');
     }
     return response.json();
   }
 
+  getUploadedVideoUrl(videoId: string): string {
+    return `${this.baseUrl}/api/uploaded-video/${videoId}/stream`;
+  }
+
+  async getManualTrajectory(videoId: string): Promise<ManualTrajectoryResponse> {
+    const response = await agentFetch(`${this.baseUrl}/api/manual-trajectory/${videoId}`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch manual trajectory');
+    }
+    return response.json();
+  }
+
+  async saveManualTrajectory(
+    videoId: string,
+    trajectory: number[][],
+    turnPoints: Record<string, unknown>[] = []
+  ): Promise<{ success: boolean; video_id: string; updated_at: string; trajectory_points: number }> {
+    const response = await agentFetch(`${this.baseUrl}/api/manual-trajectory/${videoId}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        trajectory,
+        turn_points: turnPoints,
+      }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || "Failed to save manual trajectory");
+    }
+    return response.json();
+  }
+
   async getVideoAnalysis(videoId: string): Promise<VideoAnalysisResult> {
-    const response = await fetch(`${this.baseUrl}/api/video/${videoId}`);
+    const response = await agentFetch(`${this.baseUrl}/api/video/${videoId}`);
     if (!response.ok) {
       throw new Error('Failed to fetch video analysis');
     }
@@ -240,9 +457,9 @@ export class ApiClient {
     status: string;
     progress: number;
     message: string;
-    result?: any;
+    result?: VideoAnalysisResult["data"];
   }> {
-    const response = await fetch(`${this.baseUrl}/api/status/${videoId}`);
+    const response = await agentFetch(`${this.baseUrl}/api/status/${videoId}`);
     if (!response.ok) {
       // If status endpoint returns 404 or other error, return default unknown status
       return { status: "unknown", progress: 0, message: "Status not available" };
@@ -255,7 +472,7 @@ export class ApiClient {
   }
 
   async getPlans(): Promise<Plan[]> {
-    const response = await fetch(`${this.baseUrl}/api/plans`);
+    const response = await agentFetch(`${this.baseUrl}/api/plans`);
     if (!response.ok) {
       throw new Error('Failed to fetch plans');
     }
@@ -263,7 +480,7 @@ export class ApiClient {
   }
 
   async savePlan(plan: Plan): Promise<{ id: number; name: string; status: string }> {
-    const response = await fetch(`${this.baseUrl}/api/plans`, {
+    const response = await agentFetch(`${this.baseUrl}/api/plans`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -277,7 +494,7 @@ export class ApiClient {
   }
 
   async deletePlan(id: number): Promise<{ status: string; id: number }> {
-    const response = await fetch(`${this.baseUrl}/api/plans/${id}`, {
+    const response = await agentFetch(`${this.baseUrl}/api/plans/${id}`, {
       method: 'DELETE',
     });
     if (!response.ok) {
@@ -367,7 +584,7 @@ export class ApiClient {
       if (Date.now() - start > timeout) {
         throw new Error('Превышено время ожидания. Файл 170 MB — экспортируйте план в PNG в AutoCAD (File → Export → PNG).');
       }
-      const statusRes = await fetch(`${this.baseUrl}/api/convert-dwg-status/${job_id}`);
+      const statusRes = await agentFetch(`${this.baseUrl}/api/convert-dwg-status/${job_id}`);
       const status = await statusRes.json();
       const serverProgress = status.progress ?? 0;
       onProgress?.(20 + Math.round(serverProgress * 0.8), status.message ?? '');

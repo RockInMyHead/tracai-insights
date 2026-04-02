@@ -8,7 +8,11 @@ import { apiClient, VideoListItem } from "@/lib/api";
 
 interface VideoLibraryProps {
   onVideoSelected?: (video: VideoListItem) => void;
-  onAnalysisLoaded?: (trajectory: number[][], turnPoints: any[], stats: any) => void;
+  onAnalysisLoaded?: (
+    trajectory: number[][],
+    turnPoints: Record<string, unknown>[],
+    stats: Record<string, unknown> | undefined
+  ) => void;
 }
 
 const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) => {
@@ -37,8 +41,12 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
     }
   };
 
-  const handleVideoSelect = (video: VideoListItem) => {
+  const handleVideoSelect = async (video: VideoListItem) => {
     onVideoSelected?.(video);
+    // Автоматически загружаем анализ при выборе видео
+    if (video.has_analysis) {
+      await handleLoadAnalysis(video);
+    }
   };
 
   const handleLoadAnalysis = async (video: VideoListItem) => {
@@ -50,9 +58,9 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
         toast.error("Не удалось загрузить анализ видео");
         return;
       }
-      const data = result.data as { trajectory?: unknown; turn_points?: unknown; processing_stats?: unknown };
-      const trajectory = data.trajectory;
-      const turnPoints = data.turn_points ?? [];
+      const data = result.data as { trajectory?: unknown; map_trajectory?: unknown; turn_points?: unknown; map_turn_points?: unknown; processing_stats?: unknown };
+      const trajectory = data.map_trajectory ?? data.trajectory;
+      const turnPoints = data.map_turn_points ?? data.turn_points ?? [];
       const stats = data.processing_stats;
 
       if (!trajectory || !Array.isArray(trajectory) || trajectory.length === 0) {
@@ -61,7 +69,11 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
       }
 
       if (onAnalysisLoaded) {
-        onAnalysisLoaded(trajectory as number[][], turnPoints as any[], stats);
+        onAnalysisLoaded(
+          trajectory as number[][],
+          Array.isArray(turnPoints) ? (turnPoints as Record<string, unknown>[]) : [],
+          stats as Record<string, unknown> | undefined
+        );
         toast.success(`Анализ "${video.filename}" загружен`);
       }
     } catch (error) {

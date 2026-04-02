@@ -1,0 +1,348 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T2A]{fontenc}
+\usepackage[russian]{babel}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{parskip}
+
+\geometry{margin=2cm}
+
+\title{Детальное описание функционала TrackAI}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+По каждому функционалу: задача, строки кода, изменённые файлы, артефакт на выходе.
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{1. Загрузка видео (Upload Video)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Загрузить видеофайл на сервер потоково (чанками 1 MB) без немедленного анализа. Поддержка больших файлов (до 500 MB). \\
+Строк кода & Backend: $\sim$150 (main.py) + Frontend: $\sim$240 (api.ts) = \textbf{$\sim$390} \\
+Изменённые файлы & \texttt{backend/main.py}, \texttt{src/lib/api.ts} \\
+Артефакт на выходе & \texttt{\{ success, video\_id, filename, original\_filename, file\_size \}} — идентификатор для последующего анализа; файл в \texttt{videos/} \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{2. Анализ видео по ID (Analyze Video by ID)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Запустить анализ уже загруженного видео по \texttt{video\_id}. Двухшаговый процесс: сначала upload, затем analyze. Фоновая обработка. \\
+Строк кода & Backend: $\sim$180 (main.py) + Frontend: $\sim$150 (api.ts) + TrajectoryAnalysis: $\sim$300 = \textbf{$\sim$630} \\
+Изменённые файлы & \texttt{backend/main.py}, \texttt{src/lib/api.ts}, \texttt{src/pages/TrajectoryAnalysis.tsx} \\
+Артефакт на выходе & \texttt{\{ success, video\_id, status: "queued" \}}; после обработки — JSON с траекторией, turn\_points, статистикой; PNG-визуализация в \texttt{outputs/} \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{3. Обработка видео (Video Tracker — SLAM, стабилизация)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Извлечь траекторию движения из видео: Visual Odometry (SLAM), опциональная стабилизация, детекция поворотов, расчёт дистанции. \\
+Строк кода & processor.py: \textbf{1539}, slam\_wrapper.py: \textbf{456}, stabilization.py: \textbf{216}, video\_utils.py: \textbf{123} = \textbf{$\sim$2340} \\
+Изменённые файлы & \texttt{backend/video\_tracker/src/processor.py}, \texttt{slam\_wrapper.py}, \texttt{stabilization.py}, \texttt{utils/video\_utils.py} \\
+Артефакт на выходе & \texttt{*\_analysis.json} (траектория, turn\_points, video\_info, processing\_stats); \texttt{*\_trajectory\_square.png} — визуализация пути \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{4. Библиотека видео (Video Library)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Список загруженных видео, загрузка сохранённого анализа по \texttt{video\_id}, отображение траектории на карте. \\
+Строк кода & Backend: $\sim$240 (main.py: GET /videos, GET /video/\{id\}) + Frontend: \textbf{624} (VideoLibrary.tsx) = \textbf{$\sim$870} \\
+Изменённые файлы & \texttt{backend/main.py}, \texttt{src/components/VideoLibrary.tsx} \\
+Артефакт на выходе & UI: список видео с датой, размером, статусом; при «Загрузить анализ» — траектория на карте \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{5. Карта траекторий (TrajectoryMap)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Интерактивная SVG-карта: план помещения, траектории, точка отсчёта, направление, компас, zoom/pan, pathfinding, калибровка масштаба. \\
+Строк кода & \textbf{3 333} \\
+Изменённые файлы & \texttt{src/components/TrajectoryMap.tsx} \\
+Артефакт на выходе & Визуализация траекторий на плане с поворотом по направлению; компас; heatmap; экспорт \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{6. Страница анализа траектории (TrajectoryAnalysis Page)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Главная страница: загрузка плана (img/PDF/DWG), установка точки отсчёта и направления, загрузка видео, запуск анализа, отображение результатов. \\
+Строк кода & \textbf{2 868} \\
+Изменённые файлы & \texttt{src/pages/TrajectoryAnalysis.tsx} \\
+Артефакт на выходе & UI: план с маркерами, вкладки (План / Видео / Результаты), кнопки «Указать направление», «Сбросить точку» \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{7. Компонент карточки анализа (TrajectoryAnalysis Component)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Карточка с вкладками: траектория, статистика, точки поворота. Интеграция TrajectoryMap, VideoLibrary. \\
+Строк кода & \textbf{2 883} \\
+Изменённые файлы & \texttt{src/components/TrajectoryAnalysis.tsx} \\
+Артефакт на выходе & UI: карточка с графиком траектории, статистикой (дистанция, повороты), списком turn points \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{8. Pathfinding по плану}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Траектория следует плану, не проходит сквозь стены. A* на occupancy grid из изображения (luminance). \\
+Строк кода & \textbf{642} \\
+Изменённые файлы & \texttt{src/lib/pathfinding.ts} \\
+Артефакт на выходе & Скорректированный массив точек \texttt{\{x, y\}[]}, обходящий стены на плане \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{9. Точка отсчёта и направление (Reference Point \& Direction)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Клик по плану $\rightarrow$ точка отсчёта; второй клик $\rightarrow$ направление. Коррекция координат при object-contain (img/SVG). \\
+Строк кода & $\sim$360 (handleFloorPlanClick, planImgLayout, overlay) в TrajectoryAnalysis page \\
+Изменённые файлы & \texttt{src/pages/TrajectoryAnalysis.tsx} \\
+Артефакт на выходе & \texttt{referencePoint}, \texttt{directionPoint} в localStorage; стрелка на плане; угол для поворота траектории \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{10. Компас и калибровка направления}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Угол поворота плана (0--360°), калибровка масштаба по двум точкам (известное расстояние в метрах). \\
+Строк кода & $\sim$450 в TrajectoryMap (compassAngle, scaleCalibStep, scalePointA/B) \\
+Изменённые файлы & \texttt{src/components/TrajectoryMap.tsx} \\
+Артефакт на выходе & Визуализация с повёрнутым планом; компас внизу; сохранение compassAngle в localStorage \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{11. API-клиент (api.ts)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Единая точка доступа к backend: uploadVideo, analyzeVideoById, getVideos, getVideoAnalysis, plans CRUD, convertDwg, convertPdf. \\
+Строк кода & \textbf{1 155} \\
+Изменённые файлы & \texttt{src/lib/api.ts} \\
+Артефакт на выходе & Класс ApiClient с методами; типы VideoAnalysisResult, VideoListItem, Plan \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{12. Конвертация DWG $\rightarrow$ PNG}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Загрузить DWG, конвертировать через ODA File Converter (DWG$\rightarrow$DXF$\rightarrow$SVG$\rightarrow$PNG), вернуть PNG в base64. Асинхронно с polling статуса. \\
+Строк кода & Backend: $\sim$360 (main.py) + Frontend: $\sim$180 (api.ts, TrajectoryAnalysis) = \textbf{$\sim$540} \\
+Изменённые файлы & \texttt{backend/main.py}, \texttt{src/lib/api.ts}, \texttt{src/pages/TrajectoryAnalysis.tsx} \\
+Артефакт на выходе & \texttt{\{ job\_id \}} $\rightarrow$ \texttt{\{ status, progress, png?, filename? \}}; PNG-изображение плана \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{13. Конвертация PDF $\rightarrow$ PNG}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Первая страница PDF $\rightarrow$ PNG через pdftoppm (poppler-utils). \\
+Строк кода & Backend: $\sim$105 (main.py) + Frontend: $\sim$90 = \textbf{$\sim$195} \\
+Изменённые файлы & \texttt{backend/main.py}, \texttt{src/pages/TrajectoryAnalysis.tsx} \\
+Артефакт на выходе & \texttt{\{ success, png, filename \}} — base64 PNG \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{14. Библиотека планов (Plans CRUD)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Сохранение, список, удаление нарисованных планов. SQLite. \\
+Строк кода & Backend: $\sim$210 (main.py) + Frontend: PlanLibrary \textbf{387} + api $\sim$150 = \textbf{$\sim$750} \\
+Изменённые файлы & \texttt{backend/main.py}, \texttt{src/components/PlanLibrary.tsx}, \texttt{src/lib/api.ts} \\
+Артефакт на выходе & \texttt{GET /api/plans} $\rightarrow$ список; \texttt{POST /api/plans} $\rightarrow$ id; \texttt{DELETE /api/plans/\{id\}}; UI списка планов \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{15. Редактор плана (Plan Editor)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & Рисование стен (линии) и прямоугольников на canvas. Сохранение в библиотеку. \\
+Строк кода & \textbf{873} \\
+Изменённые файлы & \texttt{src/components/PlanEditor.tsx} \\
+Артефакт на выходе & \texttt{drawnPlan: \{ type, points \}[]}; SVG preview; сохранение через API \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{16. Чат поддержки (Support Chat)}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & UI чата с AI (backend /api/chat). Отправка сообщений, отображение ответов. \\
+Строк кода & SupportChat: \textbf{909}, Support page: \textbf{132}, Backend chat: $\sim$300 = \textbf{$\sim$1350} \\
+Изменённые файлы & \texttt{src/components/SupportChat.tsx}, \texttt{src/pages/Support.tsx}, \texttt{backend/main.py} \\
+Артефакт на выходе & UI чата; ответы AI в реальном времени \\
+\bottomrule
+\end{tabular}
+
+\vspace{1em}
+\hrule
+\vspace{1em}
+
+\section{17. Уведомления об ошибках в Telegram}
+
+\begin{tabular}{>{\bfseries}l p{10cm}}
+\toprule
+Параметр & Значение \\
+\midrule
+Задача & При ошибках обработки видео — отправка в Telegram канал. \\
+Строк кода & $\sim$240 в main.py \\
+Изменённые файлы & \texttt{backend/main.py} \\
+Артефакт на выходе & Сообщение в Telegram с контекстом ошибки \\
+\bottomrule
+\end{tabular}
+
+\vspace{2em}
+\hrule
+\vspace{1em}
+
+\section*{Сводная таблица}
+
+\begin{center}
+\begin{tabular}{clccc}
+\toprule
+№ & Функционал & Строк & Файлов & Артефакт \\
+\midrule
+1 & Загрузка видео & $\sim$390 & 2 & video\_id, файл \\
+2 & Анализ по ID & $\sim$630 & 3 & JSON траектории, PNG \\
+3 & Video Tracker (SLAM) & $\sim$2340 & 4 & analysis.json, trajectory.png \\
+4 & Библиотека видео & $\sim$870 & 2 & UI списка, траектория \\
+5 & TrajectoryMap & 3\,333 & 1 & Визуализация на карте \\
+6 & TrajectoryAnalysis Page & 2\,868 & 1 & UI страницы \\
+7 & TrajectoryAnalysis Component & 2\,883 & 1 & Карточка анализа \\
+8 & Pathfinding & 642 & 1 & Скорректированные точки \\
+9 & Точка отсчёта и направление & $\sim$360 & 1 & referencePoint, directionPoint \\
+10 & Компас и калибровка & $\sim$450 & 1 & Угол, масштаб \\
+11 & API-клиент & 1\,155 & 1 & ApiClient \\
+12 & DWG $\rightarrow$ PNG & $\sim$540 & 3 & PNG план \\
+13 & PDF $\rightarrow$ PNG & $\sim$195 & 2 & PNG план \\
+14 & Библиотека планов & $\sim$750 & 3 & CRUD планов \\
+15 & Редактор плана & 873 & 1 & drawnPlan \\
+16 & Чат поддержки & $\sim$1350 & 3 & UI чата \\
+17 & Telegram ошибки & $\sim$240 & 1 & Уведомление \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{1em}
+\textbf{Итого:} $\sim$19\,500+ строк кода, 20+ файлов.
+
+\end{document}

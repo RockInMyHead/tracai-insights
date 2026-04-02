@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Link } from "react-router-dom";
-import { ArrowRight, Play, Shield, Zap, BarChart3 } from "lucide-react";
+import { ArrowRight, Play, Shield, Zap, BarChart3, Download } from "lucide-react";
 
 const HeroSection = () => {
   return (
@@ -37,7 +37,13 @@ const HeroSection = () => {
                 <ArrowRight className="h-5 w-5" />
               </Button>
             </Link>
-            <Button variant="outline" size="xl" className="gap-2">
+            <Link to="/download">
+              <Button variant="outline" size="xl" className="gap-2">
+                <Download className="h-5 w-5" />
+                Скачать приложение
+              </Button>
+            </Link>
+            <Button variant="ghost" size="xl" className="gap-2">
               <Play className="h-5 w-5" />
               Смотреть демо
             </Button>

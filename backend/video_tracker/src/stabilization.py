@@ -8,7 +8,33 @@ logger = logging.getLogger(__name__)
 
 FFMPEG_STAB_TIMEOUT = 1800  # 30 минут для больших видео
 
-def stabilize_video(input_path: Path, output_path: Path = None, progress_callback=None, timeout: int = FFMPEG_STAB_TIMEOUT):
+
+def _video_duration_sec(path: Path) -> float:
+    ffprobe_path = '/usr/bin/ffprobe' if os.path.exists('/usr/bin/ffprobe') else 'ffprobe'
+    try:
+        result = subprocess.run(
+            [ffprobe_path, '-v', 'error', '-show_entries', 'format=duration', '-of',
+             'default=noprint_wrappers=1:nokey=1', str(path)],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def _compute_smoothing(duration_sec: float) -> int:
+    if duration_sec <= 60:
+        return 40
+    if duration_sec <= 180:
+        return 55
+    if duration_sec <= 600:
+        return 70
+    return 90
+
+def stabilize_video(input_path: Path, output_path: Path = None, progress_callback=None, timeout: int = FFMPEG_STAB_TIMEOUT,
+                    dynamic_smoothing: bool = True):
     """
     Высокоскоростная стабилизация видео с использованием FFmpeg (vid.stab).
     Это в 5-10 раз быстрее, чем решение на чистом Python.
@@ -30,6 +56,9 @@ def stabilize_video(input_path: Path, output_path: Path = None, progress_callbac
     transforms_path = input_path.parent / f"{input_path.stem}_transforms.trf"
     
     try:
+        duration_sec = _video_duration_sec(input_path) if dynamic_smoothing else 0
+        smoothing_val = _compute_smoothing(duration_sec) if duration_sec > 0 else 45
+
         # ШАГ 1: Анализ движения (Pass 1)
         # Мы также уменьшаем разрешение до 720p для ускорения всех последующих этапов
         if progress_callback:
@@ -38,7 +67,7 @@ def stabilize_video(input_path: Path, output_path: Path = None, progress_callbac
         logger.info("Шаг 1: Анализ векторов движения...")
         subprocess.run([
             ffmpeg_path, '-v', 'error', '-i', str(input_path),
-            '-vf', 'scale=-2:720,vidstabdetect=shakiness=10:accuracy=15:result=' + str(transforms_path),
+            '-vf', 'scale=-2:720,vidstabdetect=shakiness=10:accuracy=18:result=' + str(transforms_path),
             '-f', 'null', '-'
         ], check=True, timeout=timeout)
 
@@ -49,8 +78,9 @@ def stabilize_video(input_path: Path, output_path: Path = None, progress_callbac
         logger.info("Шаг 2: Применение стабилизации и рендеринг...")
         subprocess.run([
             ffmpeg_path, '-v', 'error', '-i', str(input_path),
-            '-vf', f'scale=-2:720,vidstabtransform=smoothing=30:input={str(transforms_path)},unsharp=5:5:0.8:3:3:0.4',
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+            '-vf', f'scale=-2:720,vidstabtransform=smoothing={smoothing_val}:tripod=1:input={str(transforms_path)},unsharp=5:5:0.8:3:3:0.4',
+            '-c:v', 'libx264', '-preset', 'slow', '-crf', '21',
+            '-threads', '0',
             '-c:a', 'copy', '-y', str(output_path)
         ], check=True, timeout=timeout)
 
