@@ -5,13 +5,15 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { apiClient, TrackingTask } from "@/lib/api";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { MousePointer2, Image as ImageIcon, Video, User, Clock, CheckCircle2, AlertCircle, Loader2, RefreshCw } from "lucide-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { MousePointer2, Image as ImageIcon, Video, User, Clock, CheckCircle2, AlertCircle, Loader2, RefreshCw, Gauge } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 
 const ADMIN_LOGIN = "adm!n";
 const ADMIN_PASSWORD = "bdyltrcrjvgfybz123";
 const ADMIN_SESSION_KEY = "trackai_admin_authenticated";
+
+const PLAYBACK_RATES = ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "2"] as const;
 
 const Admin = () => {
     const [username, setUsername] = useState("");
@@ -23,10 +25,10 @@ const Admin = () => {
     const [dataError, setDataError] = useState("");
     const [selectedTaskId, setSelectedTaskId] = useState("");
     const [manualPoints, setManualPoints] = useState<Array<{ x: number; y: number }>>([]);
-    const [drawingSource, setDrawingSource] = useState<"video" | "plan">("video");
+    const [playbackRate, setPlaybackRate] = useState("1");
     const [isSavingTrajectory, setIsSavingTrajectory] = useState(false);
     const [trajectoryNotice, setTrajectoryNotice] = useState("");
-    const videoContainerRef = useRef<HTMLDivElement | null>(null);
+    const videoRef = useRef<HTMLVideoElement | null>(null);
     const planContainerRef = useRef<SVGSVGElement | null>(null);
 
     useEffect(() => {
@@ -89,15 +91,13 @@ const Admin = () => {
         ? apiClient.getUploadedVideoUrl(selectedTask.id)
         : "";
 
-    const handleCanvasClick = (event: MouseEvent<HTMLDivElement>) => {
-        if (!videoContainerRef.current) return;
-        const rect = videoContainerRef.current.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return;
-        const x = ((event.clientX - rect.left) / rect.width) * 100;
-        const y = ((event.clientY - rect.top) / rect.height) * 100;
-        setManualPoints((prev) => [...prev, { x: Number(x.toFixed(3)), y: Number(y.toFixed(3)) }]);
-        setTrajectoryNotice("");
-    };
+    useEffect(() => {
+        const v = videoRef.current;
+        if (!v) return;
+        const rate = Number.parseFloat(playbackRate);
+        if (!Number.isFinite(rate) || rate <= 0) return;
+        v.playbackRate = rate;
+    }, [playbackRate, selectedVideoUrl, selectedTaskId]);
 
     const handlePlanCanvasClick = (event: MouseEvent<SVGSVGElement>) => {
         if (!planContainerRef.current) return;
@@ -123,6 +123,7 @@ const Admin = () => {
 
     const handleSelectTask = async (taskId: string) => {
         setSelectedTaskId(taskId);
+        setPlaybackRate("1");
         setManualPoints([]);
         setTrajectoryNotice("");
         if (!taskId) return;
@@ -168,7 +169,7 @@ const Admin = () => {
         <div className="min-h-screen bg-slate-950 text-slate-50 font-sans selection:bg-primary/30">
             <Navbar />
             <main className="container mx-auto px-6 pt-24 pb-12">
-                <div className="mx-auto max-w-6xl">
+                <div className="mx-auto max-w-7xl">
                     {!isAuthenticated ? (
                         <Card className="mx-auto max-w-md bg-slate-900 border-slate-800 shadow-2xl">
                             <CardHeader className="text-center">
@@ -310,91 +311,80 @@ const Admin = () => {
                                 <Card className="lg:col-span-3 bg-slate-900 border-slate-800 shadow-xl overflow-hidden flex flex-col">
                                     {selectedTask ? (
                                         <>
-                                            <CardHeader className="bg-slate-800/30 flex flex-row items-center justify-between border-b border-slate-800/50">
+                                            <CardHeader className="bg-slate-800/30 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/50">
                                                 <div className="flex flex-col">
-                                                    <CardTitle className="text-xl flex items-center gap-3">
+                                                    <CardTitle className="text-xl flex items-center gap-3 flex-wrap">
                                                         <Badge className="bg-blue-600 text-white hover:bg-blue-600">Активная сессия</Badge>
                                                         {selectedTask.employee_name || "Без имени"}
                                                     </CardTitle>
                                                     <CardDescription className="flex items-center gap-2 mt-1">
                                                         <Video className="h-3 w-3" /> {selectedTask.original_filename}
                                                     </CardDescription>
-                                                </div>
-                                                <div className="flex gap-2">
-                                                    <Button 
-                                                        size="sm"
-                                                        variant={drawingSource === 'video' ? 'secondary' : 'ghost'} 
-                                                        onClick={() => setDrawingSource('video')}
-                                                        className="gap-2"
-                                                    >
-                                                        <Video className="h-4 w-4" /> Видео
-                                                    </Button>
-                                                    <Button 
-                                                        size="sm"
-                                                        variant={drawingSource === 'plan' ? 'secondary' : 'ghost'} 
-                                                        onClick={() => setDrawingSource('plan')}
-                                                        className={`gap-2 ${!selectedTask.map_context?.floor_plan_data && !selectedTask.map_context?.drawn_plan ? 'opacity-50 grayscale' : ''}`}
-                                                    >
-                                                        <ImageIcon className="h-4 w-4" /> Чертеж
-                                                    </Button>
+                                                    <p className="text-[11px] text-slate-500 mt-2 max-w-xl">
+                                                        Слева — просмотр записи (ускорение без влияния на траекторию). Справа — кликайте по чертежу, чтобы отметить путь.
+                                                    </p>
                                                 </div>
                                             </CardHeader>
                                             <CardContent className="p-0 bg-black/40 relative">
-                                                <div className="p-6">
-                                                    {drawingSource === "video" ? (
-                                                        <div className="space-y-4">
-                                                            <div
-                                                                ref={videoContainerRef}
-                                                                onClick={handleCanvasClick}
-                                                                className="relative overflow-hidden rounded-xl border border-slate-800 bg-black cursor-crosshair group shadow-2xl"
-                                                            >
-                                                                <video src={selectedVideoUrl} controls className="h-[520px] w-full object-contain" />
-                                                                <svg
-                                                                    className="pointer-events-none absolute inset-0 h-full w-full"
-                                                                    viewBox="0 0 100 100"
-                                                                    preserveAspectRatio="none"
-                                                                >
-                                                                    {manualPoints.length > 1 && (
-                                                                        <polyline
-                                                                            points={manualPoints.map((p) => `${p.x},${p.y}`).join(" ")}
-                                                                            fill="none"
-                                                                            stroke="#38bdf8"
-                                                                            strokeWidth="0.8"
-                                                                            strokeLinecap="round"
-                                                                            strokeLinejoin="round"
-                                                                            className="drop-shadow-[0_0_8px_rgba(56,189,248,0.8)]"
-                                                                        />
-                                                                    )}
-                                                                    {manualPoints.map((p, idx) => (
-                                                                        <circle 
-                                                                            key={`vp-${idx}`} 
-                                                                            cx={p.x} cy={p.y} r="0.8" 
-                                                                            fill={idx === manualPoints.length - 1 ? "#f43f5e" : "#0ea5e9"} 
-                                                                            className={idx === manualPoints.length - 1 ? "animate-pulse" : ""}
-                                                                        />
-                                                                    ))}
-                                                                </svg>
-                                                                {manualPoints.length === 0 && (
-                                                                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none group-hover:bg-black/20 transition-all">
-                                                                        <div className="text-center bg-black/60 backdrop-blur-md p-4 rounded-2xl border border-white/10 opacity-0 group-hover:opacity-100 transition-all">
-                                                                            <MousePointer2 className="h-8 w-8 mx-auto mb-2 text-blue-400" />
-                                                                            <p className="text-sm font-medium">Кликните по видео, чтобы начать рисовать путь</p>
-                                                                        </div>
-                                                                    </div>
-                                                                )}
+                                                <div className="p-4 sm:p-6">
+                                                    <div className="grid grid-cols-1 gap-6 xl:grid-cols-2 xl:gap-8 xl:items-start">
+                                                        {/* Видео: только просмотр, без разметки */}
+                                                        <div className="flex flex-col gap-3 min-w-0">
+                                                            <div className="flex items-center gap-2 text-sm font-medium text-slate-300">
+                                                                <Video className="h-4 w-4 text-sky-400 shrink-0" />
+                                                                Видео
                                                             </div>
-                                                            <div className="flex items-center justify-between text-slate-400 px-2">
-                                                                <p className="text-xs font-medium">
-                                                                    Активных точек: <span className="text-blue-400">{manualPoints.length}</span>
+                                                            <div className="overflow-hidden rounded-xl border border-slate-800 bg-black shadow-2xl">
+                                                                <video
+                                                                    key={selectedTaskId}
+                                                                    ref={videoRef}
+                                                                    src={selectedVideoUrl}
+                                                                    controls
+                                                                    playsInline
+                                                                    className="block h-[min(520px,52vh)] w-full object-contain bg-black"
+                                                                    onLoadedMetadata={(e) => {
+                                                                        const rate = Number.parseFloat(playbackRate);
+                                                                        if (Number.isFinite(rate) && rate > 0) {
+                                                                            e.currentTarget.playbackRate = rate;
+                                                                        }
+                                                                    }}
+                                                                />
+                                                            </div>
+                                                            <div className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-800/80 bg-slate-900/80 px-3 py-2.5">
+                                                                <div className="flex items-center gap-2 text-slate-400">
+                                                                    <Gauge className="h-4 w-4 shrink-0" />
+                                                                    <span className="text-xs font-medium">Скорость</span>
+                                                                </div>
+                                                                <Select value={playbackRate} onValueChange={setPlaybackRate}>
+                                                                    <SelectTrigger className="h-9 w-[120px] border-slate-700 bg-slate-800/80 text-slate-100">
+                                                                        <SelectValue placeholder="1×" />
+                                                                    </SelectTrigger>
+                                                                    <SelectContent className="bg-slate-900 border-slate-700 text-slate-100">
+                                                                        {PLAYBACK_RATES.map((r) => (
+                                                                            <SelectItem key={r} value={r}>
+                                                                                {r === "1" ? "1× (норма)" : `${r}×`}
+                                                                            </SelectItem>
+                                                                        ))}
+                                                                    </SelectContent>
+                                                                </Select>
+                                                                <p className="text-[11px] text-slate-500 ml-auto">
+                                                                    Траектория рисуется только на чертеже
                                                                 </p>
-                                                                <p className="text-[11px] italic opacity-70">Автоматически синхронизируется с мировыми координатами</p>
                                                             </div>
                                                         </div>
-                                                    ) : (
-                                                        <div className="space-y-4">
-                                                            <div 
-                                                                className="relative overflow-hidden rounded-xl border border-slate-800 bg-slate-950 aspect-[16/9] max-h-[520px] shadow-2xl group"
-                                                            >
+
+                                                        {/* Чертеж: единственное место для траектории */}
+                                                        <div className="flex flex-col gap-3 min-w-0">
+                                                            <div className="flex items-center gap-2 text-sm font-medium text-slate-300">
+                                                                <ImageIcon className="h-4 w-4 text-emerald-400 shrink-0" />
+                                                                Чертеж
+                                                                {!selectedTask.map_context?.floor_plan_data && !selectedTask.map_context?.drawn_plan && (
+                                                                    <Badge variant="outline" className="text-[10px] border-amber-500/40 text-amber-400/90">
+                                                                        план не загружен — сетка
+                                                                    </Badge>
+                                                                )}
+                                                            </div>
+                                                            <div className="relative overflow-hidden rounded-xl border border-slate-800 bg-slate-950 aspect-[16/9] max-h-[min(520px,52vh)] min-h-[240px] shadow-2xl group">
                                                                 <svg
                                                                     ref={planContainerRef}
                                                                     className="w-full h-full cursor-crosshair touch-none"
@@ -409,7 +399,6 @@ const Admin = () => {
                                                                     </defs>
                                                                     <rect width="100%" height="100%" fill="url(#adminGrid)" />
 
-                                                                    {/* Render Background Image IF Available */}
                                                                     {selectedTask.map_context?.floor_plan_data && (
                                                                         <image
                                                                             href={selectedTask.map_context.floor_plan_data}
@@ -420,10 +409,9 @@ const Admin = () => {
                                                                         />
                                                                     )}
 
-                                                                    {/* Render Drawn Shapes */}
-                                                                    {selectedTask.map_context?.drawn_plan && Array.isArray(selectedTask.map_context.drawn_plan) && selectedTask.map_context.drawn_plan.map((shape: any) => (
+                                                                    {selectedTask.map_context?.drawn_plan && Array.isArray(selectedTask.map_context.drawn_plan) && selectedTask.map_context.drawn_plan.map((shape: { id: string; type: string; points: { x: number; y: number }[] }) => (
                                                                         <g key={shape.id}>
-                                                                            {shape.type === 'rect' ? (
+                                                                            {shape.type === "rect" ? (
                                                                                 <rect
                                                                                     x={(Math.min(shape.points[0].x, shape.points[1].x) / 800) * 100}
                                                                                     y={(Math.min(shape.points[0].y, shape.points[1].y) / 600) * 100}
@@ -448,7 +436,6 @@ const Admin = () => {
                                                                         </g>
                                                                     ))}
 
-                                                                    {/* Render Reference Point if user set it */}
                                                                     {selectedTask.map_context?.reference_point && (
                                                                         <g transform={`translate(${selectedTask.map_context.reference_point.x}, ${selectedTask.map_context.reference_point.y})`}>
                                                                             <circle r="1.5" fill="rgba(239, 68, 68, 0.3)" className="animate-ping" />
@@ -468,35 +455,37 @@ const Admin = () => {
                                                                         />
                                                                     )}
                                                                     {manualPoints.map((p, idx) => (
-                                                                        <circle 
-                                                                            key={`pp-${idx}`} 
-                                                                            cx={p.x} cy={p.y} r="1" 
-                                                                            fill={idx === manualPoints.length - 1 ? "#f43f5e" : "#06b6d4"} 
+                                                                        <circle
+                                                                            key={`pp-${idx}`}
+                                                                            cx={p.x}
+                                                                            cy={p.y}
+                                                                            r="1"
+                                                                            fill={idx === manualPoints.length - 1 ? "#f43f5e" : "#06b6d4"}
                                                                             className={idx === manualPoints.length - 1 ? "animate-pulse" : ""}
                                                                         />
                                                                     ))}
                                                                 </svg>
                                                                 {manualPoints.length === 0 && (
-                                                                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none hover:bg-black/20 transition-all">
-                                                                        <div className="text-center bg-black/60 backdrop-blur-md p-4 rounded-2xl border border-white/10 opacity-0 group-hover:opacity-100 transition-all">
-                                                                            <ImageIcon className="h-8 w-8 mx-auto mb-2 text-emerald-400" />
-                                                                            <p className="text-sm font-medium">Чертеж пользователя подгружен автоматически</p>
+                                                                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                                                        <div className="text-center bg-black/55 backdrop-blur-md px-4 py-3 rounded-xl border border-white/10 max-w-[90%] opacity-90">
+                                                                            <MousePointer2 className="h-7 w-7 mx-auto mb-2 text-emerald-400" />
+                                                                            <p className="text-xs sm:text-sm text-slate-200">Кликайте по плану, чтобы отметить траекторию</p>
                                                                         </div>
                                                                     </div>
                                                                 )}
                                                             </div>
-                                                            <div className="flex items-center justify-between text-slate-400 px-2">
+                                                            <div className="flex flex-wrap items-center justify-between gap-2 text-slate-400 px-0.5">
                                                                 <p className="text-xs font-medium">
-                                                                    Точек на плане: <span className="text-emerald-400">{manualPoints.length}</span>
+                                                                    Точек на чертеже: <span className="text-emerald-400">{manualPoints.length}</span>
                                                                 </p>
-                                                                <p className="text-[11px] italic opacity-70">
-                                                                    {!selectedTask.map_context?.floor_plan_data && !selectedTask.map_context?.drawn_plan ? 
-                                                                        "⚠️ У пользователя не был выбран чертеж" : 
-                                                                        "Отрисовка поверх пользовательского плана"}
+                                                                <p className="text-[11px] italic opacity-70 text-right">
+                                                                    {!selectedTask.map_context?.floor_plan_data && !selectedTask.map_context?.drawn_plan
+                                                                        ? "Нет плана пользователя — координаты в условной сетке 0–100"
+                                                                        : "Траектория в координатах плана"}
                                                                 </p>
                                                             </div>
                                                         </div>
-                                                    )}
+                                                    </div>
                                                 </div>
 
                                                 <div className="bg-slate-800/50 backdrop-blur-md border-t border-slate-800/80 p-6 flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
