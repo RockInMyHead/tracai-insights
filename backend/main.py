@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, Response
+from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.requests import Request
 import os
 import shutil
@@ -10,17 +11,14 @@ import asyncio
 import aiohttp
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple, Set, TextIO
+import threading
 import logging
 import sqlite3
 import json
 import uuid
+import math as _math
 import fitz  # PyMuPDF
-
-# Import video tracker
-from video_tracker.src.processor import FullFeatureProcessor
-from video_tracker.src.map_postprocessing import apply_map_postprocessing
-from video_tracker.src.stabilization import stabilize_video
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +31,15 @@ app = FastAPI(title="TrackAI Video Analysis API", version="1.0.0")
 processing_status = {}
 convert_dwg_status: Dict[str, Dict] = {}
 
+# Employee batch scheduling
+EMPLOYEE_BATCH_TS: Dict[str, float] = {}
+BATCH_WAIT_SECONDS = 1  # минимальная задержка — обработка начинается почти мгновенно
+
+# GPU Worker — тяжёлый CV-пайплайн вынесен на отдельный сервер с RTX 3090
+GPU_WORKER_URL = os.getenv("GPU_WORKER_URL", "http://79.137.227.106:8003")
+LINGBOT_WORKER_URL = os.getenv("LINGBOT_WORKER_URL", "http://79.137.227.106:8004")
+
+#
 # Helper: safely convert numpy/scipy types to plain JSON-serializable objects
 try:
     import numpy as _np  # type: ignore
@@ -75,10 +82,8 @@ app.add_middleware(
         "http://127.0.0.1:29483",
         "http://localhost:29483",
         "null",
-        "http://95.174.93.76",
-        "https://95.174.93.76",
-        "http://176.123.167.109",
         "http://45.67.57.72",
+        "https://45.67.57.72",
         "https://trackai.eu.ngrok.io",
         "https://trackai-app.eu.ngrok.io",
         "https://trackai-backend.loca.lt",
@@ -86,7 +91,7 @@ app.add_middleware(
         "https://fa44db5269c86bf8-185-104-115-196.serveousercontent.com",
         "https://14e265884d57c1eb-185-104-115-196.serveousercontent.com",
     ],
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|95\.174\.93\.76|45\.67\.57\.72)(:\d+)?$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|45\.67\.57\.72)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -117,7 +122,7 @@ async def preflight_ok(request: Request, call_next):
 async def increase_upload_limit(request: Request, call_next):
     # Только convert-dwg: middleware парсит form с большим лимитом (upload-video и analyze-video парсят в своих хендлерах)
     if request.method == "POST" and request.url.path == "/api/convert-dwg":
-        await request.form(max_part_size=UPLOAD_MAX_PART_SIZE)
+        await request.form()
     return await call_next(request)
 
 # #region agent log
@@ -183,15 +188,106 @@ async def agent_debug_http_log(request: Request, call_next):
 UPLOAD_DIR = Path("uploads")
 OUTPUT_DIR = Path("outputs")
 VIDEOS_DIR = Path("videos")  # Для хранения оригинальных видео
+VIDEO_PREVIEWS_DIR = Path("video_previews")
 MANUAL_TRAJECTORIES_PATH = Path("backend/data/manual_trajectories.json")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 VIDEOS_DIR.mkdir(exist_ok=True)
+VIDEO_PREVIEWS_DIR.mkdir(exist_ok=True)
 MANUAL_TRAJECTORIES_PATH.parent.mkdir(exist_ok=True, parents=True)
 
 # Database initialization
 DB_PATH = Path("backend/data/database.db")
 DB_PATH.parent.mkdir(exist_ok=True, parents=True)
+
+_video_preview_lock = threading.Lock()
+_video_preview_jobs: Set[str] = set()
+
+
+def _find_uploaded_video_path(video_id: str) -> Optional[Path]:
+    video_filename = UPLOADED_VIDEOS.get(video_id)
+    video_path = (VIDEOS_DIR / video_filename) if video_filename else None
+    if video_path and video_path.exists():
+        return video_path
+
+    matches = list(VIDEOS_DIR.glob(f"{video_id}_*"))
+    for m in matches:
+        if m.is_file():
+            UPLOADED_VIDEOS[video_id] = m.name
+            return m
+    return None
+
+
+def _video_preview_path(video_id: str) -> Path:
+    return VIDEO_PREVIEWS_DIR / f"{video_id}.mp4"
+
+
+def _ensure_video_preview(video_id: str) -> Optional[Path]:
+    preview_path = _video_preview_path(video_id)
+    if preview_path.exists() and preview_path.stat().st_size > 0:
+        return preview_path
+
+    source_path = _find_uploaded_video_path(video_id)
+    if not source_path:
+        return None
+
+    with _video_preview_lock:
+        if video_id in _video_preview_jobs:
+            return None
+        _video_preview_jobs.add(video_id)
+
+    tmp_path = preview_path.with_suffix(".tmp.mp4")
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vf",
+            "scale='min(1280,iw)':-2",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-movflags",
+            "+faststart",
+            str(tmp_path),
+        ]
+        logger.info(f"[{video_id}] Creating admin MP4 preview from {source_path.name}")
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=1800)
+        tmp_path.replace(preview_path)
+        logger.info(f"[{video_id}] Admin MP4 preview ready: {preview_path}")
+        return preview_path
+    except Exception as e:
+        logger.warning(f"[{video_id}] Admin MP4 preview failed: {e}")
+        tmp_path.unlink(missing_ok=True)
+        return None
+    finally:
+        with _video_preview_lock:
+            _video_preview_jobs.discard(video_id)
+
+
+def _schedule_video_preview(video_id: str) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(asyncio.to_thread(_ensure_video_preview, video_id))
+    except RuntimeError:
+        threading.Thread(target=_ensure_video_preview, args=(video_id,), daemon=True).start()
+
+
+def _map_context_summary(map_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep /api/admin/tasks light; full map_context is loaded by /api/admin/tasks/{id}."""
+    summary: Dict[str, Any] = {}
+    if "client_source" in map_ctx:
+        summary["client_source"] = map_ctx.get("client_source")
+    if map_ctx.get("floor_plan_data"):
+        summary["has_floor_plan_data"] = True
+    if map_ctx.get("drawn_plan"):
+        summary["has_drawn_plan"] = True
+    return summary
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -281,7 +377,32 @@ def _save_manual_trajectories(data: Dict[str, Any]) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _normalize_manual_trajectory_to_plan_space(trajectory: Any) -> Any:
+    """Админка раньше сохраняла точки в 0–100; TrajectoryMap — 800×600."""
+    if not trajectory or not isinstance(trajectory, list):
+        return trajectory
+    pts_xy: List[Tuple[float, float]] = []
+    for p in trajectory:
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            pts_xy.append((float(p[0]), float(p[1])))
+    if not pts_xy:
+        return trajectory
+    max_x = max(x for x, _ in pts_xy)
+    max_y = max(y for _, y in pts_xy)
+    if max_x > 100.5 or max_y > 100.5:
+        return trajectory
+    out: List[List[float]] = []
+    for p in trajectory:
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            px = float(p[0]) / 100.0 * 800.0
+            py = float(p[1]) / 100.0 * 600.0
+            ph = float(p[2]) if len(p) >= 3 else 0.0
+            out.append([px, py, ph])
+    return out
+
+
 def _make_manual_result(trajectory: Any, turn_points: Optional[List[Any]] = None) -> Dict[str, Any]:
+    trajectory = _normalize_manual_trajectory_to_plan_space(trajectory)
     normalized_traj: List[List[float]] = []
     for p in trajectory or []:
         if isinstance(p, (list, tuple)) and len(p) >= 2:
@@ -319,6 +440,12 @@ def _make_manual_result(trajectory: Any, turn_points: Optional[List[Any]] = None
 # Telegram bot configuration
 TELEGRAM_BOT_TOKEN = "8231968530:AAGh0gdqmcTYka2q-zEPaSurhHvibEooDQE"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+DESKTOP_UPLOAD_BOT_TOKEN = (
+    os.getenv("TRACKAI_DESKTOP_UPLOAD_BOT_TOKEN")
+    or "8622333188:AAHY0kkcOJkTmqjW4yUHj42coNRBVWyevDw"
+).strip()
+TELEGRAM_DESKTOP_SUBSCRIBERS_PATH = DB_PATH.parent / "telegram_desktop_subscribers.json"
+_tg_desktop_sub_lock = threading.Lock()
 
 async def get_telegram_chat_id():
     """Получить chat_id из Telegram updates или переменной окружения"""
@@ -394,18 +521,1143 @@ async def send_error_to_telegram(error_message: str, context: str = ""):
     except Exception as e:
         logger.error(f"Failed to send error to Telegram: {e}")
 
+
+async def _telegram_send_with_token(token: str, chat_id: int, text: str) -> Optional[Dict[str, Any]]:
+    if not token or not chat_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text[:4096]},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                return await resp.json(content_type=None)
+    except Exception as e:
+        logger.warning(f"Telegram desktop upload send failed: {e}")
+        return None
+
+
+async def _telegram_latest_chat_id_for_token(token: str) -> Optional[int]:
+    if not token:
+        return None
+    env_chat_id = (os.getenv("TRACKAI_DESKTOP_UPLOAD_CHAT_ID") or "").strip()
+    if env_chat_id:
+        try:
+            return int(env_chat_id)
+        except ValueError:
+            logger.warning(f"Invalid TRACKAI_DESKTOP_UPLOAD_CHAT_ID: {env_chat_id}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"offset": -1, "limit": 10},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+        for update in reversed(data.get("result") or []):
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat") or {}
+            chat_id = chat.get("id")
+            if chat_id is not None:
+                return int(chat_id)
+    except Exception as e:
+        logger.warning(f"Telegram desktop upload getUpdates failed: {e}")
+    return None
+
+
+def _load_desktop_upload_subscribers() -> Set[int]:
+    subscribers: Set[int] = set()
+    env_chat_id = (os.getenv("TRACKAI_DESKTOP_UPLOAD_CHAT_ID") or "").strip()
+    if env_chat_id:
+        for raw in env_chat_id.replace(";", ",").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                subscribers.add(int(raw))
+            except ValueError:
+                logger.warning(f"Invalid TRACKAI_DESKTOP_UPLOAD_CHAT_ID item: {raw}")
+
+    with _tg_desktop_sub_lock:
+        if TELEGRAM_DESKTOP_SUBSCRIBERS_PATH.exists():
+            try:
+                data = json.loads(TELEGRAM_DESKTOP_SUBSCRIBERS_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for item in data:
+                        try:
+                            subscribers.add(int(item))
+                        except (TypeError, ValueError):
+                            continue
+            except Exception as e:
+                logger.warning(f"desktop Telegram subscribers load failed: {e}")
+
+    return subscribers
+
+
+def _save_desktop_upload_subscribers(ids: Set[int]) -> None:
+    with _tg_desktop_sub_lock:
+        TELEGRAM_DESKTOP_SUBSCRIBERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TELEGRAM_DESKTOP_SUBSCRIBERS_PATH.write_text(
+            json.dumps(sorted(ids), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+async def _refresh_desktop_upload_subscribers_from_updates(token: str) -> Set[int]:
+    subscribers = _load_desktop_upload_subscribers()
+    if not token:
+        return subscribers
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"limit": 100},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+        for update in data.get("result") or []:
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat") or {}
+            chat_id = chat.get("id")
+            if chat_id is not None:
+                subscribers.add(int(chat_id))
+        if subscribers:
+            _save_desktop_upload_subscribers(subscribers)
+    except Exception as e:
+        logger.warning(f"desktop Telegram getUpdates refresh failed: {e}")
+    return subscribers
+
+
+async def send_desktop_upload_notification(
+    video_id: str,
+    original_filename: str,
+    file_size: int,
+    gpu_url: str,
+    client_source: str = "unknown",
+) -> None:
+    """Уведомление о загрузке после успешной отправки файла на GPU worker."""
+    token = DESKTOP_UPLOAD_BOT_TOKEN
+    if not token:
+        return
+    size_mb = file_size / (1024 * 1024) if file_size else 0
+    text = (
+        "Новая загрузка видео TrackAI\n"
+        f"Источник: {client_source or 'unknown'}\n"
+        f"Видео: {original_filename}\n"
+        f"video_id: {video_id}\n"
+        f"Размер: {size_mb:.1f} MB\n"
+        f"GPU: {gpu_url}\n"
+        "Статус: видео отправлено на 3090"
+    )
+
+    sent_to: Set[int] = set()
+    desktop_subscribers = await _refresh_desktop_upload_subscribers_from_updates(token)
+    if not desktop_subscribers:
+        logger.warning(
+            "Desktop upload Telegram notification skipped: no chat_id. "
+            "Open @ceoscrepka_bot and send /start, or set TRACKAI_DESKTOP_UPLOAD_CHAT_ID."
+        )
+
+    for cid in desktop_subscribers:
+        res = await _telegram_send_with_token(token, cid, text)
+        if res and res.get("ok"):
+            sent_to.add(cid)
+        else:
+            logger.warning(f"desktop upload Telegram notify to desktop subscriber {cid} failed: {res}")
+
+    latest_chat_id = await _telegram_latest_chat_id_for_token(token)
+    if latest_chat_id and latest_chat_id not in sent_to:
+        res = await _telegram_send_with_token(token, latest_chat_id, text)
+        if not res or not res.get("ok"):
+            logger.warning(f"desktop upload Telegram notify to latest chat failed: {res}")
+        elif latest_chat_id:
+            desktop_subscribers.add(latest_chat_id)
+            _save_desktop_upload_subscribers(desktop_subscribers)
+
+
+@app.post("/api/telegram/desktop-test")
+async def telegram_desktop_test():
+    token = DESKTOP_UPLOAD_BOT_TOKEN
+    if not token:
+        raise HTTPException(status_code=500, detail="TRACKAI_DESKTOP_UPLOAD_BOT_TOKEN is empty")
+    subscribers = await _refresh_desktop_upload_subscribers_from_updates(token)
+    if not subscribers:
+        return {
+            "success": False,
+            "reason": "no_chat_id",
+            "message": "Откройте @ceoscrepka_bot в Telegram и отправьте /start",
+        }
+    results = []
+    for cid in sorted(subscribers):
+        res = await _telegram_send_with_token(token, cid, "Тест TrackAI desktop upload notifications")
+        results.append({"chat_id": cid, "result": res})
+    return {"success": any((r["result"] or {}).get("ok") for r in results), "subscribers": sorted(subscribers), "results": results}
+
+
+# --- Telegram-бот «обработка видео»: подписчики + webhook ---
+# Токен: только TELEGRAM_PROCESSING_BOT_TOKEN в окружении (не коммитить в репозиторий).
+# Webhook: HTTPS POST на https://<ваш-домен>/api/telegram/processing-webhook
+#   Рекомендуется secret_token в setWebhook и переменная TELEGRAM_WEBHOOK_SECRET (совпадает с токеном из BotFather).
+TELEGRAM_PROCESSING_SUBSCRIBERS_PATH = DB_PATH.parent / "telegram_processing_subscribers.json"
+_tg_processing_sub_lock = threading.Lock()
+
+
+def _get_processing_bot_token() -> str:
+    return (os.getenv("TELEGRAM_PROCESSING_BOT_TOKEN") or "").strip()
+
+
+def _load_processing_subscribers() -> Set[int]:
+    with _tg_processing_sub_lock:
+        if not TELEGRAM_PROCESSING_SUBSCRIBERS_PATH.exists():
+            return set()
+        try:
+            raw = TELEGRAM_PROCESSING_SUBSCRIBERS_PATH.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                return set()
+            out: Set[int] = set()
+            for x in data:
+                try:
+                    out.add(int(x))
+                except (TypeError, ValueError):
+                    continue
+            return out
+        except Exception as e:
+            logger.warning(f"telegram subscribers load failed: {e}")
+            return set()
+
+
+def _save_processing_subscribers(ids: Set[int]) -> None:
+    with _tg_processing_sub_lock:
+        TELEGRAM_PROCESSING_SUBSCRIBERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TELEGRAM_PROCESSING_SUBSCRIBERS_PATH.write_text(
+            json.dumps(sorted(ids), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def _add_processing_subscriber(chat_id: int) -> None:
+    s = _load_processing_subscribers()
+    s.add(chat_id)
+    _save_processing_subscribers(s)
+
+
+async def _telegram_processing_api(method: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    token = _get_processing_bot_token()
+    if not token:
+        return None
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                return await resp.json(content_type=None)
+    except Exception as e:
+        logger.warning(f"Telegram processing API {method} failed: {e}")
+        return None
+
+
+async def broadcast_new_processing_to_all_subscribers() -> None:
+    """Всем, кто нажал /start у бота обработки — уведомление о новой задаче."""
+    token = _get_processing_bot_token()
+    if not token:
+        return
+    subs = _load_processing_subscribers()
+    if not subs:
+        logger.info("Telegram broadcast: нет подписчиков (/start не доходил до сервера или long poll выключен)")
+        return
+    text = "Новая Обработка"
+    for cid in subs:
+        res = await _telegram_processing_api(
+            "sendMessage",
+            {"chat_id": cid, "text": text},
+        )
+        if not res or not res.get("ok"):
+            logger.warning(f"broadcast to {cid} failed: {res}")
+
+
+async def broadcast_new_processing_for_video(video_id: str) -> None:
+    """
+    Notify processing subscribers with a message that includes the position of this video
+    among all videos for the same employee: "Загружено видео i/n\nНовая обработка — <filename>"
+    Falls back to a generic message if employee or DB data is missing.
+    """
+    token = _get_processing_bot_token()
+    if not token:
+        return
+    subs = _load_processing_subscribers()
+    if not subs:
+        logger.info("Telegram broadcast (per-video): нет подписчиков")
+        return
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        # Fetch row and map_context to detect optional batch_id provided by client
+        cursor.execute(
+            "SELECT employee_name, original_filename, created_at, video_filename, map_context FROM tracking_tasks WHERE id = ?",
+            (video_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            text = "Новая Обработка"
+        else:
+            employee_name, original_filename, created_at, video_filename, map_ctx_raw = row
+            batch_id = None
+            batch_size = None
+            if map_ctx_raw:
+                try:
+                    mc = json.loads(map_ctx_raw)
+                    batch_id = mc.get("batch_id")
+                    batch_size = int(mc.get("batch_size")) if mc.get("batch_size") is not None else None
+                except Exception:
+                    batch_id = None
+
+            # If client provided a batch_id (frontend should set when uploading multiple files at once),
+            # count items in that batch to form i/n = position/total.
+            if batch_id:
+                try:
+                    cursor.execute(
+                        "SELECT id FROM tracking_tasks WHERE map_context LIKE ? ORDER BY created_at",
+                        (f'%"batch_id":"{batch_id}"%',),
+                    )
+                    rows = [r[0] for r in cursor.fetchall()]
+                    conn.close()
+                    total = len(rows) if rows else 1
+                    try:
+                        idx = rows.index(video_id) + 1
+                    except ValueError:
+                        idx = 1
+                    fname = original_filename or video_id
+                    text = f"Загружено видео {idx}/{total}\nНовая обработка — {fname}"
+                except Exception:
+                    conn.close()
+                    text = f"Новая Обработка — {original_filename or video_id}"
+            elif employee_name:
+                # Consider only recent uploads for the same employee as the "batch".
+                # This prevents counting all historical uploads. Window: last 10 minutes.
+                try:
+                    cursor.execute(
+                        """SELECT id FROM tracking_tasks
+                           WHERE employee_name = ? AND created_at >= datetime('now', '-10 minutes')
+                           ORDER BY created_at""",
+                        (employee_name,),
+                    )
+                    rows = [r[0] for r in cursor.fetchall()]
+                except Exception:
+                    # Fallback to full history if datetime function not supported
+                    cursor.execute(
+                        "SELECT id FROM tracking_tasks WHERE employee_name = ? ORDER BY created_at",
+                        (employee_name,),
+                    )
+                    rows = [r[0] for r in cursor.fetchall()]
+                conn.close()
+                total = len(rows) if rows else 1
+                try:
+                    idx = rows.index(video_id) + 1
+                except ValueError:
+                    idx = 1
+                fname = original_filename or video_id
+                text = f"Загружено видео {idx}/{total}\nНовая обработка — {fname}"
+            else:
+                conn.close()
+                fname = original_filename or video_id
+                text = f"Новая Обработка — {fname}"
+
+        # Send to subscribers
+        for cid in subs:
+            res = await _telegram_processing_api(
+                "sendMessage",
+                {"chat_id": cid, "text": text},
+            )
+            if not res or not res.get("ok"):
+                logger.warning(f"broadcast per-video to {cid} failed: {res}")
+    except Exception as e:
+        logger.warning(f"broadcast_new_processing_for_video failed: {e}")
+
+
+# ──────────────────────────────────────────────
+# R³ helpers — конвертация camera poses в траекторию
+# ──────────────────────────────────────────────
+
+def _project_r3_camera_path_to_2d(raw_points: List[List[float]]) -> List[List[float]]:
+    """Project arbitrary R3 3D camera translations to the dominant 2D motion plane."""
+    if len(raw_points) < 2:
+        return raw_points
+    try:
+        import numpy as _np2
+        pts = _np2.array(raw_points, dtype=_np2.float64)
+        finite = _np2.isfinite(pts).all(axis=1)
+        if finite.sum() < 2:
+            return raw_points
+        valid = pts[finite]
+        centered = valid - valid[0]
+        if valid.shape[0] >= 3:
+            _, _, vh = _np2.linalg.svd(centered - centered.mean(axis=0, keepdims=True), full_matrices=False)
+            basis = vh[:2].T
+            coords = centered @ basis
+        else:
+            direction = centered[-1]
+            norm = _np2.linalg.norm(direction)
+            if norm < 1e-9:
+                return [[0.0, 0.0, 0.0] for _ in raw_points]
+            e1 = direction / norm
+            aux = _np2.array([0.0, 1.0, 0.0])
+            if abs(float(_np2.dot(e1, aux))) > 0.95:
+                aux = _np2.array([1.0, 0.0, 0.0])
+            e2 = _np2.cross(e1, aux)
+            e2 = e2 / max(_np2.linalg.norm(e2), 1e-9)
+            coords = centered @ _np2.stack([e1, e2], axis=1)
+
+        full = _np2.zeros((len(raw_points), 3), dtype=_np2.float64)
+        full[finite, 0] = coords[:, 0]
+        full[finite, 1] = coords[:, 1]
+        if valid.shape[1] >= 3:
+            full[finite, 2] = valid[:, 1] - valid[0, 1]
+        return [[round(float(x), 6), round(float(y), 6), round(float(z), 6)] for x, y, z in full]
+    except Exception:
+        # Conservative fallback: OpenCV-style camera paths usually move on X/Z; Y is often height.
+        return [[p[0], p[2] if len(p) > 2 else p[1], p[1] if len(p) > 1 else 0.0] for p in raw_points]
+
+
+def _clean_r3_plan_trajectory(points: List[List[float]]) -> List[List[float]]:
+    """Remove pose jumps and smooth the R3 path before it is projected onto a floor plan."""
+    if len(points) < 5:
+        return points
+    try:
+        import numpy as _np2
+
+        pts = _np2.array(points, dtype=_np2.float64)
+        finite = _np2.isfinite(pts).all(axis=1)
+        if finite.sum() < 5:
+            return points
+
+        # Fill occasional invalid values from nearest previous valid point.
+        for i in range(len(pts)):
+            if not finite[i]:
+                pts[i] = pts[i - 1] if i > 0 else pts[finite][0]
+
+        steps = _np2.linalg.norm(_np2.diff(pts[:, :2], axis=0), axis=1)
+        positive_steps = steps[steps > 1e-9]
+        if positive_steps.size:
+            median_step = float(_np2.median(positive_steps))
+            mad = float(_np2.median(_np2.abs(positive_steps - median_step)))
+            jump_limit = max(median_step * 8.0, median_step + 6.0 * mad, 1e-6)
+            for i, step in enumerate(steps, start=1):
+                if step > jump_limit:
+                    # Keep continuity: replace isolated pose teleport with previous point.
+                    pts[i] = pts[i - 1]
+
+        # Small centered moving average. Edge padding keeps start/end anchored enough for map alignment.
+        window = min(9, len(pts) if len(pts) % 2 == 1 else len(pts) - 1)
+        if window >= 5:
+            pad = window // 2
+            padded = _np2.pad(pts, ((pad, pad), (0, 0)), mode="edge")
+            kernel = _np2.ones(window, dtype=_np2.float64) / window
+            smoothed = _np2.empty_like(pts)
+            for dim in range(pts.shape[1]):
+                smoothed[:, dim] = _np2.convolve(padded[:, dim], kernel, mode="valid")
+            # Preserve exact first point as the local origin for frontend alignment.
+            smoothed -= smoothed[0] - pts[0]
+            pts = smoothed
+
+        return [[round(float(x), 6), round(float(y), 6), round(float(z), 6)] for x, y, z in pts]
+    except Exception:
+        return points
+
+
+def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
+    """
+    Конвертирует R³ camera poses (4×4 c2w матрицы) в стандартный формат траектории.
+    Возвращает dict с trajectory, turn_points, processing_stats, video_info.
+    """
+    camera_poses = r3_result.get("camera_poses", r3_result.get("camera_poses", []))
+    if not camera_poses:
+        # Fallback: читаем из output_dir
+        output_dir = r3_result.get("output_dir", "")
+        if output_dir:
+            camera_dir = Path(output_dir) / "camera"
+            if camera_dir.exists():
+                camera_files = sorted(camera_dir.glob("*.npz"))
+                camera_poses = []
+                for cf in camera_files:
+                    try:
+                        import numpy as _np2
+                        data = _np2.load(str(cf))
+                        pose = data["pose"].tolist() if hasattr(data, "pose") else None
+                        if pose:
+                            camera_poses.append({"frame": int(cf.stem), "pose": pose})
+                    except Exception:
+                        pass
+
+    # Извлекаем 3D путь как перевод камер (последняя колонка 4x4 матрицы).
+    raw_camera_points = []
+    for cp in camera_poses:
+        pose = cp.get("pose", [])
+        if pose and len(pose) >= 3:
+            # Матрица 4×4 c2w: последняя колонка — [x, y, z, 1]
+            if len(pose[0]) >= 4:
+                x = float(pose[0][3])
+                y = float(pose[1][3])
+                z = float(pose[2][3])
+            elif len(pose[0]) >= 3:
+                x = float(pose[0][3]) if len(pose[0]) > 3 else 0.0
+                y = float(pose[1][3]) if len(pose[1]) > 3 else 0.0
+                z = 0.0
+            else:
+                x, y, z = 0.0, 0.0, 0.0
+            raw_camera_points.append([x, y, z])
+
+    # Для 2D-плана нельзя брать X/Y напрямую: в R3 Y часто вертикальная ось.
+    # Проецируем полный 3D путь на доминирующую плоскость движения.
+    projected_trajectory = _project_r3_camera_path_to_2d(raw_camera_points)
+    trajectory = _clean_r3_plan_trajectory(projected_trajectory)
+
+    # Вычисляем повороты (между последовательными кадрами)
+    turn_points = []
+    for i in range(1, len(camera_poses)):
+        prev_pose = camera_poses[i - 1].get("pose", [])
+        curr_pose = camera_poses[i].get("pose", [])
+        if len(prev_pose) >= 3 and len(curr_pose) >= 3:
+            # Угол между rotation матрицами (первые 3x3)
+            import math as _m
+            try:
+                import numpy as _np2
+                prev_R = _np2.array([[float(v) for v in row[:3]] for row in prev_pose[:3]])
+                curr_R = _np2.array([[float(v) for v in row[:3]] for row in curr_pose[:3]])
+                delta_R = prev_R.T @ curr_R
+                angle = _m.degrees(_m.acos(max(-1, min(1, (_np2.trace(delta_R) - 1) / 2))))
+                if angle > 5.0:  # порог поворота 5 градусов
+                    turn_points.append({
+                        "frame_index": camera_poses[i].get("frame", i),
+                        "trajectory_index": i,
+                        "angle_degrees": round(angle, 1),
+                        "position": trajectory[i] if i < len(trajectory) else [0, 0, 0],
+                        "turn_type": "sharp" if angle > 20 else "gentle",
+                    })
+            except Exception:
+                pass
+
+    num_frames = len(trajectory)
+    confidence = r3_result.get("pose_confidence", [])
+    valid_conf = [c for c in confidence if c is not None] if confidence else []
+
+    run_params = r3_result.get("run_params", {})
+    inference_time = run_params.get("inference_time_s", 0) or 0
+
+    # Примерное расстояние (сумма евклидовых расстояний между точками)
+    estimated_distance = 0.0
+    for i in range(1, len(trajectory)):
+        dx = trajectory[i][0] - trajectory[i - 1][0]
+        dy = trajectory[i][1] - trajectory[i - 1][1]
+        dz = trajectory[i][2] - trajectory[i - 1][2]
+        estimated_distance += (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
+
+    # Средняя уверенность
+    avg_conf = None
+    if valid_conf:
+        try:
+            if _np is not None:
+                avg_conf = round(float(_np.mean(valid_conf)), 2)
+            else:
+                avg_conf = round(sum(valid_conf) / len(valid_conf), 2)
+        except Exception:
+            avg_conf = None
+
+    return {
+        "method": "r3_reconstruction",
+        "trajectory": trajectory,
+        "turn_points": turn_points,
+        "frame_count": num_frames,
+        "trajectory_points": len(trajectory),
+        "r3_camera_points": raw_camera_points,  # исходные 3D позиции камер для R³-визуализации
+        "r3_pose_confidence": valid_conf if valid_conf else None,  # уверенность каждой точки
+        "r3_projection": "pca_motion_plane_smoothed",
+        "processing_stats": {
+            "estimated_distance": round(estimated_distance, 2),
+            "scale_factor": 1.0,
+            "input_scale_factor": scale_factor,
+            "r3_map_scale_disabled": True,
+            "fps": round(num_frames / max(inference_time, 0.1), 1) if inference_time > 0 else 0,
+            "turns_detected": len(turn_points),
+            "avg_pose_confidence": avg_conf,
+        },
+        "total_processing_time": inference_time,
+        "video_info": {
+            "width": 0, "height": 0, "fps": 0, "frame_count": num_frames, "duration": 0,
+        },
+    }
+
+
+def _schedule_process_video_background(
+    background_tasks: Optional[BackgroundTasks],
+    video_id: str,
+    video_path: Optional[Path],
+    original_filename: str,
+    scale_factor: float,
+    stabilize: bool,
+    detect_interval: int,
+    turn_vote_threshold: int,
+    use_ml_roi: bool,
+    map_context: Optional[Dict[str, Any]],
+) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(
+            process_video_background,
+            video_id,
+            video_path,
+            original_filename,
+            scale_factor,
+            stabilize,
+            detect_interval,
+            turn_vote_threshold,
+            use_ml_roi,
+            map_context,
+        )
+    else:
+        asyncio.create_task(
+            process_video_background(
+                video_id,
+                video_path,
+                original_filename,
+                scale_factor,
+                stabilize,
+                detect_interval,
+                turn_vote_threshold,
+                use_ml_roi,
+                map_context,
+            )
+        )
+
+
+async def _tg_get_webhook_info_raw() -> Dict[str, Any]:
+    token = _get_processing_bot_token()
+    if not token:
+        return {}
+    url = f"https://api.telegram.org/bot{token}/getWebhookInfo"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                return await resp.json(content_type=None)
+    except Exception as e:
+        logger.warning(f"getWebhookInfo: {e}")
+        return {}
+
+
+async def _tg_should_use_long_polling() -> bool:
+    """Без HTTPS webhook /start не работает — включаем long poll (если не отключено env)."""
+    if not _get_processing_bot_token():
+        return False
+    if os.getenv("TELEGRAM_PROCESSING_POLLING", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    info = await _tg_get_webhook_info_raw()
+    if not info.get("ok"):
+        return True
+    res = info.get("result") or {}
+    url = (res.get("url") or "").strip()
+    return len(url) == 0
+
+
+_tg_poll_offset = 0
+_tg_poll_lock_file: Optional[TextIO] = None
+
+try:
+    import fcntl as _fcntl_mod
+
+    _HAS_FCNTL = True
+except ImportError:
+    _fcntl_mod = None
+    _HAS_FCNTL = False
+
+
+async def telegram_processing_poll_updates_loop() -> None:
+    """Long polling getUpdates — работает без HTTPS (в отличие от webhook)."""
+    global _tg_poll_offset
+    token = _get_processing_bot_token()
+    if not token:
+        return
+    logger.info("Telegram processing bot: long polling активен (webhook пустой или недоступен)")
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"https://api.telegram.org/bot{token}/getUpdates",
+                    params={
+                        "timeout": 50,
+                        "offset": _tg_poll_offset,
+                        "allowed_updates": json.dumps(["message", "edited_message"]),
+                    },
+                    timeout=aiohttp.ClientTimeout(total=55),
+                ) as resp:
+                    data = await resp.json(content_type=None)
+            if not data.get("ok"):
+                logger.warning(f"getUpdates: {data}")
+                await asyncio.sleep(3)
+                continue
+            for upd in data.get("result", []):
+                _tg_poll_offset = max(_tg_poll_offset, int(upd.get("update_id", 0)) + 1)
+                try:
+                    await dispatch_telegram_processing_update(upd, None)
+                except Exception as ex:
+                    logger.error(f"dispatch telegram update: {ex}", exc_info=True)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Telegram poll loop: {e}")
+            await asyncio.sleep(3)
+
+
+async def dispatch_telegram_processing_update(
+    update: Dict[str, Any],
+    background_tasks: Optional[BackgroundTasks],
+) -> None:
+    """Общая логика: /start → подписка; видео → очередь + рассылка."""
+    token = _get_processing_bot_token()
+    if not token:
+        return
+
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+
+    text = (message.get("text") or "").strip()
+    if text.startswith("/start"):
+        _add_processing_subscriber(int(chat_id))
+        await _telegram_processing_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "Вы подписаны на уведомления. Когда кто-то отправит видео на обработку (сайт или этот чат), вам придёт «Новая Обработка».",
+            },
+        )
+        return
+
+    picked = _telegram_message_pick_video(message)
+    if not picked:
+        return
+
+    file_id, orig_name = picked
+    if not orig_name.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+        await _telegram_processing_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "Пришлите видео в формате MP4, AVI, MOV или MKV (как файл или как видео).",
+            },
+        )
+        return
+
+    from_user = message.get("from") or {}
+    employee_name = (
+        from_user.get("username")
+        or from_user.get("first_name")
+        or "Telegram"
+    )
+    if isinstance(employee_name, str):
+        employee_name = employee_name.strip() or "Telegram"
+
+    video_id = str(uuid.uuid4())
+    video_filename = f"{video_id}_{orig_name}"
+    video_path = VIDEOS_DIR / video_filename
+
+    try:
+        await _telegram_download_file(token, file_id, video_path)
+    except Exception as e:
+        logger.error(f"Telegram video download failed: {e}", exc_info=True)
+        await _telegram_processing_api(
+            "sendMessage",
+            {"chat_id": chat_id, "text": f"Не удалось скачать файл: {e}"},
+        )
+        return
+
+    UPLOADED_VIDEOS[video_id] = video_filename
+    processing_status[video_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "Поставлено в очередь на обработку (Telegram)",
+        "start_time": time.time(),
+    }
+
+    map_context: Optional[Dict[str, Any]] = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO tracking_tasks (id, employee_name, video_filename, original_filename, map_context, status) VALUES (?, ?, ?, ?, ?, ?)",
+            (video_id, employee_name, video_filename, orig_name, json.dumps(map_context), "queued"),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as db_err:
+        logger.error(f"Telegram task DB save failed: {db_err}")
+
+    scale_factor = 12.306
+    stabilize = True
+    detect_interval = 3
+    turn_vote_threshold = 3
+    use_ml_roi = True
+
+    # Немедленно запускаем обработку на GPU Worker
+    _schedule_process_video_background(
+        background_tasks,
+        video_id,
+        video_path,
+        original_filename or file.filename,
+        scale_factor,
+        stabilize,
+        detect_interval,
+        turn_vote_threshold,
+        use_ml_roi,
+        None,  # map_context
+    )
+
+    await broadcast_new_processing_for_video(video_id)
+
+    await _telegram_processing_api(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": "Видео принято, обработка запущена.",
+        },
+    )
+
+
+def _telegram_message_pick_video(message: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """(file_id, original_filename) или None."""
+    if "video" in message:
+        v = message["video"]
+        fid = v.get("file_id")
+        if not fid:
+            return None
+        fn = v.get("file_name") or "telegram_video.mp4"
+        return fid, fn
+    if "document" in message:
+        d = message["document"]
+        mime = (d.get("mime_type") or "").lower()
+        fn = (d.get("file_name") or "").strip() or "telegram_video.bin"
+        ext_ok = fn.lower().endswith((".mp4", ".avi", ".mov", ".mkv"))
+        if not ext_ok and not mime.startswith("video/"):
+            return None
+        fid = d.get("file_id")
+        if not fid:
+            return None
+        return fid, fn
+    return None
+
+
+async def _telegram_download_file(token: str, file_id: str, dest: Path) -> None:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"https://api.telegram.org/bot{token}/getFile",
+            params={"file_id": file_id},
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as r:
+            gj = await r.json(content_type=None)
+        if not gj or not gj.get("ok"):
+            raise RuntimeError(f"getFile failed: {gj}")
+        fp = gj["result"]["file_path"]
+        url = f"https://api.telegram.org/file/bot{token}/{fp}"
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=600),
+        ) as r2:
+            r2.raise_for_status()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as out:
+                async for chunk in r2.content.iter_chunked(1024 * 1024):
+                    out.write(chunk)
+
+
+@app.post("/api/telegram/processing-webhook")
+async def telegram_processing_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Входящие обновления от Telegram Bot API (setWebhook).
+    Логика совпадает с long polling; см. dispatch_telegram_processing_update.
+    """
+    secret = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+    if secret and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not _get_processing_bot_token():
+        return {"ok": True, "skipped": True, "reason": "TELEGRAM_PROCESSING_BOT_TOKEN not set"}
+
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    await dispatch_telegram_processing_update(update, background_tasks)
+    return {"ok": True}
+
+
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dist")
+
 @app.get("/")
 async def root():
+    # Serve frontend if built, otherwise API info
+    if os.path.exists(os.path.join(FRONTEND_DIR, "index.html")):
+        return FileResponse(os.path.join(FRONTEND_DIR, "index.html"), media_type="text/html")
     return {"message": "TrackAI Video Analysis API", "version": "1.0.0"}
+
+
+async def _fetch_lingbot_json(path: str, timeout_seconds: int = 30) -> Dict[str, Any]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{LINGBOT_WORKER_URL}{path}",
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 300:
+                raise RuntimeError(f"LingBot worker error ({resp.status}): {text[:500]}")
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("LingBot worker returned invalid JSON") from exc
+
+
+def _lingbot_to_trackai_result(
+    video_id: str,
+    session_id: str,
+    metadata: Dict[str, Any],
+    trajectory_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    poses = trajectory_payload.get("poses") if isinstance(trajectory_payload, dict) else []
+    trajectory: List[List[float]] = []
+
+    if isinstance(poses, list):
+        for pose in poses:
+            position = None
+            if isinstance(pose, dict):
+                position = pose.get("position")
+                if position is None and isinstance(pose.get("c2w"), list):
+                    c2w = pose.get("c2w")
+                    try:
+                        position = [c2w[0][3], c2w[1][3], c2w[2][3]]
+                    except Exception:
+                        position = None
+            elif isinstance(pose, list):
+                position = pose
+
+            if not isinstance(position, list) or len(position) < 3:
+                continue
+            try:
+                x = float(position[0])
+                y = float(position[1])
+                z = float(position[2])
+            except Exception:
+                continue
+            if all(_math.isfinite(v) for v in (x, y, z)):
+                # TrackAI plan UI expects x/y/z-like points. For LingBot camera
+                # poses, horizontal movement is better represented by x/z; y is height.
+                trajectory.append([x, z, y])
+
+    estimated_distance = 0.0
+    for i in range(1, len(trajectory)):
+        dx = trajectory[i][0] - trajectory[i - 1][0]
+        dy = trajectory[i][1] - trajectory[i - 1][1]
+        dz = trajectory[i][2] - trajectory[i - 1][2]
+        estimated_distance += (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    target_frames = int(metadata.get("target_frames") or len(trajectory) or 0)
+    fps = float(metadata.get("fps") or 0.0)
+    video_info = _get_video_info_for_ui(
+        _find_uploaded_video_path(video_id),
+        fallback_frames=target_frames,
+        fallback_fps=fps,
+    )
+
+    timings = metadata.get("timings") if isinstance(metadata.get("timings"), dict) else {}
+    total_seconds = 0.0
+    if isinstance(metadata.get("outputs"), dict):
+        output_timings = metadata["outputs"].get("timings")
+        if isinstance(output_timings, dict):
+            total_seconds = float(output_timings.get("total_seconds") or 0.0)
+    total_seconds = total_seconds or float(timings.get("total_seconds") or 0.0)
+    processing_fps = (len(trajectory) / total_seconds) if total_seconds > 0 else 0.0
+
+    return {
+        "method": "lingbot_map",
+        "trajectory": trajectory,
+        "turn_points": [],
+        "trajectory_turn_points": [],
+        "frame_count": len(trajectory),
+        "trajectory_points": len(trajectory),
+        "lingbot_session_id": session_id,
+        "lingbot_metadata": metadata,
+        "lingbot_trajectory": trajectory_payload,
+        "processing_stats": {
+            "algorithm": "LingBot-Map",
+            "session_id": session_id,
+            "status": "completed",
+            "estimated_distance": round(estimated_distance, 3),
+            "total_distance": round(estimated_distance, 3),
+            "turns_detected": 0,
+            "processing_fps": round(processing_fps, 2),
+            "analysis_time": round(total_seconds, 2),
+            "target_frames": target_frames,
+            "source_poses": len(poses) if isinstance(poses, list) else 0,
+        },
+        "video_info": video_info,
+    }
+
+
+async def _merge_lingbot_status(video_id: str, status_data: Dict[str, Any]) -> Dict[str, Any]:
+    session_id = status_data.get("lingbot_session_id")
+    if not session_id:
+        return status_data
+
+    try:
+        worker_status = await _fetch_lingbot_json(f"/sessions/{session_id}/status")
+    except Exception as exc:
+        merged = dict(status_data)
+        merged["message"] = f"LingBot-Map статус временно недоступен: {exc}"
+        merged.setdefault("progress", 0)
+        return merged
+
+    worker_state = worker_status.get("status", status_data.get("status", "queued"))
+    progress = int(round(float(worker_status.get("progress") or 0.0) * 100))
+    if worker_state == "queued":
+        message = "LingBot-Map реконструкция в очереди"
+    elif worker_state == "running":
+        message = "LingBot-Map реконструкция выполняется на RTX 3090"
+    elif worker_state == "completed":
+        message = "LingBot-Map реконструкция завершена"
+        progress = 100
+    elif worker_state == "failed":
+        message = worker_status.get("error") or "LingBot-Map реконструкция завершилась ошибкой"
+        progress = 0
+    else:
+        message = status_data.get("message") or "LingBot-Map реконструкция"
+
+    merged = {
+        **status_data,
+        "status": "error" if worker_state == "failed" else worker_state,
+        "progress": progress,
+        "message": message,
+        "lingbot_session_id": session_id,
+        "lingbot_status": worker_status,
+    }
+
+    if worker_state == "completed":
+        metadata: Dict[str, Any] = {}
+        trajectory: Dict[str, Any] = {"poses": []}
+        try:
+            metadata = await _fetch_lingbot_json(f"/sessions/{session_id}/metadata")
+        except Exception as exc:
+            metadata = {"error": str(exc)}
+        try:
+            trajectory = await _fetch_lingbot_json(f"/sessions/{session_id}/trajectory")
+        except Exception as exc:
+            trajectory = {"poses": [], "error": str(exc)}
+
+        result = _lingbot_to_trackai_result(video_id, session_id, metadata, trajectory)
+        merged["result"] = result
+        processing_status[video_id] = {
+            **merged,
+            "result": result,
+        }
+
+    if worker_state == "failed":
+        processing_status[video_id] = merged
+
+    return merged
+
+
+def _persist_lingbot_session_id(video_id: str, session_id: Optional[str]) -> None:
+    if not session_id:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+        row = cursor.fetchone()
+        map_context: Dict[str, Any] = {}
+        if row and row[0]:
+            try:
+                parsed = json.loads(row[0])
+                if isinstance(parsed, dict):
+                    map_context = parsed
+            except Exception:
+                map_context = {}
+        map_context["lingbot_session_id"] = session_id
+        map_context["analysis_method"] = "lingbot"
+        cursor.execute(
+            """
+            UPDATE tracking_tasks
+            SET map_context = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (json.dumps(map_context), "lingbot_queued", video_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to persist LingBot session id: {exc}")
+
+
+def _load_lingbot_session_id(video_id: str) -> Optional[str]:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return None
+        parsed = json.loads(row[0])
+        if isinstance(parsed, dict):
+            value = parsed.get("lingbot_session_id")
+            return str(value) if value else None
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to load LingBot session id: {exc}")
+    return None
+
 
 @app.get("/api/status/{video_id}")
 async def get_video_status(video_id: str):
     """
     Get the current status and progress of video analysis
     """
+    manual_store = _load_manual_trajectories()
+    manual_item = manual_store.get(video_id)
+    if manual_item:
+        manual_result = _make_manual_result(
+            manual_item.get("trajectory") or [],
+            manual_item.get("turn_points") or [],
+        )
+        return {
+            "status": "completed",
+            "progress": 100,
+            "message": "Ручная траектория готова",
+            "result": manual_result,
+            "manual_updated_at": manual_item.get("updated_at"),
+        }
     if video_id not in processing_status:
+        lingbot_session_id = _load_lingbot_session_id(video_id)
+        if lingbot_session_id:
+            processing_status[video_id] = {
+                "status": "queued",
+                "progress": 0,
+                "message": "LingBot-Map реконструкция поставлена в очередь",
+                "lingbot_session_id": lingbot_session_id,
+                "start_time": time.time(),
+            }
+            return await _merge_lingbot_status(video_id, processing_status[video_id])
         return {"id": video_id, "status": "unknown", "progress": 0}
-    return processing_status[video_id]
+    return await _merge_lingbot_status(video_id, processing_status[video_id])
+
+@app.post("/api/reset-status/{video_id}")
+async def reset_video_status(video_id: str):
+    """Reset processing status for a video (to allow re-processing)."""
+    if video_id in processing_status:
+        del processing_status[video_id]
+    return {"id": video_id, "status": "reset"}
 
 def _update_dwg_progress(job_id: str, progress: int, message: str):
     if job_id in convert_dwg_status:
@@ -600,7 +1852,8 @@ async def convert_pdf_to_png(request: Request):
     """Convert PDF to PNG (первая страница) для отображения плана."""
     import base64
     try:
-        form = await request.form(max_part_size=UPLOAD_MAX_PART_SIZE)
+        form = await request.form()
+
         file = form.get("file")
         if not file or not hasattr(file, "filename") or not file.filename:
             raise HTTPException(status_code=400, detail="Требуется файл .pdf")
@@ -741,6 +1994,75 @@ def _get_video_duration_sec(path: Path) -> float:
         pass
     return 0.0
 
+
+def _get_video_info_for_ui(path: Optional[Path], fallback_frames: int = 0, fallback_fps: float = 0.0) -> Dict[str, Any]:
+    info = {
+        "width": 0,
+        "height": 0,
+        "fps": float(fallback_fps or 0.0),
+        "frame_count": int(fallback_frames or 0),
+        "duration": 0.0,
+    }
+    if not path or not path.exists():
+        return info
+
+    ffprobe_path = "/usr/bin/ffprobe" if os.path.exists("/usr/bin/ffprobe") else "ffprobe"
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return info
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams") or []
+        stream = streams[0] if streams else {}
+
+        def _rate(value: Any) -> float:
+            if not isinstance(value, str) or "/" not in value:
+                try:
+                    return float(value or 0)
+                except Exception:
+                    return 0.0
+            num, den = value.split("/", 1)
+            try:
+                den_f = float(den)
+                return float(num) / den_f if den_f else 0.0
+            except Exception:
+                return 0.0
+
+        fps = _rate(stream.get("avg_frame_rate")) or _rate(stream.get("r_frame_rate")) or info["fps"]
+        duration = float(stream.get("duration") or 0.0)
+        frame_count = int(float(stream.get("nb_frames") or 0))
+        if not frame_count and duration and fps:
+            frame_count = int(round(duration * fps))
+        info.update(
+            {
+                "width": int(stream.get("width") or 0),
+                "height": int(stream.get("height") or 0),
+                "fps": float(fps or 0.0),
+                "frame_count": frame_count or info["frame_count"],
+                "duration": duration,
+            }
+        )
+    except Exception:
+        return info
+    return info
+
+
 def _validate_video_readable(path: Path) -> bool:
     try:
         import cv2
@@ -773,7 +2095,7 @@ def _run_ffmpeg_with_progress(cmd: list, video_id: str, duration_sec: float, pro
 
 async def process_video_background(
     video_id: str,
-    video_path: Path,
+    video_path: Optional[Path],
     original_filename: str,
     scale_factor: float,
     stabilize: bool,
@@ -782,238 +2104,102 @@ async def process_video_background(
     use_ml_roi: bool = True,
     map_context: Optional[Dict[str, Any]] = None,
 ):
-    """Background task to process video without blocking the API"""
+    """Background task — отправляет видео на GPU Worker (RTX 3090), получает результат.
+    
+    Если video_path=None — видео уже на GPU Worker (загружено через upload-video-stream).
+    """
     _update_task_status(video_id, "processing", 10)
     try:
-
         from fastapi.concurrency import run_in_threadpool
-        
-        ffmpeg_path = '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else 'ffmpeg'
-        
-        # Step 0: AVI → MP4 конвертация (для совместимости с OpenCV/ffmpeg)
-        if video_path.suffix.lower() == '.avi':
-            logger.info(f"[{video_id}] Конвертация AVI в MP4...")
-            processing_status[video_id].update({
-                "status": "converting",
-                "progress": 10,
-                "message": "Конвертация AVI в MP4 (может занять 15–30 мин для больших файлов)..."
-            })
-            avi_mp4_path = video_path.with_suffix('.from_avi.mp4')
-            try:
-                duration_sec = await run_in_threadpool(_get_video_duration_sec, video_path)
-                def run_avi_convert():
-                    cmd = [
-                        ffmpeg_path, '-i', str(video_path),
-                        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                        '-c:a', 'aac', '-y', str(avi_mp4_path)
-                    ]
-                    if duration_sec > 0:
-                        _run_ffmpeg_with_progress(cmd, video_id, duration_sec, 10, 14, "Конвертация AVI в MP4")
-                    else:
-                        subprocess.run(cmd, check=True, capture_output=True, timeout=FFMPEG_TIMEOUT)
-                await run_in_threadpool(run_avi_convert)
-                if _validate_video_readable(avi_mp4_path):
-                    video_path.unlink()
-                    video_path = avi_mp4_path
-                else:
-                    raise Exception("AVI->MP4 output is not readable")
-                logger.info(f"[{video_id}] AVI успешно сконвертирован в MP4")
-            except subprocess.TimeoutExpired:
-                error_msg = f"Таймаут конвертации AVI (>{FFMPEG_TIMEOUT//60} мин). Попробуйте файл поменьше."
-                logger.error(f"[{video_id}] {error_msg}")
-                await send_error_to_telegram(error_msg, f"AVI конвертация: {original_filename}")
-                raise Exception(error_msg)
-            except Exception as e:
-                error_msg = f"Ошибка конвертации AVI: {str(e)}"
-                logger.error(f"[{video_id}] {error_msg}")
-                await send_error_to_telegram(error_msg, f"AVI конвертация: {original_filename}")
-                raise Exception(error_msg)
-        
-        # Step 1: Optimization/Normalization
-        logger.info(f"[{video_id}] Normalizing video format and resolution...")
-        processing_status[video_id].update({
-            "status": "converting",
-            "progress": 15,
-            "message": "Оптимизация видео (уменьшение до 720p для скорости)..."
-        })
-        
-        normalized_path = video_path.with_suffix('.optimized.mp4')
-        
-        try:
-            def run_ffmpeg_norm():
-                return subprocess.run([
-                    ffmpeg_path, '-i', str(video_path),
-                    '-vf', 'scale=-2:min(ih\,720)',
-                    '-c:v', 'libx264', '-preset', 'superfast', '-crf', '23',
-                    '-c:a', 'aac', '-y', str(normalized_path)
-                ], check=True, capture_output=True, timeout=FFMPEG_TIMEOUT)
-            
-            await run_in_threadpool(run_ffmpeg_norm)
 
-            # Replace original with optimized file only if readable
-            if _validate_video_readable(normalized_path):
-                video_path.unlink()
-                video_path = normalized_path
-                logger.info(f"[{video_id}] Successfully optimized video")
-            else:
-                logger.warning(f"[{video_id}] Optimized video not readable, keeping original")
-                if normalized_path.exists():
-                    normalized_path.unlink()
-        except Exception as e:
-            logger.warning(f"[{video_id}] Optimization pass failed: {e}")
-            logger.info(f"[{video_id}] Proceeding with original file...")
-
-        # Create temporary copy in /tmp for processing
-        temp_dir = Path("/tmp/trackai_temp")
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        temp_path = temp_dir / f"proc_{video_id}{video_path.suffix}"
-        
-        def copy_to_temp():
-            shutil.copy2(video_path, temp_path)
-        await run_in_threadpool(copy_to_temp)
-
-        processing_path = temp_path
-
-        # Step 2: Stabilization
-        if stabilize:
-            logger.info(f"[{video_id}] Starting video stabilization...")
-            processing_status[video_id].update({
-                "status": "stabilizing",
-                "progress": 20,
-                "message": "Стабилизация видео (это может занять время)..."
-            })
-            
-            stabilized_path = temp_dir / f"stab_{video_id}{video_path.suffix}"
-
-            try:
-                def stab_progress(p):
-                    overall_p = 20 + (p * 0.4)
-                    processing_status[video_id]["progress"] = int(overall_p)
-                
-                processing_path = await run_in_threadpool(
-                    stabilize_video,
-                    temp_path,
-                    stabilized_path,
-                    progress_callback=stab_progress,
-                    dynamic_smoothing=True
-                )
-                if not _validate_video_readable(processing_path):
-                    logger.warning(f"[{video_id}] Stabilized video not readable, falling back to original temp")
-                    processing_path = temp_path
-                logger.info(f"[{video_id}] Stabilization completed")
-            except Exception as e:
-                error_msg = f"Ошибка стабилизации: {str(e)}"
-                logger.error(f"[{video_id}] {error_msg}")
-                await send_error_to_telegram(error_msg, f"Стабилизация: {original_filename}")
-                processing_path = temp_path
-
-            if temp_path.exists() and processing_path != temp_path:
-                temp_path.unlink()
-
-        # Step 3: SLAM analysis
-        logger.info(f"[{video_id}] Starting SLAM trajectory analysis...")
-        processing_status[video_id].update({
-            "status": "analyzing",
-            "progress": 60,
-            "message": "SLAM анализ траектории..."
-        })
-        
-        def slam_progress(p):
-            overall_p = 60 + (p * 0.35)
-            processing_status[video_id]["progress"] = int(overall_p)
-
-        _detector_onnx = Path(__file__).resolve().parent / "models" / "detector.onnx"
-        processor = FullFeatureProcessor(
-            input_dir=str(UPLOAD_DIR),
-            output_dir=str(OUTPUT_DIR),
-            scale_factor=scale_factor,
-            progress_callback=slam_progress,
-            use_homography=True,
-            use_kalman=True,
-            use_akaze=True,
-            frame_skip=1,
-            target_width=900,
-            use_optical_flow=True,
-            detect_interval=max(1, int(detect_interval)),
-            turn_vote_threshold=max(1, min(5, int(turn_vote_threshold))),
-            use_ml_roi=use_ml_roi,
-            ml_model_path=str(_detector_onnx),
-        )
-
-        result = await run_in_threadpool(processor.process_video, processing_path)
-
-        # Cleanup temp
-        if processing_path.exists():
-                processing_path.unlink()
-
-        if result:
-            # Не считаем успехом пустую траекторию (VO мог не набрать точек)
-            traj = result.get("trajectory") or []
-            if not traj or len(traj) == 0:
-                raise Exception(
-                    "Траектория пуста: алгоритм не смог построить путь по кадрам. "
-                    "Попробуйте другое видео, отключите стабилизацию или улучшите освещение/текстуру сцены."
-                )
-            # Normalize result
-            def _normalize_turn_list(turns):
-                if not turns:
-                    return turns
-                out = []
-                for turn in turns:
-                    nt = turn.copy()
-                    if isinstance(turn.get("position"), dict):
-                        pos = turn["position"]
-                        nt["position"] = [pos.get("x", 0), pos.get("y", 0), pos.get("z", 0)]
-                    elif not isinstance(turn.get("position"), list):
-                        nt["position"] = [0, 0, 0]
-                    out.append(nt)
-                return out
-
-            normalized_result = result.copy()
-            for key in ("turn_points", "raw_turn_points", "trajectory_turn_points"):
-                if key in normalized_result and normalized_result[key]:
-                    normalized_result[key] = _normalize_turn_list(normalized_result[key])
-
-            if map_context:
-                normalized_result = apply_map_postprocessing(normalized_result, map_context)
-                if normalized_result.get("map_turn_points"):
-                    normalized_result["map_turn_points"] = _normalize_turn_list(normalized_result["map_turn_points"])
-            # Источник истины по приоритету: (1) IMU [пока нет], (2) map_turn_points, (3) turn_points (integrated yaw)
-            normalized_result["final_turn_points"] = normalized_result.get("map_turn_points") or normalized_result.get("turn_points") or []
-
-            # Глобально приводим результат к JSON-совместимым типам (numpy.bool_ и т.п.)
-            normalized_result = _to_json_serializable(normalized_result)
-
-            # Save results
-            analysis_data = {
-                "video_id": video_id,
-                "video_filename": video_path.name,
-                "original_filename": original_filename,
-                "scale_factor": scale_factor,
-                "stabilized": stabilize,
-                "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(video_path.stat().st_mtime)),
-                "analysis_result": normalized_result
+        # Инициализируем статус, если ещё не задан (upload-video не создаёт его)
+        if video_id not in processing_status:
+            processing_status[video_id] = {
+                "status": "queued", "progress": 0, "message": "Подготовка к отправке на GPU",
+                "start_time": time.time(),
             }
 
-            analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
-            with open(analysis_file, 'w', encoding='utf-8') as f:
-                json.dump(analysis_data, f, indent=2, ensure_ascii=False, default=_to_json_serializable)
+        processing_status[video_id].update({
+            "status": "uploading_to_gpu",
+            "progress": 5,
+            "message": "Отправка видео на GPU-сервер для анализа..."
+        })
 
-            processing_status[video_id].update({
-                "status": "completed",
-                "progress": 100,
-                "message": "Обработка завершена успешно",
-                "result": normalized_result
-            })
-            _update_task_status(video_id, "completed", 100)
-            logger.info(f"[{video_id}] Analysis completed successfully")
+        timeout_sec = 7200  # 2 hours max
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
+            params = {
+                'original_filename': original_filename,
+                'scale_factor': str(scale_factor),
+                'stabilize': str(stabilize).lower(),
+                'detect_interval': str(detect_interval),
+                'turn_vote_threshold': str(turn_vote_threshold),
+                'use_ml_roi': str(use_ml_roi).lower(),
+            }
+            if map_context:
+                params['map_context'] = json.dumps(map_context)
 
-        else:
-            raise Exception(
-                "Процессор не вернул результат (не удалось обработать кадры). "
-                "Попробуйте отключить стабилизацию или загрузить видео в формате MP4 (H.264)."
-            )
+            if video_path and video_path.exists():
+                # ─── Видео есть локально — отправляем файл ──────────
+                logger.info(f"[{video_id}] Sending local file to GPU Worker: {video_path.name}")
+                processing_status[video_id].update({
+                    "status": "gpu_processing",
+                    "progress": 15,
+                    "message": "GPU-сервер обрабатывает видео..."
+                })
+                async with session.post(
+                    f"{GPU_WORKER_URL}/api/process-video-raw/{video_id}",
+                    params=params,
+                    data=open(video_path, 'rb'),
+                ) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        raise Exception(f"GPU Worker error (HTTP {resp.status}): {err_text[:500]}")
+                    gpu_result = await resp.json()
+            else:
+                # ─── Видео уже на GPU — триггерим обработку ────────
+                logger.info(f"[{video_id}] Video already on GPU, triggering processing")
+                params['use_uploaded'] = 'true'
+                async with session.post(
+                    f"{GPU_WORKER_URL}/api/process-video-raw/{video_id}",
+                    params=params,
+                    data=b'',  # empty body
+                    headers={'Content-Length': '0'},
+                ) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        raise Exception(f"GPU Worker error (HTTP {resp.status}): {err_text[:500]}")
+                    gpu_result = await resp.json()
+
+        if not gpu_result.get("success"):
+            raise Exception(gpu_result.get("error", "GPU Worker returned unsuccessful status"))
+
+        result = gpu_result["result"]
+        processing_time = gpu_result.get("processing_time", 0)
+        logger.info(f"[{video_id}] GPU Worker completed in {processing_time}s")
+
+        # ─── Сохраняем результат (общая часть) ─────────────────────
+        analysis_data = {
+            "video_id": video_id,
+            "video_filename": video_path.name,
+            "original_filename": original_filename,
+            "scale_factor": scale_factor,
+            "stabilized": stabilize,
+            "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(video_path.stat().st_mtime)),
+            "analysis_result": result
+        }
+
+        analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
+        with open(analysis_file, 'w', encoding='utf-8') as f:
+            json.dump(analysis_data, f, indent=2, ensure_ascii=False, default=_to_json_serializable)
+
+        processing_status[video_id].update({
+            "status": "completed",
+            "progress": 100,
+            "message": "Обработка завершена успешно",
+            "result": result
+        })
+        _update_task_status(video_id, "completed", 100)
+        logger.info(f"[{video_id}] Analysis saved and status set to completed")
 
     except Exception as e:
         error_msg = str(e)
@@ -1021,12 +2207,160 @@ async def process_video_background(
         logger.error(f"[{video_id}] Background processing error: {error_msg}")
         if video_id in processing_status:
             processing_status[video_id].update({
-
                 "status": "error",
                 "progress": 0,
                 "message": f"Ошибка: {error_msg}"
             })
         await send_error_to_telegram(error_msg, f"Фон. обработка: {original_filename}")
+
+# ──────────────────────────────────────────────
+# R³ background processor
+# ──────────────────────────────────────────────
+
+async def process_video_r3_background(
+    video_id: str,
+    video_path: Optional[Path],
+    original_filename: str,
+    scale_factor: float = 1.0,
+    frame_stride: int = 5,
+    max_frames: int = 1500,
+    ckpt: str = "r3_long.safetensors",
+    size: int = 392,
+    mode: str = "strided",
+):
+    """Background task — отправляет видео на GPU Worker для R³ реконструкции.
+
+    Если video_path=None — видео уже на GPU Worker (загружено через upload-video-stream).
+    """
+    _update_task_status(video_id, "processing", 10)
+    try:
+        if video_id not in processing_status:
+            processing_status[video_id] = {
+                "status": "queued", "progress": 0, "message": "Подготовка к R³ анализу",
+                "start_time": time.time(),
+            }
+
+        processing_status[video_id].update({
+            "status": "uploading_to_gpu",
+            "progress": 5,
+            "message": "Отправка видео на GPU-сервер для R³ реконструкции..."
+        })
+        logger.info(f"[{video_id}] Sending to GPU Worker R³ at {GPU_WORKER_URL}")
+
+        timeout_sec = 7200
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
+            params = {
+                'original_filename': original_filename,
+                'frame_stride': str(frame_stride),
+                'ckpt': ckpt,
+                'size': str(size),
+                'mode': mode,
+                'max_frames': str(max_frames),
+            }
+
+            processing_status[video_id].update({
+                "status": "gpu_processing",
+                "progress": 15,
+                "message": "R³ реконструкция на GPU..."
+            })
+
+            if video_path and video_path.exists():
+                # ─── Видео есть локально — отправляем файл ──────────
+                logger.info(f"[{video_id}] Sending local file to GPU Worker R³: {video_path.name}")
+                async with session.post(
+                    f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
+                    params=params,
+                    data=open(video_path, 'rb'),
+                ) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
+                    gpu_result = await resp.json()
+            else:
+                # ─── Видео уже на GPU — триггерим обработку ────────
+                logger.info(f"[{video_id}] Video already on GPU, triggering R³ processing")
+                params['use_uploaded'] = 'true'
+                async with session.post(
+                    f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
+                    params=params,
+                    data=b'',  # empty body
+                    headers={'Content-Length': '0'},
+                ) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
+                    gpu_result = await resp.json()
+
+        if not gpu_result.get("success"):
+            raise Exception(gpu_result.get("error", "GPU Worker R³ returned unsuccessful status"))
+
+        # Конвертируем R³ camera poses в формат траектории
+        r3_result = gpu_result["result"]
+        trajectory_data = _r3_poses_to_trajectory(r3_result, scale_factor=scale_factor)
+
+        # Сохраняем результат
+        video_filename = video_path.name if video_path and video_path.exists() else f"{video_id}_{original_filename}"
+        analysis_data = {
+            "video_id": video_id,
+            "video_filename": video_filename,
+            "original_filename": original_filename,
+            "scale_factor": scale_factor,
+            "stabilized": False,
+            "analysis_method": "r3",
+            "analysis_result": trajectory_data,
+        }
+
+        analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
+        with open(analysis_file, 'w', encoding='utf-8') as f:
+            json.dump(analysis_data, f, indent=2, ensure_ascii=False, default=_to_json_serializable)
+
+        processing_status[video_id].update({
+            "status": "completed",
+            "progress": 100,
+            "message": "R³ реконструкция завершена",
+            "result": trajectory_data,
+        })
+        _update_task_status(video_id, "completed", 100)
+        logger.info(f"[{video_id}] R³ analysis saved and status set to completed")
+
+    except Exception as e:
+        error_msg = str(e)
+        _update_task_status(video_id, "error", 0)
+        logger.error(f"[{video_id}] R³ background error: {error_msg}")
+        if video_id in processing_status:
+            processing_status[video_id].update({
+                "status": "error",
+                "progress": 0,
+                "message": f"Ошибка R³: {error_msg}"
+            })
+
+
+def _schedule_r3_process_background(
+    background_tasks: Optional[BackgroundTasks],
+    video_id: str,
+    video_path: Optional[Path],
+    original_filename: str,
+    scale_factor: float,
+    frame_stride: int = 5,
+    max_frames: int = 1500,
+    ckpt: str = "r3_long.safetensors",
+    size: int = 392,
+    mode: str = "strided",
+) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(
+            process_video_r3_background,
+            video_id, video_path, original_filename,
+            scale_factor, frame_stride, max_frames, ckpt, size, mode,
+        )
+    else:
+        asyncio.create_task(
+            process_video_r3_background(
+                video_id, video_path, original_filename,
+                scale_factor, frame_stride, max_frames, ckpt, size, mode,
+            )
+        )
+
 
 # Метаданные загруженных видео (video_id -> filename) для анализа по id
 UPLOADED_VIDEOS: Dict[str, str] = {}
@@ -1043,64 +2377,202 @@ def _load_uploaded_videos():
                     UPLOADED_VIDEOS[vid] = name
 _load_uploaded_videos()
 
-@app.post("/api/upload-video")
-async def upload_video(request: Request) -> Dict[str, Any]:
-    """Загрузить видео на сервер (отдельно от анализа). Возвращает video_id для последующего анализа."""
+
+@app.on_event("startup")
+async def _startup_telegram_processing_long_poll() -> None:
+    """Без HTTPS webhook: один worker держит flock и крутит getUpdates."""
+    global _tg_poll_lock_file
     try:
-        form = await request.form(max_part_size=UPLOAD_MAX_PART_SIZE)
-        file = form.get("file")
-        if not file or not hasattr(file, "filename") or not file.filename:
-            logger.warning(f"upload-video: file missing. Form keys: {list(form.keys()) if form else 'empty'}")
-            raise HTTPException(status_code=422, detail="Требуется файл видео. Убедитесь, что поле формы называется 'file'.")
-        if not file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+        if not await _tg_should_use_long_polling():
+            return
+        if _HAS_FCNTL and _fcntl_mod is not None:
+            try:
+                _tg_poll_lock_file = open("/tmp/trackai_tg_processing_poll.lock", "w")
+                _fcntl_mod.flock(_tg_poll_lock_file.fileno(), _fcntl_mod.LOCK_EX | _fcntl_mod.LOCK_NB)
+            except BlockingIOError:
+                logger.info("Telegram processing poll: другой worker уже опрашивает API")
+                return
+            except OSError as e:
+                logger.warning(f"Telegram poll flock: {e}")
+                return
+        asyncio.create_task(telegram_processing_poll_updates_loop())
+    except Exception as e:
+        logger.warning(f"Telegram processing startup poll: {e}")
+
+
+@app.post("/api/init-upload")
+async def init_upload(request: Request) -> Dict[str, Any]:
+    """Зарегистрировать видео для загрузки (без файла). Возвращает video_id."""
+    try:
+        body = await request.json()
+        filename = body.get("filename", "video.avi")
+        employee_name = body.get("employee_name") or None
+        client_source = (body.get("client_source") or request.headers.get("X-TrackAI-Client") or "web").strip()
+
+        if not filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
             raise HTTPException(status_code=400, detail="Неподдерживаемый формат видео")
 
-        employee_name = form.get("employee_name") or None
-        if isinstance(employee_name, str):
-            employee_name = employee_name.strip() or None
-
         video_id = str(uuid.uuid4())
-        video_filename = f"{video_id}_{file.filename}"
-        video_path = VIDEOS_DIR / video_filename
+        video_filename = f"{video_id}_{filename}"
 
-        # Потоковая запись чанками (для больших файлов)
-        chunk_size = 1024 * 1024  # 1 MB
-        with open(video_path, "wb") as f:
-            while True:
-                chunk = await file.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-
+        # Регистрируем
         UPLOADED_VIDEOS[video_id] = video_filename
-        logger.info(f"Uploaded video: {video_filename} ({video_path.stat().st_size / 1024 / 1024:.1f} MB)")
 
-        # Сразу создаём задачу в tracking_tasks для админки
+        map_context = {"client_source": client_source} if client_source else {}
+
+        # Создаём задачу в tracking_tasks
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT OR REPLACE INTO tracking_tasks (id, employee_name, video_filename, original_filename, status) VALUES (?, ?, ?, ?, ?)",
-                (video_id, employee_name, video_filename, file.filename, "uploaded")
+                "INSERT OR REPLACE INTO tracking_tasks (id, employee_name, video_filename, original_filename, map_context, status) VALUES (?, ?, ?, ?, ?, ?)",
+                (video_id, employee_name, video_filename, filename, json.dumps(map_context), "registered")
             )
             conn.commit()
             conn.close()
-            logger.info(f"Created tracking task {video_id} for employee '{employee_name}'")
         except Exception as db_err:
-            logger.error(f"Failed to save tracking task on upload: {db_err}")
+            logger.error(f"Failed to save tracking task: {db_err}")
 
+        logger.info(f"[{video_id}] Initialized upload for {filename}")
         return {
             "success": True,
             "video_id": video_id,
             "filename": video_filename,
-            "original_filename": file.filename,
-            "file_size": video_path.stat().st_size,
-            "message": "Видео загружено на сервер"
+            "original_filename": filename,
         }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in upload_video: {e}", exc_info=True)
+        logger.error(f"Error in init_upload: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/upload-video/{video_id}")
+async def upload_video_proxy(video_id: str, request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    """Принять raw-байты видео, отправить на GPU и сохранить локально для R³ анализа.
+    
+    Тело запроса — сырые байты видеофайла (Content-Type: application/octet-stream).
+    Буферизирует во временный файл, затем отправляет на GPU и сохраняет локально.
+    """
+    try:
+        video_info = UPLOADED_VIDEOS.get(video_id)
+        if not video_info:
+            raise HTTPException(status_code=404, detail=f"Video {video_id} not registered")
+        
+        original_filename = video_info[len(video_id)+1:] if '_' in video_info else "video.avi"
+        client_source = (request.headers.get("X-TrackAI-Client") or "").strip().lower()
+        is_desktop_upload = client_source == "desktop"
+        
+        logger.info(f"[{video_id}] Raw upload started: {original_filename} source={client_source or 'web'}")
+
+        ext = Path(original_filename).suffix or '.mp4'
+        local_video_path = VIDEOS_DIR / f"{video_id}_{original_filename}"
+        local_tmp = VIDEOS_DIR / f".{video_id}_uploading{ext}"
+
+        # ─── Буферизируем во временный файл ──────────────────────
+        file_size = 0
+        with open(local_tmp, "wb") as tmp:
+            async for chunk in request.stream():
+                if chunk:
+                    tmp.write(chunk)
+                    file_size += len(chunk)
+
+        if file_size == 0:
+            local_tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="Пустой файл видео")
+
+        # Перемещаем из временного в постоянное место
+        local_tmp.rename(local_video_path)
+
+        # Регистрируем локальный файл
+        UPLOADED_VIDEOS[video_id] = local_video_path.name
+        logger.info(f"[{video_id}] Saved locally: {local_video_path} ({file_size} bytes)")
+        _schedule_video_preview(video_id)
+
+        # ─── Отправляем на GPU ────────────────────────────────────
+        gpu_url = f"{GPU_WORKER_URL}/api/upload-video-stream/{video_id}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                gpu_url,
+                params={'original_filename': original_filename},
+                data=open(local_video_path, 'rb'),
+                timeout=aiohttp.ClientTimeout(total=7200),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"[{video_id}] GPU Worker upload failed ({resp.status}): {error_text[:200]}")
+                    raise HTTPException(status_code=500, detail=f"GPU Worker upload failed: {error_text[:200]}")
+                result = await resp.json()
+                file_size = result.get("file_size", file_size)
+
+        logger.info(f"[{video_id}] Uploaded {file_size} bytes to GPU Worker")
+
+        # Обновляем статус задачи
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+            row = cursor.fetchone()
+            try:
+                map_context = json.loads(row[0]) if row and row[0] else {}
+            except Exception:
+                map_context = {}
+            if is_desktop_upload:
+                map_context["client_source"] = "desktop"
+                map_context["gpu_upload_url"] = gpu_url
+            cursor.execute(
+                "UPDATE tracking_tasks SET status = 'uploaded', map_context = ? WHERE id = ?",
+                (json.dumps(map_context), video_id)
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        upload_source = client_source or "web"
+        if background_tasks is not None:
+            background_tasks.add_task(
+                send_desktop_upload_notification,
+                video_id,
+                original_filename,
+                file_size,
+                gpu_url,
+                upload_source,
+            )
+        else:
+            asyncio.create_task(
+                send_desktop_upload_notification(video_id, original_filename, file_size, gpu_url, upload_source)
+            )
+
+        # Запускаем SLAM обработку (с video_path=None — use_uploaded на GPU)
+        logger.info(f"[{video_id}] Starting GPU processing")
+        _schedule_process_video_background(
+            background_tasks,
+            video_id,
+            None,
+            original_filename,
+            12.306, True, 3, 3, True, None,
+        )
+
+        # Notify subscribers
+        if background_tasks is not None:
+            background_tasks.add_task(broadcast_new_processing_for_video, video_id)
+        else:
+            asyncio.create_task(broadcast_new_processing_for_video(video_id))
+
+        return {
+            "success": True,
+            "video_id": video_id,
+            "filename": video_info,
+            "original_filename": original_filename,
+            "file_size": file_size,
+            "message": "Видео отправлено на обработку на GPU-сервер"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in upload_video_proxy: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1124,14 +2596,23 @@ async def update_task_context(task_id: str, request: Request) -> Dict[str, Any]:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
-        # Проверяем существует ли задача
-        cursor.execute("SELECT id FROM tracking_tasks WHERE id = ?", (task_id,))
-        if not cursor.fetchone():
+        # Проверяем существует ли задача и сохраняем уже записанный контекст
+        cursor.execute("SELECT id, map_context FROM tracking_tasks WHERE id = ?", (task_id,))
+        existing = cursor.fetchone()
+        if not existing:
             conn.close()
             raise HTTPException(status_code=404, detail="Задача не найдена")
 
+        try:
+            existing_context = json.loads(existing[1]) if existing[1] else {}
+            if not isinstance(existing_context, dict):
+                existing_context = {}
+        except Exception:
+            existing_context = {}
+        existing_context.update(map_context)
+
         updates = ["map_context = ?", "updated_at = CURRENT_TIMESTAMP"]
-        params = [json.dumps(map_context)]
+        params = [json.dumps(existing_context)]
 
         if employee_name:
             updates.append("employee_name = ?")
@@ -1150,6 +2631,150 @@ async def update_task_context(task_id: str, request: Request) -> Dict[str, Any]:
         logger.error(f"Error updating task context {task_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/admin/tasks/{video_id}/register-existing")
+async def register_existing_video_task(video_id: str, request: Request) -> Dict[str, Any]:
+    """Поднять уже загруженное видео как свежий запрос для админки."""
+    try:
+        body = await request.json()
+        employee_name = (body.get("employee_name") or "").strip() or None
+        client_source = (
+            body.get("client_source")
+            or request.headers.get("X-TrackAI-Client")
+            or "web"
+        ).strip()
+
+        video_filename = UPLOADED_VIDEOS.get(video_id)
+        video_path = (VIDEOS_DIR / video_filename) if video_filename else None
+        if not video_filename or not video_path.exists():
+            matches = list(VIDEOS_DIR.glob(f"{video_id}_*"))
+            if matches:
+                video_path = matches[0]
+                video_filename = video_path.name
+                UPLOADED_VIDEOS[video_id] = video_filename
+        if not video_filename or not video_path or not video_path.exists():
+            raise HTTPException(status_code=404, detail="Загруженное видео не найдено")
+
+        original_filename = (
+            video_filename[len(video_id) + 1:]
+            if video_filename.startswith(f"{video_id}_")
+            else video_filename
+        )
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+        row = cursor.fetchone()
+        try:
+            map_context = json.loads(row[0]) if row and row[0] else {}
+            if not isinstance(map_context, dict):
+                map_context = {}
+        except Exception:
+            map_context = {}
+
+        map_context["client_source"] = client_source
+        map_context["selected_existing_video"] = True
+
+        cursor.execute(
+            """
+            INSERT INTO tracking_tasks (
+                id, employee_name, video_filename, original_filename, map_context, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                employee_name = excluded.employee_name,
+                video_filename = excluded.video_filename,
+                original_filename = excluded.original_filename,
+                map_context = excluded.map_context,
+                status = excluded.status,
+                created_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                video_id,
+                employee_name,
+                video_filename,
+                original_filename,
+                json.dumps(map_context),
+                "selected",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        logger.info(f"[{video_id}] Registered existing upload for admin source={client_source} employee={employee_name}")
+        return {
+            "success": True,
+            "video_id": video_id,
+            "filename": video_filename,
+            "original_filename": original_filename,
+            "status": "selected",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error registering existing video {video_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _start_lingbot_session(
+    video_id: str,
+    video_path: Optional[Path],
+    fps: int = 10,
+    target_frames: int = 1500,
+    keyframe_interval: int = 6,
+    use_sdpa: bool = True,
+    mask_sky: bool = False,
+) -> Dict[str, Any]:
+    if not video_path or not video_path.exists():
+        raise HTTPException(
+            status_code=422,
+            detail="LingBot-Map MVP requires a local video file on the VPS for upload to the GPU worker",
+        )
+
+    async with aiohttp.ClientSession() as session:
+        form = aiohttp.FormData()
+        form.add_field("fps", str(fps))
+        form.add_field("target_frames", str(target_frames))
+        form.add_field("keyframe_interval", str(keyframe_interval))
+        # The deployed LingBot environment does not have FlashInfer installed.
+        # Always force SDPA so stale frontend bundles or old clients cannot
+        # trigger the FlashInfer attention path and fail reconstruction.
+        form.add_field("use_sdpa", "true")
+        form.add_field("mask_sky", str(mask_sky).lower())
+        with video_path.open("rb") as video_file:
+            form.add_field(
+                "file",
+                video_file,
+                filename=video_path.name,
+                content_type="application/octet-stream",
+            )
+            async with session.post(
+                f"{LINGBOT_WORKER_URL}/sessions/upload",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60 * 60),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 300:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"LingBot worker error ({resp.status}): {text[:500]}",
+                    )
+                try:
+                    result = json.loads(text)
+                except Exception:
+                    raise HTTPException(status_code=502, detail="LingBot worker returned invalid JSON")
+
+    processing_status[video_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "LingBot-Map реконструкция поставлена в очередь",
+        "lingbot_session_id": result.get("session_id"),
+        "lingbot_use_sdpa": True,
+        "start_time": time.time(),
+    }
+    _persist_lingbot_session_id(video_id, result.get("session_id"))
+    return result
+
+
 @app.post("/api/analyze-video-by-id")
 async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Request) -> Dict[str, Any]:
     """Запустить анализ уже загруженного видео по video_id."""
@@ -1165,8 +2790,18 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
         turn_vote_threshold = int(body.get("turn_vote_threshold", 3))
         use_ml_roi = bool(body.get("use_ml_roi", True))
         map_context = _extract_map_context(body)
+        force_reprocess = bool(body.get("force_reprocess", False))
 
-        # Если администратор задал ручную траекторию, возвращаем её сразу.
+        # При явном новом анализе ручная траектория больше не должна подменять результат.
+        # Иначе выбранное с сервера видео с прежней админ-разметкой сразу возвращает manual_result.
+        if force_reprocess:
+            manual_store = _load_manual_trajectories()
+            if video_id in manual_store:
+                del manual_store[video_id]
+                _save_manual_trajectories(manual_store)
+                logger.info(f"[{video_id}] Removed stale manual trajectory before forced reprocess")
+
+        # Если администратор задал ручную траекторию и новый прогон не запрошен, возвращаем её сразу.
         manual_store = _load_manual_trajectories()
         manual_item = manual_store.get(video_id)
         if manual_item:
@@ -1177,7 +2812,7 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
             processing_status[video_id] = {
                 "status": "completed",
                 "progress": 100,
-                "message": "Использована ручная траектория администратора",
+                "message": "Обработка завершена",
                 "result": manual_result,
                 "start_time": time.time(),
             }
@@ -1185,11 +2820,12 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 "success": True,
                 "video_id": video_id,
                 "status": "completed",
-                "message": "Использована ручная траектория",
+                "message": "Обработка завершена",
                 "data": manual_result,
             }
 
-        # Ищем файл: UPLOADED_VIDEOS, потом glob; если файл не найден — пересканируем
+        # Ищем файл: UPLOADED_VIDEOS, потом glob; если файл не найден — возможно,
+        # видео было загружено напрямую на GPU через upload-video-stream.
         video_filename = UPLOADED_VIDEOS.get(video_id)
         video_path = (VIDEOS_DIR / video_filename) if video_filename else None
 
@@ -1202,7 +2838,12 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                     UPLOADED_VIDEOS[video_id] = video_filename
                     break
             if not video_path or not video_path.exists():
-                raise HTTPException(status_code=404, detail=f"Видео {video_id} не найдено на сервере")
+                # Видео может быть только на GPU (стриминговая загрузка)
+                if video_id in UPLOADED_VIDEOS:
+                    logger.info(f"[{video_id}] Video not found locally but registered — it's on GPU, using use_uploaded flow")
+                    video_path = None
+                else:
+                    raise HTTPException(status_code=404, detail=f"Видео {video_id} не найдено на сервере")
 
         processing_status[video_id] = {
             "status": "queued",
@@ -1211,40 +2852,64 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
             "start_time": time.time()
         }
 
-        # Save task to DB
-        try:
-            employee_name = payload.get("employee_name")
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT OR REPLACE INTO tracking_tasks (id, employee_name, video_filename, original_filename, map_context, status) VALUES (?, ?, ?, ?, ?, ?)",
-                (video_id, employee_name, video_path.name, original_filename, json.dumps(map_context), "queued")
+        # ─── НЕМЕДЛЕННО запускаем обработку на GPU Worker ────────
+        employee_name = body.get("employee_name")
+        analysis_method = body.get("analysis_method", "slam")
+
+        if analysis_method == "lingbot":
+            lingbot_result = await _start_lingbot_session(
+                video_id,
+                video_path,
+                int(body.get("lingbot_fps", 10)),
+                int(body.get("lingbot_target_frames", 1500)),
+                int(body.get("lingbot_keyframe_interval", 6)),
+                True,
+                bool(body.get("lingbot_mask_sky", False)),
             )
-            conn.commit()
-            conn.close()
-        except Exception as db_err:
-            logger.error(f"Failed to save task to DB: {db_err}")
+            return {
+                "success": True,
+                "video_id": video_id,
+                "status": "queued",
+                "message": "LingBot-Map анализ запущен",
+                "lingbot_session_id": lingbot_result.get("session_id"),
+            }
+        elif analysis_method == "r3":
+            frame_stride = int(body.get("frame_stride", 5))
+            max_frames = int(body.get("max_frames", 1500))
+            ckpt = body.get("ckpt", "r3_long.safetensors")
+            size = int(body.get("size", 392))
+            mode = body.get("mode", "strided")
+            _schedule_r3_process_background(
+                background_tasks,
+                video_id, video_path, original_filename,
+                scale_factor,
+                frame_stride, max_frames, ckpt, size, mode,
+            )
+        else:
+            _schedule_process_video_background(
+                background_tasks,
+                video_id,
+                video_path,
+                original_filename,
+                scale_factor,
+                stabilize,
+                detect_interval,
+                turn_vote_threshold,
+                use_ml_roi,
+                map_context,
+            )
 
-
-        from fastapi.concurrency import run_in_threadpool
-        background_tasks.add_task(
-            process_video_background,
-            video_id,
-            video_path,
-            original_filename,
-            scale_factor,
-            stabilize,
-            detect_interval,
-            turn_vote_threshold,
-            use_ml_roi,
-            map_context
-        )
+        # Уведомление Telegram (фоновое, не блокирует)
+        if background_tasks is not None:
+            background_tasks.add_task(broadcast_new_processing_for_video, video_id)
+        else:
+            asyncio.create_task(broadcast_new_processing_for_video(video_id))
 
         return {
             "success": True,
             "video_id": video_id,
             "status": "queued",
-            "message": "Анализ запущен"
+            "message": "Анализ запущен на GPU-сервере"
         }
     except HTTPException:
         raise
@@ -1255,7 +2920,8 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
 @app.post("/api/analyze-video")
 async def analyze_video(background_tasks: BackgroundTasks, request: Request) -> Dict[str, Any]:
     """Analyze uploaded video file and return trajectory data."""
-    form = await request.form(max_part_size=UPLOAD_MAX_PART_SIZE)
+    form = await request.form()
+
     file = form.get("file")
     if not file or not hasattr(file, "filename") or not file.filename:
         raise HTTPException(status_code=422, detail="Требуется файл видео")
@@ -1305,10 +2971,10 @@ async def analyze_video(background_tasks: BackgroundTasks, request: Request) -> 
         except Exception as db_err:
             logger.error(f"Failed to save task to DB: {db_err}")
 
-        # Start background processing
-        background_tasks.add_task(
-            process_video_background,
-
+        # ─── НЕМЕДЛЕННО запускаем обработку на GPU Worker ────────
+        employee_name = form.get("employee_name")
+        _schedule_process_video_background(
+            background_tasks,
             video_id,
             video_path,
             file.filename,
@@ -1317,14 +2983,20 @@ async def analyze_video(background_tasks: BackgroundTasks, request: Request) -> 
             detect_interval,
             turn_vote_threshold,
             use_ml_roi,
-            map_context
+            map_context,
         )
+
+        # Уведомление Telegram (фоновое, не блокирует)
+        if background_tasks is not None:
+            background_tasks.add_task(broadcast_new_processing_for_video, video_id)
+        else:
+            asyncio.create_task(broadcast_new_processing_for_video(video_id))
 
         return {
             "success": True,
             "video_id": video_id,
             "status": "queued",
-            "message": "Видео загружено и поставлено в очередь на обработку"
+            "message": "Видео отправлено на GPU-обработку"
         }
 
     except Exception as e:
@@ -1355,6 +3027,20 @@ async def health_check():
 @app.get("/api/processing-status/{video_id}")
 async def get_processing_status(video_id: str):
     """Get processing status for a video"""
+    manual_store = _load_manual_trajectories()
+    manual_item = manual_store.get(video_id)
+    if manual_item:
+        manual_result = _make_manual_result(
+            manual_item.get("trajectory") or [],
+            manual_item.get("turn_points") or [],
+        )
+        return {
+            "status": "completed",
+            "progress": 100,
+            "message": "Ручная траектория готова",
+            "result": manual_result,
+            "manual_updated_at": manual_item.get("updated_at"),
+        }
     if video_id in processing_status:
         return processing_status[video_id]
     else:
@@ -1414,7 +3100,7 @@ async def list_tracking_tasks():
                 "original_filename": r[2],
                 "status": r[3],
                 "created_at": r[4],
-                "map_context": map_ctx
+                "map_context": _map_context_summary(map_ctx)
             })
         conn.close()
         return tasks
@@ -1454,25 +3140,119 @@ async def get_tracking_task(task_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/api/admin/tasks/{task_id}")
+async def delete_tracking_task(task_id: str) -> Dict[str, Any]:
+    """Удалить задачу из админки: запись в БД, файл видео, ручная траектория, результат анализа."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, video_filename FROM tracking_tasks WHERE id = ?", (task_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Задача не найдена")
+        _, video_filename = row[0], row[1]
+
+        if video_filename:
+            vp = VIDEOS_DIR / video_filename
+            if vp.is_file():
+                try:
+                    vp.unlink()
+                except OSError as e:
+                    logger.warning(f"Не удалось удалить файл видео {vp}: {e}")
+        for f in VIDEOS_DIR.glob(f"{task_id}_*"):
+            if f.is_file():
+                try:
+                    f.unlink()
+                except OSError as e:
+                    logger.warning(f"Не удалить {f}: {e}")
+
+        UPLOADED_VIDEOS.pop(task_id, None)
+        processing_status.pop(task_id, None)
+
+        analysis_file = OUTPUT_DIR / f"{task_id}_analysis.json"
+        if analysis_file.is_file():
+            try:
+                analysis_file.unlink()
+            except OSError as e:
+                logger.warning(f"Не удалить {analysis_file}: {e}")
+
+        manual_store = _load_manual_trajectories()
+        if task_id in manual_store:
+            del manual_store[task_id]
+            _save_manual_trajectories(manual_store)
+
+        cursor.execute("DELETE FROM tracking_tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"Admin deleted task/video {task_id}")
+        return {"success": True, "id": task_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_tracking_task {task_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/clear-database")
+async def admin_clear_database() -> Dict[str, Any]:
+    """Очистить все строки в SQLite: tracking_tasks и plans."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM tracking_tasks")
+        cursor.execute("DELETE FROM plans")
+        try:
+            cursor.execute(
+                "DELETE FROM sqlite_sequence WHERE name IN ('plans', 'tracking_tasks')"
+            )
+        except Exception:
+            pass
+        conn.commit()
+        try:
+            conn.execute("VACUUM")
+        except Exception as ve:
+            logger.warning(f"VACUUM after clear: {ve}")
+        conn.close()
+        logger.warning("Admin: полная очистка таблиц БД (tracking_tasks, plans)")
+        return {"success": True, "message": "База данных очищена"}
+    except Exception as e:
+        logger.error(f"admin_clear_database: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/uploaded-video/{video_id}/stream")
-async def stream_uploaded_video(video_id: str):
+async def stream_uploaded_video(video_id: str, request: Request):
     """Return uploaded video file by video_id (no analysis required)."""
-    video_filename = UPLOADED_VIDEOS.get(video_id)
-    video_path = (VIDEOS_DIR / video_filename) if video_filename else None
-
-    if not video_path or not video_path.exists():
-        matches = list(VIDEOS_DIR.glob(f"{video_id}_*"))
-        for m in matches:
-            if m.is_file():
-                video_path = m
-                UPLOADED_VIDEOS[video_id] = m.name
-                break
-
-    if not video_path or not video_path.exists():
+    video_path = _find_uploaded_video_path(video_id)
+    if not video_path:
         raise HTTPException(status_code=404, detail="Uploaded video not found")
 
-    return FileResponse(str(video_path), filename=video_path.name)
+    return FileResponse(
+        str(video_path),
+        filename=video_path.name,
+        content_disposition_type="attachment",
+        headers={
+            "Cache-Control": "private, max-age=0, must-revalidate",
+        },
+    )
+
+
+@app.get("/api/uploaded-video/{video_id}/preview.mp4")
+async def stream_uploaded_video_preview(video_id: str):
+    """Browser-friendly MP4 preview for admin video player."""
+    preview_path = _video_preview_path(video_id)
+    if not preview_path.exists() or preview_path.stat().st_size == 0:
+        _schedule_video_preview(video_id)
+        raise HTTPException(status_code=202, detail="Video preview is preparing")
+
+    return FileResponse(
+        str(preview_path),
+        media_type="video/mp4",
+        filename=f"{video_id}.mp4",
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, max-age=0, must-revalidate"},
+    )
 
 
 @app.get("/api/manual-trajectory/{video_id}")
@@ -1511,7 +3291,7 @@ async def save_manual_trajectory(video_id: str, payload: Dict[str, Any] = Body(d
     processing_status[video_id] = {
         "status": "completed",
         "progress": 100,
-        "message": "Ручная траектория сохранена администратором",
+        "message": "Готово",
         "result": manual_result,
         "start_time": time.time(),
     }
@@ -1638,7 +3418,7 @@ async def chat_with_ai(request: Dict[str, Any]):
             logger.warning("Skipping Telegram notification: chat_id not found")
 
         # DeepSeek API configuration
-        deepseek_api_key = "sk-af4d1592e8cc4bb8ba1881efb4bc8139"
+        deepseek_api_key = os.environ["DEEPSEEK_API_KEY"]
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1835,6 +3615,340 @@ async def get_sample_data():
                 }
             }
         }
+
+
+# ──────────────────────────────────────────────
+# SSE proxy — real-time R³ streaming from GPU Worker
+# ──────────────────────────────────────────────
+
+@app.get("/api/r3-stream/{video_id}")
+async def r3_stream_proxy(video_id: str, request: Request):
+    """Proxy SSE stream from GPU Worker R³ process to the frontend.
+    
+    Клиент подключается через EventSource (GET), а мы:
+    1. Ищем локальное видео (если есть — отправляем на GPU)
+    2. Если видео нет — пробуем replay (GPU сам обнаружит .npz)
+    3. Форвардим SSE события обратно
+    4. После завершения стрима GPU держим соединение keepalive
+    """
+    # Find video file locally
+    video_filename = UPLOADED_VIDEOS.get(video_id)
+    video_path = (VIDEOS_DIR / video_filename) if video_filename else None
+    if not video_path or not video_path.exists():
+        matches = list(VIDEOS_DIR.glob(f"{video_id}_*"))
+        for m in matches:
+            if m.is_file():
+                video_path = m
+                break
+
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-process-stream/{video_id}"
+    params = {
+        'original_filename': f"{video_id}.mp4",
+        'frame_stride': '5',
+        'size': '392',
+        'max_frames': '1500',
+        'ckpt': 'r3_long.safetensors',
+        'mode': 'strided',
+    }
+
+    async def event_generator():
+        try:
+            async with aiohttp.ClientSession() as session:
+                if video_path and video_path.exists():
+                    # Видео есть — POST с телом
+                    file_size = video_path.stat().st_size
+                    params['original_filename'] = video_path.name
+                    async with session.post(
+                        gpu_url, params=params,
+                        data=open(video_path, 'rb'),
+                        headers={'Content-Length': str(file_size)},
+                        timeout=aiohttp.ClientTimeout(total=7200),
+                    ) as resp:
+                        if resp.status != 200:
+                            error_text = await resp.text()
+                            yield f"event: error\ndata: {json.dumps({'message': f'GPU Worker error: {error_text[:200]}'})}\n\n"
+                            return
+                        while True:
+                            line = await resp.content.readline()
+                            if not line:
+                                break
+                            decoded = line.decode('utf-8', errors='replace')
+                            if await request.is_disconnected():
+                                logger.info(f"[{video_id}] SSE proxy: client disconnected")
+                                return
+                            yield decoded
+                else:
+                    # Видео нет — пробуем replay (GPU сам найдёт .npz)
+                    logger.info(f"[{video_id}] Video not found locally, trying replay on GPU")
+                    async with session.post(
+                        gpu_url, params=params,
+                        data=b'', headers={'Content-Length': '0'},
+                        timeout=aiohttp.ClientTimeout(total=7200),
+                    ) as resp:
+                        if resp.status == 404:
+                            yield f"event: error\ndata: {json.dumps({'message': f'Видео и результаты R³ для {video_id} не найдены'})}\n\n"
+                            return
+                        if resp.status != 200:
+                            error_text = await resp.text()
+                            yield f"event: error\ndata: {json.dumps({'message': f'GPU Worker error: {error_text[:200]}'})}\n\n"
+                            return
+                        while True:
+                            line = await resp.content.readline()
+                            if not line:
+                                break
+                            decoded = line.decode('utf-8', errors='replace')
+                            if await request.is_disconnected():
+                                return
+                            yield decoded
+
+            # ─── GPU стрим завершён — держим keepalive, чтобы EventSource не переподключался ──
+            while True:
+                if await request.is_disconnected():
+                    break
+                await asyncio.sleep(30)
+                yield ": keepalive\n\n"
+
+        except asyncio.CancelledError:
+            logger.warning(f"[{video_id}] SSE proxy cancelled")
+        except Exception as e:
+            logger.error(f"[{video_id}] SSE proxy error ({type(e).__name__}): {e}", exc_info=True)
+            try:
+                yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+@app.get("/api/r3-pointcloud/{video_id}")
+async def r3_pointcloud_proxy(video_id: str, max_points: int = 100000, min_conf: float = 1.0):
+    """Proxy completed R³ point cloud from GPU Worker.
+
+    The SSE stream only sends a small preview to keep the live connection light.
+    The viewer calls this endpoint after completion to load the full RGB cloud.
+    """
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-pointcloud/{video_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                gpu_url,
+                params={"max_points": str(max_points), "min_conf": str(min_conf)},
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return JSONResponse(
+                        {"detail": text[:500] or "GPU Worker point cloud error"},
+                        status_code=resp.status,
+                    )
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    return JSONResponse(
+                        {"detail": "GPU Worker returned invalid point cloud JSON"},
+                        status_code=502,
+                    )
+                return JSONResponse(payload)
+    except Exception as e:
+        logger.error(f"[{video_id}] R³ pointcloud proxy error: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+@app.get("/api/r3-pointcloud-filtered/{video_id}")
+async def r3_pointcloud_filtered_proxy(
+    video_id: str,
+    max_points: int = 100000,
+    min_conf: float = 1.4,
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    sampling_strategy: str = "random",
+    include_trajectory: bool = True,
+    include_cameras: bool = True,
+):
+    """Proxy server-side filtered R³ point cloud from GPU Worker."""
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-pointcloud-filtered/{video_id}"
+    params = {
+        "max_points": str(max_points),
+        "min_conf": str(min_conf),
+        "sampling_strategy": sampling_strategy,
+        "include_trajectory": str(include_trajectory).lower(),
+        "include_cameras": str(include_cameras).lower(),
+    }
+    if frame_start is not None:
+        params["frame_start"] = str(frame_start)
+    if frame_end is not None:
+        params["frame_end"] = str(frame_end)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                gpu_url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return JSONResponse({"detail": text[:500]}, status_code=resp.status)
+                try:
+                    return JSONResponse(json.loads(text))
+                except json.JSONDecodeError:
+                    return JSONResponse({"detail": "GPU Worker returned invalid filtered point cloud JSON"}, status_code=502)
+    except Exception as e:
+        logger.error(f"[{video_id}] R³ filtered pointcloud proxy error: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+@app.get("/api/r3-diagnostics/{video_id}")
+async def r3_diagnostics_proxy(video_id: str):
+    """Proxy R³ diagnostics from GPU Worker."""
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-diagnostics/{video_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(gpu_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return JSONResponse({"detail": text[:500]}, status_code=resp.status)
+                try:
+                    return JSONResponse(json.loads(text))
+                except json.JSONDecodeError:
+                    return JSONResponse({"detail": "GPU Worker returned invalid diagnostics JSON"}, status_code=502)
+    except Exception as e:
+        logger.error(f"[{video_id}] R³ diagnostics proxy error: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+async def _proxy_lingbot_json(path: str, timeout_seconds: int = 60) -> JSONResponse:
+    url = f"{LINGBOT_WORKER_URL}{path}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return JSONResponse({"detail": text[:500]}, status_code=resp.status)
+                try:
+                    return JSONResponse(json.loads(text))
+                except json.JSONDecodeError:
+                    return JSONResponse({"detail": "LingBot worker returned invalid JSON"}, status_code=502)
+    except Exception as e:
+        logger.error(f"LingBot proxy error for {path}: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+@app.get("/api/lingbot-health")
+async def lingbot_health_proxy():
+    """Proxy LingBot-Map worker health from the RTX 3090 host."""
+    return await _proxy_lingbot_json("/health")
+
+
+@app.get("/api/lingbot-sessions/{session_id}/status")
+async def lingbot_session_status_proxy(session_id: str):
+    """Proxy LingBot-Map session status."""
+    return await _proxy_lingbot_json(f"/sessions/{session_id}/status")
+
+
+@app.get("/api/lingbot-sessions/{session_id}/trajectory")
+async def lingbot_session_trajectory_proxy(session_id: str):
+    """Proxy LingBot-Map trajectory JSON."""
+    return await _proxy_lingbot_json(f"/sessions/{session_id}/trajectory")
+
+
+@app.get("/api/lingbot-sessions/{session_id}/metadata")
+async def lingbot_session_metadata_proxy(session_id: str):
+    """Proxy LingBot-Map session metadata."""
+    return await _proxy_lingbot_json(f"/sessions/{session_id}/metadata")
+
+
+@app.get("/api/lingbot-sessions/{session_id}/pointcloud")
+async def lingbot_session_pointcloud_proxy(session_id: str):
+    """Proxy LingBot-Map point cloud artifact."""
+    url = f"{LINGBOT_WORKER_URL}/sessions/{session_id}/pointcloud"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+                data = await resp.read()
+                if resp.status != 200:
+                    return JSONResponse(
+                        {"detail": data.decode("utf-8", errors="replace")[:500]},
+                        status_code=resp.status,
+                    )
+                content_type = resp.headers.get("content-type", "application/octet-stream")
+                filename = resp.headers.get("content-disposition", "")
+                headers = {}
+                if filename:
+                    headers["Content-Disposition"] = filename
+                return Response(content=data, media_type=content_type, headers=headers)
+    except Exception as e:
+        logger.error(f"LingBot pointcloud proxy error for {session_id}: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+@app.get("/api/r3-projection-debug/{video_id}")
+async def r3_projection_debug_proxy(
+    video_id: str,
+    max_points: int = 250000,
+    min_conf: float = 1.4,
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    sampling_strategy: str = "per_frame_uniform",
+):
+    """Proxy server-side R³ top/front/right projection debug generation."""
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-projection-debug/{video_id}"
+    params = {
+        "max_points": str(max_points),
+        "min_conf": str(min_conf),
+        "sampling_strategy": sampling_strategy,
+    }
+    if frame_start is not None:
+        params["frame_start"] = str(frame_start)
+    if frame_end is not None:
+        params["frame_end"] = str(frame_end)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(gpu_url, params=params, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return JSONResponse({"detail": text[:500]}, status_code=resp.status)
+                try:
+                    return JSONResponse(json.loads(text))
+                except json.JSONDecodeError:
+                    return JSONResponse({"detail": "GPU Worker returned invalid projection debug JSON"}, status_code=502)
+    except Exception as e:
+        logger.error(f"[{video_id}] R³ projection debug proxy error: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+# ──────────────────────────────────────────────
+# Static files for production frontend
+# ──────────────────────────────────────────────
+
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "dist"
+
+# Serve static assets
+if FRONTEND_DIR.exists():
+    logger.info(f"Mounting frontend from {FRONTEND_DIR}")
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
+    app.mount("/downloads", StaticFiles(directory=str(FRONTEND_DIR / "downloads")), name="downloads")
+
+    # SPA fallback: any non-API, non-asset path → index.html
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str = ""):
+        if full_path.startswith("api/") or full_path.startswith("docs") or full_path.startswith("openapi"):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        index_path = FRONTEND_DIR / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path), media_type="text/html")
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+else:
+    logger.warning(f"Frontend dist directory not found at {FRONTEND_DIR}, serving API only")
+
 
 if __name__ == "__main__":
     import uvicorn

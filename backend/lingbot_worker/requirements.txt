@@ -1,0 +1,11 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.9
+pydantic>=2.5.0
+numpy>=1.26.0
+torch>=2.2.0
+
+# LingBot-Map itself is installed separately on the GPU host:
+# git clone https://github.com/Robbyant/lingbot-map backend/third_party/lingbot-map
+# cd backend/third_party/lingbot-map
+# pip install -e .

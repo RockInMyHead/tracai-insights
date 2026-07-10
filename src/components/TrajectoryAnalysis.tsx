@@ -8,12 +8,41 @@ import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
-import { Video, MapPin, Activity, Clock, Navigation, Loader2, User, X, Plus, FolderOpen } from "lucide-react";
+import { Video, MapPin, Activity, Clock, Navigation, Loader2, User, X, Plus, FolderOpen, Eye } from "lucide-react";
 import { toast } from "sonner";
 import { apiClient, VideoAnalysisResult, VideoListItem } from "@/lib/api";
 import { finiteNum } from "@/lib/numbers";
+import RealTimeR3Visualization from "./RealTimeR3Visualization";
+
+/** Временно скрыть в UI: масштаб, detect/turn/ml roi, подсказки и переключатель стабилизации (значения по умолчанию в коде сохраняются). */
+const SHOW_ADVANCED_ANALYSIS_SETTINGS = false;
 
 type AnalysisData = NonNullable<VideoAnalysisResult["data"]>;
+
+const convertTrajectory = (traj: unknown): { x: number; y: number; z?: number }[] => {
+  if (!traj || !Array.isArray(traj) || traj.length === 0) return [];
+  if (Array.isArray(traj[0])) {
+    return traj.map((point: unknown) => {
+      const arr = point as number[];
+      return {
+        x: finiteNum(arr[0]),
+        y: finiteNum(arr[1]),
+        z: finiteNum(arr[2]),
+      };
+    });
+  }
+  if (typeof traj[0] === "object" && traj[0] !== null) {
+    return traj.map((p: unknown) => {
+      const o = p as Record<string, unknown> & { 0?: unknown; 1?: unknown; 2?: unknown };
+      return {
+        x: finiteNum(o.x ?? o[0]),
+        y: finiteNum(o.y ?? o[1]),
+        z: finiteNum(o.z ?? o[2]),
+      };
+    });
+  }
+  return [];
+};
 
 // Интерфейс для видео с владельцем (локальный файл или с сервера)
 interface VideoWithOwner {
@@ -23,6 +52,7 @@ interface VideoWithOwner {
   serverFilename?: string; // имя файла на сервере
   ownerName: string;
   analysisResult?: AnalysisData;
+  allowManualUpdates?: boolean;
   isAnalyzing?: boolean;
   uploadProgress?: number;
   color: string;
@@ -39,7 +69,13 @@ interface TrajectoryData {
   turnPoints: Record<string, unknown>[];
   ownerName: string;
   color: string;
+  videoId?: string;
+  method?: string;
   mapAligned?: boolean;
+  manualPlanSpace?: boolean;
+  r3CameraPoints?: number[][];  // все позиции камер R³
+  mapScaleFactor?: number;
+  r3AutoFitToPlan?: boolean;
 }
 
 interface TrajectoryAnalysisProps {
@@ -71,10 +107,15 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const [detectInterval, setDetectInterval] = useState<number>(5);
   const [turnVoteThreshold, setTurnVoteThreshold] = useState<number>(3);
   const [useMlRoi, setUseMlRoi] = useState<boolean>(true);
+  const [analysisMethod, setAnalysisMethod] = useState<'slam' | 'r3' | 'lingbot'>('slam');
+  const [liveViewVideoId, setLiveViewVideoId] = useState<string | null>(null);
+  const [showLiveView, setShowLiveView] = useState(false);
   const [floorPlan, setFloorPlan] = useState<string | null>(null);
   const [floorPlanFile, setFloorPlanFile] = useState<File | null>(null);
   const [referencePoint, setReferencePoint] = useState(null);
   const [existingOwners, setExistingOwners] = useState<string[]>([]);
+  const manualTrajectoryVersionsRef = useRef<Record<string, string>>({});
+  const manualSuppressedVideoIdsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const floorPlanInputRef = useRef<HTMLInputElement>(null);
 
@@ -126,6 +167,85 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       }
     }
   }, []);
+
+  useEffect(() => {
+    if (!onTrajectoryAnalyzed) return;
+    const trackedVideos = videos.filter((v) => v.video_id && v.allowManualUpdates);
+    if (trackedVideos.length === 0) return;
+
+    let cancelled = false;
+
+    const fetchManualUpdates = async () => {
+      for (const video of trackedVideos) {
+        if (!video.video_id) continue;
+        if (manualSuppressedVideoIdsRef.current.has(video.video_id)) continue;
+        try {
+          const manual = await apiClient.getManualTrajectory(video.video_id);
+          if (
+            cancelled ||
+            manualSuppressedVideoIdsRef.current.has(video.video_id) ||
+            !manual.exists ||
+            !Array.isArray(manual.trajectory)
+          ) continue;
+
+          const version = manual.updated_at || `${manual.trajectory.length}`;
+          if (
+            manualSuppressedVideoIdsRef.current.has(video.video_id) ||
+            manualTrajectoryVersionsRef.current[video.video_id] === version
+          ) continue;
+          manualTrajectoryVersionsRef.current[video.video_id] = version;
+
+          const converted = convertTrajectory(manual.trajectory);
+          if (converted.length < 2) continue;
+
+          const manualStats = {
+            manual_override: true,
+            scale_factor: 1,
+            trajectory_points: converted.length,
+          };
+          const manualResult = {
+            method: "manual_admin",
+            trajectory: manual.trajectory,
+            turn_points: manual.turn_points || [],
+            processing_stats: manualStats,
+          } as AnalysisData;
+
+          setVideos((prev) =>
+            prev.map((v) =>
+              v.video_id === video.video_id
+                ? { ...v, analysisResult: manualResult, isAnalyzing: false }
+                : v
+            )
+          );
+          onTrajectoryAnalyzed(
+            converted,
+            manual.turn_points || [],
+            manualStats,
+            [
+              {
+                trajectory: converted,
+                turnPoints: manual.turn_points || [],
+                ownerName: video.ownerName,
+                color: video.color,
+                mapAligned: true,
+                manualPlanSpace: true,
+              },
+            ]
+          );
+          toast.success(`Администратор отправил ручную траекторию для ${video.ownerName}`);
+        } catch {
+          // Ручная траектория может еще не существовать.
+        }
+      }
+    };
+
+    fetchManualUpdates();
+    const interval = window.setInterval(fetchManualUpdates, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [videos, onTrajectoryAnalyzed]);
 
   const handleStabilizationToggle = () => {
     const newValue = !stabilizationEnabled;
@@ -229,7 +349,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
     );
   };
 
-  const addServerVideosToList = () => {
+  const addServerVideosToList = async () => {
     if (selectedServerVideos.length === 0) {
       toast.error("Выберите одно или несколько видео");
       return;
@@ -247,16 +367,35 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
     const timestamp = Date.now();
     const existingOwner = videos.find(v => v.ownerName === ownerName);
     const ownerColor = existingOwner ? existingOwner.color : userColors[Array.from(new Set(videos.map(v => v.ownerName))).length % userColors.length];
+    const selectedServerVideoIds = new Set(selectedServerVideos.map((v) => v.video_id));
+    selectedServerVideoIds.forEach((videoId) => {
+      manualSuppressedVideoIdsRef.current.add(videoId);
+      delete manualTrajectoryVersionsRef.current[videoId];
+    });
+
+    try {
+      await Promise.all(
+        selectedServerVideos.map((video) =>
+          apiClient.registerExistingVideoTask(video.video_id, ownerName)
+        )
+      );
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Не удалось добавить видео в админку");
+      return;
+    }
+
     const newVideos: VideoWithOwner[] = selectedServerVideos.map((v, i) => ({
       id: `server-${v.video_id}-${timestamp}-${i}`,
       video_id: v.video_id,
       serverFilename: v.filename,
       ownerName,
       color: ownerColor,
+      allowManualUpdates: false,
       isAnalyzing: false,
       uploadedAt: timestamp
     }));
-    setVideos(prev => [...prev, ...newVideos]);
+    setVideos(prev => [...prev.filter((v) => !v.video_id || !selectedServerVideoIds.has(v.video_id)), ...newVideos]);
+    onTrajectoryAnalyzed?.([], [], { cleared: true }, []);
     setShowServerPicker(false);
     setSelectedServerVideos([]);
     toast.success(`Добавлено ${newVideos.length} видео с сервера для ${ownerName}`);
@@ -293,11 +432,13 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       file: file,
       ownerName: ownerName,
       color: ownerColor,
+      allowManualUpdates: false,
       isAnalyzing: false,
       uploadedAt: timestamp
     }));
 
     setVideos(prev => [...prev, ...newVideos]);
+    onTrajectoryAnalyzed?.([], [], { cleared: true }, []);
     setCurrentOwnerName('');
     setSelectedFiles([]);
 
@@ -333,77 +474,95 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
       // Use the current `videos` state for analysis
       const videosToAnalyze = [...videos];
+      const batchId = (typeof crypto !== "undefined" && (crypto as any).randomUUID) ? (crypto as any).randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+      const batchSize = videosToAnalyze.length;
 
-      // Запускаем анализ всех видео параллельно (одновременно)
-      const analysisPromises = videosToAnalyze.map(async (video, index) => {
+      // Загрузка и анализ по очереди (одно видео за раз)
+      const finalizedVideos: VideoWithOwner[] = [];
+
+      for (const video of videosToAnalyze) {
         if (video.analysisResult) {
-          // If already analyzed, just return it.
-          // We still update progress for already analyzed videos to reflect completion.
-          setAnalysisProgress(prev => prev + (100 / videosToAnalyze.length));
-          return video;
+          setAnalysisProgress((prev) => prev + 100 / videosToAnalyze.length);
+          finalizedVideos.push(video);
+          continue;
         }
 
-        // Обновляем статус: начало анализа
-        setVideos(prev => prev.map(v =>
-          v.id === video.id ? { ...v, isAnalyzing: true } : v
-        ));
-        const displayName = video.file?.name || video.serverFilename || 'video';
+        setVideos((prev) =>
+          prev.map((v) => (v.id === video.id ? { ...v, isAnalyzing: true } : v))
+        );
+        const displayName = video.file?.name || video.serverFilename || "video";
         setCurrentStep(`Анализ видео ${video.ownerName} (${displayName})...`);
+
+        let pollInterval: ReturnType<typeof setInterval> | null = null;
 
         try {
           let processingId: string | null = null;
           let uploadedVideoId: string;
 
           if (video.video_id) {
-            // Видео уже на сервере — пропускаем загрузку
             uploadedVideoId = video.video_id;
             processingId = uploadedVideoId;
-            // Синхронизируем контекст (план/чертёж) для задачи, уже созданной при загрузке
-            apiClient.updateTaskContext(uploadedVideoId, {
-              floor_plan_data: externalFloorPlan || floorPlan,
-              drawn_plan: drawnPlan || null,
-              reference_point: externalReferencePoint || referencePoint,
-              direction_point: externalDirectionPoint || null,
-              employee_name: video.ownerName,
-            }).catch(() => {});
+            // Set live view video ID for R³
+            if (analysisMethod === 'r3' && !liveViewVideoId) {
+              setLiveViewVideoId(uploadedVideoId);
+            }
+            apiClient
+              .updateTaskContext(uploadedVideoId, {
+                floor_plan_data: externalFloorPlan || floorPlan,
+                drawn_plan: drawnPlan || null,
+                reference_point: externalReferencePoint || referencePoint,
+                direction_point: externalDirectionPoint || null,
+                employee_name: video.ownerName,
+              })
+              .catch(() => {});
           } else if (video.file) {
-            // Шаг 1: Загружаем видео на сервер
             setCurrentStep(`Загрузка ${video.file.name} на сервер...`);
             const uploadResult = await apiClient.uploadVideo(
               video.file,
               (progress) => {
-                setVideos(prev => prev.map(v =>
-                  v.id === video.id ? { ...v, uploadProgress: progress } : v
-                ));
+                setVideos((prev) =>
+                  prev.map((v) =>
+                    v.id === video.id ? { ...v, uploadProgress: progress } : v
+                  )
+                );
                 setCurrentStep(`Загрузка ${video.file.name}: ${progress.toFixed(0)}%`);
               },
-              video.ownerName
+              video.ownerName,
+              batchId,
+              batchSize
             );
             uploadedVideoId = uploadResult.video_id;
+            if (analysisMethod === 'r3' && !liveViewVideoId) {
+              setLiveViewVideoId(uploadedVideoId);
+            }
             processingId = uploadedVideoId;
-            // Сразу после загрузки — синхронизируем контекст плана/чертежа
-            apiClient.updateTaskContext(uploadedVideoId, {
-              floor_plan_data: externalFloorPlan || floorPlan,
-              drawn_plan: drawnPlan || null,
-              reference_point: externalReferencePoint || referencePoint,
-              direction_point: externalDirectionPoint || null,
-            }).catch(() => {});
-
+            apiClient
+              .updateTaskContext(uploadedVideoId, {
+                floor_plan_data: externalFloorPlan || floorPlan,
+                drawn_plan: drawnPlan || null,
+                reference_point: externalReferencePoint || referencePoint,
+                direction_point: externalDirectionPoint || null,
+                batch_id: batchId,
+                batch_size: batchSize,
+                employee_name: video.ownerName,
+              })
+              .catch(() => {});
           } else {
             throw new Error("Нет файла или video_id");
           }
 
-          const pollInterval = setInterval(async () => {
+          pollInterval = setInterval(async () => {
             if (!processingId) return;
             try {
               const status = await apiClient.getProcessingStatus(processingId);
               if (status && status.progress > 0 && status.message) {
                 setCurrentStep(`[${video.ownerName}] ${status.message} (${status.progress}%)`);
               }
-            } catch (e) { /* ignore */ }
+            } catch {
+              /* ignore */
+            }
           }, 1000);
 
-          // Запускаем анализ уже загруженного видео
           let result = await apiClient.analyzeVideoById(
             uploadedVideoId,
             scaleFactor,
@@ -412,7 +571,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             {
               detect_interval: detectInterval,
               turn_vote_threshold: turnVoteThreshold,
-              use_ml_roi: useMlRoi
+              use_ml_roi: useMlRoi,
             },
             {
               floor_plan_data: externalFloorPlan || floorPlan,
@@ -420,71 +579,125 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               reference_point: externalReferencePoint || referencePoint,
               direction_point: externalDirectionPoint || null,
             },
-            video.ownerName
+            video.ownerName,
+            analysisMethod,
+            analysisMethod === 'r3' ? { frame_stride: 5, max_frames: 1500, ckpt: 'r3_long.safetensors', size: 392, mode: 'strided' } : undefined,
+            true
           );
 
-
-          // Если видео поставлено в очередь, ждем завершения через поллинг
-          if (result.status === 'queued') {
-            const maxAttempts = 1800; // 60 минут (для больших AVI конвертация может занять 30+ мин)
+          if (result.status === "queued") {
+            const maxAttempts = 1800;
             let attempts = 0;
 
             while (attempts < maxAttempts) {
               const status = await apiClient.getProcessingStatus(uploadedVideoId);
 
-              if (status.status === 'completed' && status.result) {
+              if (status.status === "completed" && status.result) {
                 result = { success: true, data: status.result, message: "Success" };
                 break;
-              } else if (status.status === 'error') {
+              } else if (status.status === "error") {
                 throw new Error(status.message || "Ошибка при обработке на сервере");
               }
 
-              // Обновляем прогресс из статуса
               if (status.progress > 0) {
-                setCurrentStep(`[${video.ownerName}] ${status.message || 'Обработка'} (${status.progress}%)`);
+                setCurrentStep(`[${video.ownerName}] ${status.message || "Обработка"} (${status.progress}%)`);
               }
 
               attempts++;
-              await new Promise(resolve => setTimeout(resolve, 2000)); // Ждем 2 секунды перед следующим опросом
+              await new Promise((resolve) => setTimeout(resolve, 2000));
             }
 
             if (attempts >= maxAttempts) {
-              throw new Error("Таймаут ожидания анализа (60 минут). Для больших AVI конвертация может занять 30+ мин.");
+              throw new Error(
+                "Таймаут ожидания анализа (60 минут). Для больших AVI конвертация может занять 30+ мин."
+              );
             }
           }
 
-          clearInterval(pollInterval);
+          if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+          }
 
-          const analyzedVideo = {
+          let analysisData = result.data;
+          if (analysisMethod === "r3" && uploadedVideoId && analysisData) {
+            try {
+              setCurrentStep(`[${video.ownerName}] Перенос R³ траектории на план...`);
+              const filtered = await apiClient.getR3PointCloudFiltered(uploadedVideoId, {
+                maxPoints: 100000,
+                minConf: 1.4,
+                samplingStrategy: "per_frame_uniform",
+                includeTrajectory: true,
+                includeCameras: false,
+              });
+              const filteredTrajectory = Array.isArray(filtered.trajectory)
+                ? filtered.trajectory.filter((p) => Array.isArray(p) && p.length >= 2)
+                : [];
+              if (filtered.success && filteredTrajectory.length >= 2) {
+                const filteredStats = filtered.stats || {};
+                const cleanedDistance = filteredStats.trajectory_quality?.cleaned_distance;
+                const currentStats =
+                  (analysisData.processing_stats as Record<string, unknown> | undefined) || {};
+                analysisData = {
+                  ...analysisData,
+                  trajectory: filteredTrajectory,
+                  estimated_distance:
+                    typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
+                      ? cleanedDistance
+                      : analysisData.estimated_distance,
+                  processing_stats: {
+                    ...currentStats,
+                    r3_filtered_trajectory: true,
+                    r3_source_points: filteredStats.source_points,
+                    r3_filtered_points: filteredStats.filtered_points,
+                    r3_returned_points: filteredStats.returned_points,
+                    r3_trajectory_quality: filteredStats.trajectory_quality,
+                  },
+                } as AnalysisData;
+              }
+            } catch (err) {
+              console.warn("Failed to fetch filtered R3 trajectory for plan:", err);
+            }
+          }
+
+          try {
+            const existingManual = await apiClient.getManualTrajectory(uploadedVideoId);
+            if (existingManual.exists && Array.isArray(existingManual.trajectory)) {
+              manualTrajectoryVersionsRef.current[uploadedVideoId] =
+                existingManual.updated_at || `${existingManual.trajectory.length}`;
+            }
+          } catch {
+            /* manual trajectory may not exist */
+          }
+          manualSuppressedVideoIdsRef.current.delete(uploadedVideoId);
+
+          const analyzedVideo: VideoWithOwner = {
             ...video,
-            analysisResult: result.data,
-            isAnalyzing: false
+            video_id: uploadedVideoId,
+            analysisResult: analysisData,
+            allowManualUpdates: true,
+            isAnalyzing: false,
           };
 
-          // Обновляем состояние конкретного видео
-          setVideos(prev => prev.map(v =>
-            v.id === video.id ? analyzedVideo : v
-          ));
-          setAnalysisProgress(prev => prev + (100 / videosToAnalyze.length));
-
-          return analyzedVideo;
+          setVideos((prev) => prev.map((v) => (v.id === video.id ? analyzedVideo : v)));
+          setAnalysisProgress((prev) => prev + 100 / videosToAnalyze.length);
+          finalizedVideos.push(analyzedVideo);
         } catch (err: unknown) {
+          if (pollInterval) {
+            clearInterval(pollInterval);
+          }
           console.error(`Error analyzing video ${video.id}:`, err);
-          toast.error(`Ошибка при анализе ${displayName}: ${err instanceof Error ? err.message : "Неизвестная ошибка"}`);
+          toast.error(
+            `Ошибка при анализе ${displayName}: ${err instanceof Error ? err.message : "Неизвестная ошибка"}`
+          );
 
-          const errorVideo = { ...video, isAnalyzing: false };
-          setVideos(prev => prev.map(v =>
-            v.id === video.id ? errorVideo : v
-          ));
-          setAnalysisProgress(prev => prev + (100 / videosToAnalyze.length));
-          return errorVideo;
+          const errorVideo: VideoWithOwner = { ...video, isAnalyzing: false };
+          setVideos((prev) => prev.map((v) => (v.id === video.id ? errorVideo : v)));
+          setAnalysisProgress((prev) => prev + 100 / videosToAnalyze.length);
+          finalizedVideos.push(errorVideo);
         }
-      });
+      }
 
-      // Ждем завершения всех запросов
-      const finalizedVideos = await Promise.all(analysisPromises);
-
-      // Обновляем финальный список
       setVideos(finalizedVideos);
       setAnalysisProgress(100);
       setCurrentStep('Анализ всех видео завершен');
@@ -496,44 +709,31 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       console.log(`   • Общее время: ${totalTime.toFixed(1)} сек`);
       console.log(`   • Среднее время на видео: ${(totalTime / finalizedVideos.length).toFixed(1)} сек`);
 
-      const convertTrajectory = (traj: unknown): { x: number; y: number; z?: number }[] => {
-        if (!traj) return [];
-        if (!Array.isArray(traj) || traj.length === 0) return [];
-        // Массив массивов [[x,y,z], ...]
-        if (Array.isArray(traj[0])) {
-          return traj.map((point: unknown) => {
-            const arr = point as number[];
-            return {
-              x: finiteNum(arr[0]),
-              y: finiteNum(arr[1]),
-              z: finiteNum(arr[2]),
-            };
-          });
-        }
-        // Уже объекты {x,y,z} или {0,1,2}
-        if (typeof traj[0] === "object" && traj[0] !== null) {
-          return traj.map((p: unknown) => {
-            const o = p as Record<string, unknown> & { 0?: unknown; 1?: unknown; 2?: unknown };
-            return {
-              x: finiteNum(o.x ?? o[0]),
-              y: finiteNum(o.y ?? o[1]),
-              z: finiteNum(o.z ?? o[2]),
-            };
-          });
-        }
-        return [];
-      };
-
       const finalAnalyzedVideos = finalizedVideos.filter(v => v.analysisResult);
 
       if (finalAnalyzedVideos.length > 0 && onTrajectoryAnalyzed) {
-        const trajectoriesData = finalAnalyzedVideos.map(video => ({
-          trajectory: convertTrajectory(video.analysisResult.map_trajectory || video.analysisResult.trajectory),
-          turnPoints: video.analysisResult.map_turn_points || video.analysisResult.turn_points || [],
-          ownerName: video.ownerName,
-          color: video.color,
-          mapAligned: Boolean(video.analysisResult.map_trajectory)
-        }));
+        const trajectoriesData = finalAnalyzedVideos.map((video) => {
+          const ps = video.analysisResult.processing_stats as Record<string, unknown> | undefined;
+          const manualOverride = Boolean(ps?.manual_override);
+          const method = String(video.analysisResult.method || "");
+          const isR3 = method.startsWith("r3");
+          const isLingBot = method === "lingbot_map";
+          const hasMapTrajectory = Boolean(video.analysisResult.map_trajectory);
+          const isAlreadyInPlanSpace = (hasMapTrajectory && !isLingBot) || manualOverride;
+          return {
+            trajectory: convertTrajectory(video.analysisResult.map_trajectory || video.analysisResult.trajectory),
+            turnPoints: video.analysisResult.map_turn_points || video.analysisResult.turn_points || [],
+            ownerName: video.ownerName,
+            color: video.color,
+            videoId: video.video_id,
+            method: video.analysisResult.method,
+            mapAligned: isAlreadyInPlanSpace,
+            manualPlanSpace: manualOverride,
+            r3CameraPoints: undefined,
+            mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(ps?.scale_factor, 1),
+            r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace,
+          };
+        });
 
         const totalPoints = trajectoriesData.reduce((sum, t) => sum + t.trajectory.length, 0);
         if (totalPoints === 0) {
@@ -546,9 +746,11 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           (finalAnalyzedVideos[0].analysisResult.processing_stats || {}) as Record<string, unknown>,
           trajectoriesData
         );
+        toast.success(`Анализ ${finalAnalyzedVideos.length} видео завершен успешно!`);
+      } else {
+        onTrajectoryAnalyzed?.([], [], { cleared: true, error: true }, []);
+        toast.error("Анализ не вернул траекторию. Проверьте ошибку R³ в статусе/логах.");
       }
-
-      toast.success(`Анализ ${videos.length} видео завершен успешно!`);
 
     } catch (error) {
       console.error("Analysis error:", error);
@@ -559,79 +761,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         setAnalysisProgress(0);
         setCurrentStep('');
       }, 2000);
-    }
-  };
-
-  const handleLoadSampleData = async () => {
-    console.log('🧪 Загрузка тестовых данных для демонстрации...');
-
-    setIsAnalyzing(true);
-    setAnalysisProgress(0);
-    setCurrentStep('Подготовка тестовых данных...');
-
-    try {
-      console.log('📦 Этап 1: Подготовка тестовых данных...');
-      setCurrentStep('Загрузка образцов анализа...');
-      await new Promise(resolve => setTimeout(resolve, 300));
-      setAnalysisProgress(50);
-      console.log('✅ Тестовые данные подготовлены');
-
-      console.log('🔄 Этап 2: Обработка результатов...');
-      setCurrentStep('Обработка результатов...');
-      await new Promise(resolve => setTimeout(resolve, 500));
-      setAnalysisProgress(90);
-      console.log('✅ Результаты обработаны');
-
-      console.log('🌐 Этап 3: Загрузка с сервера...');
-      setCurrentStep('Завершение загрузки...');
-      const startTime = Date.now();
-
-      const apiUrl = import.meta.env.VITE_API_URL || '';
-      console.log(`🌐 Запрос к: ${apiUrl || window.location.origin}/api/sample-data`);
-      const response = await fetch(`${apiUrl}/api/sample-data`);
-      if (!response.ok) {
-        console.log(`❌ Ошибка загрузки тестовых данных: ${response.status} ${response.statusText}`);
-        throw new Error(`Failed to load sample data: ${response.status} ${response.statusText}`);
-      }
-
-      const result = await response.json();
-      const endTime = Date.now();
-      const loadTime = (endTime - startTime) / 1000;
-
-      setAnalysisProgress(100);
-      console.log(`✅ Тестовые данные загружены за ${loadTime.toFixed(1)} сек`);
-      console.log(`📊 Содержимое:`);
-      console.log(`   • Точек траектории: ${result.data.trajectory?.length || 0}`);
-      console.log(`   • Поворотов: ${result.data.turn_points?.length || 0}`);
-
-      toast.success("Тестовые данные загружены!");
-
-      if (onTrajectoryAnalyzed) {
-        // Преобразуем данные в формат множественных траекторий для TrajectoryMap
-        const trajectoryData = [{
-          trajectory: result.data.trajectory,
-          turnPoints: result.data.turn_points,
-          ownerName: 'Тестовые данные',
-          color: '#10b981'
-        }];
-
-        onTrajectoryAnalyzed(
-          result.data.trajectory,
-          result.data.turn_points,
-          result.data.processing_stats,
-          trajectoryData
-        );
-      }
-    } catch (error) {
-      console.error("❌ Ошибка при загрузке тестовых данных:", error);
-      toast.error("Ошибка при загрузке тестовых данных.");
-    } finally {
-      setTimeout(() => {
-        setIsAnalyzing(false);
-        setAnalysisProgress(0);
-        setCurrentStep('');
-        console.log('🔄 Сброс состояния загрузки тестовых данных');
-      }, 500);
     }
   };
 
@@ -892,7 +1021,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           )}
         </div>
 
-        {/* Scale factor */}
+        {SHOW_ADVANCED_ANALYSIS_SETTINGS && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <Label htmlFor="scale-factor">Коэффициент масштаба</Label>
@@ -979,6 +1108,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             Коэффициент для перевода пикселей в метры. Влияет на точность расчета расстояний.
           </p>
         </div>
+        )}
 
         {/* Progress bar */}
         {isAnalyzing && (
@@ -1008,17 +1138,20 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             </div>
 
             {/* Progress steps */}
-            <div className={`grid gap-2 text-xs ${stabilizationEnabled ? 'grid-cols-4' : 'grid-cols-3'}`}>
+            <div className={`grid gap-2 text-xs ${
+              analysisMethod === 'r3' ? 'grid-cols-3' :
+              stabilizationEnabled ? 'grid-cols-4' : 'grid-cols-3'
+            }`}>
               <div className={`text-center p-2 rounded ${analysisProgress >= 20 ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
                 Загрузка
               </div>
-              {stabilizationEnabled && (
+              {analysisMethod !== 'r3' && stabilizationEnabled && (
                 <div className={`text-center p-2 rounded ${analysisProgress >= 50 ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
                   Стабилизация
                 </div>
               )}
-              <div className={`text-center p-2 rounded ${analysisProgress >= (stabilizationEnabled ? 75 : 70) ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
-                SLAM анализ
+              <div className={`text-center p-2 rounded ${analysisProgress >= (analysisMethod === 'r3' || analysisMethod === 'lingbot' ? 60 : (stabilizationEnabled ? 75 : 70)) ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
+                {analysisMethod === 'r3' ? 'R³ реконструкция' : analysisMethod === 'lingbot' ? 'LingBot-Map' : 'SLAM анализ'}
               </div>
               <div className={`text-center p-2 rounded ${analysisProgress >= 100 ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
                 Готово
@@ -1027,7 +1160,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           </div>
         )}
 
-        {/* Stabilization toggle */}
+        {SHOW_ADVANCED_ANALYSIS_SETTINGS && (
         <div className="flex items-center justify-between p-4 bg-secondary/30 rounded-lg border">
           <div className="flex flex-col">
             <Label htmlFor="stabilization-toggle" className="text-sm font-medium">
@@ -1043,6 +1176,87 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             onCheckedChange={handleStabilizationToggle}
           />
         </div>
+        )}
+
+        {/* Method selector */}
+        <div className="space-y-2">
+          <Label className="text-sm font-medium">Метод анализа</Label>
+          <div className="grid grid-cols-3 gap-2">
+            <Button
+              type="button"
+              variant={analysisMethod === 'slam' ? 'default' : 'outline'}
+              className="h-auto py-3"
+              onClick={() => setAnalysisMethod('slam')}
+              disabled={isAnalyzing}
+            >
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-sm font-semibold">SLAM</span>
+                <span className="text-[10px] opacity-70">Классический</span>
+              </div>
+            </Button>
+            <Button
+              type="button"
+              variant={analysisMethod === 'r3' ? 'default' : 'outline'}
+              className="h-auto py-3"
+              onClick={() => setAnalysisMethod('r3')}
+              disabled={isAnalyzing}
+            >
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-sm font-semibold">R³</span>
+                <span className="text-[10px] opacity-70">3D реконструкция</span>
+              </div>
+            </Button>
+            <Button
+              type="button"
+              variant={analysisMethod === 'lingbot' ? 'default' : 'outline'}
+              className="h-auto py-3"
+              onClick={() => setAnalysisMethod('lingbot')}
+              disabled={isAnalyzing}
+            >
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-sm font-semibold">LingBot</span>
+                <span className="text-[10px] opacity-70">Map GPU</span>
+              </div>
+            </Button>
+          </div>
+          {analysisMethod === 'r3' && (
+            <p className="text-xs text-muted-foreground">
+              Использует Depth Anything 3 — нейросеть для 3D-реконструкции сцены
+            </p>
+          )}
+          {analysisMethod === 'lingbot' && (
+            <p className="text-xs text-muted-foreground">
+              MVP LingBot-Map worker: потоковая 3D-реконструкция на RTX 3090 через отдельный FastAPI-сервис
+            </p>
+          )}
+        </div>
+
+        {/* Live view button for R³ monitoring */}
+        {analysisMethod === 'r3' && isAnalyzing && liveViewVideoId && !showLiveView && (
+          <div className="space-y-2">
+            <Button
+              onClick={() => setShowLiveView(true)}
+              variant="outline"
+              className="w-full border-primary/30 hover:bg-primary/10 gap-2"
+            >
+              <Eye className="h-4 w-4 text-primary" />
+              <span>Смотреть реконструкцию в реальном времени</span>
+            </Button>
+          </div>
+        )}
+
+        {/* Real-time R³ visualization */}
+        {showLiveView && liveViewVideoId && (
+          <RealTimeR3Visualization
+            videoId={liveViewVideoId}
+            onComplete={() => {
+              // Keep showing the visualization when complete
+            }}
+            onClose={() => {
+              setShowLiveView(false);
+            }}
+          />
+        )}
 
         {/* Analyze buttons */}
         <div className="space-y-3">
@@ -1059,31 +1273,20 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             ) : (
               <>
                 <Activity className="h-4 w-4 mr-2" />
-                {stabilizationEnabled ? 'Анализ со стабилизацией' : 'Анализ без стабилизации'}
-                {videos.length > 0 && ` (${videos.length} видео)`}
+                Запустить {analysisMethod === 'r3' ? 'R³' : analysisMethod === 'lingbot' ? 'LingBot-Map' : 'SLAM'}-анализ
+                {videos.length > 0 ? ` (${videos.length} видео)` : ''}
               </>
             )}
           </Button>
-
-          <Button
-            onClick={handleLoadSampleData}
-            disabled={isAnalyzing}
-            variant="outline"
-            className="w-full"
-          >
-            <Video className="h-4 w-4 mr-2" />
-            Загрузить тестовые данные
-          </Button>
         </div>
 
+        {SHOW_ADVANCED_ANALYSIS_SETTINGS && (
         <div className="space-y-2 mt-3">
           <p className="text-xs text-muted-foreground text-center">
             🎥 Автоматическая стабилизация + SLAM анализ траектории
           </p>
-          <p className="text-xs text-muted-foreground text-center">
-            Тестовые данные позволят ознакомиться с функционалом без загрузки видео
-          </p>
         </div>
+        )}
 
         {/* Analysis results */}
         {analysisResult && (

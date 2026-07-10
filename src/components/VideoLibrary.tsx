@@ -43,10 +43,6 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
 
   const handleVideoSelect = async (video: VideoListItem) => {
     onVideoSelected?.(video);
-    // Автоматически загружаем анализ при выборе видео
-    if (video.has_analysis) {
-      await handleLoadAnalysis(video);
-    }
   };
 
   const handleLoadAnalysis = async (video: VideoListItem) => {

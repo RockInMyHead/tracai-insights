@@ -1,46 +1,27 @@
 // API client for TrackAI backend
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
-// #region agent log
 async function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const urlStr =
-    typeof input === 'string'
-      ? input
-      : input instanceof URL
-        ? input.href
-        : (input as Request).url;
-  const res = await globalThis.fetch(input, init);
-  fetch('http://127.0.0.1:7343/ingest/767aed2a-4a75-4bf7-922d-0437d34eb3ef', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '64890b' },
-    body: JSON.stringify({
-      sessionId: '64890b',
-      runId: 'run1',
-      hypothesisId: 'H3',
-      location: 'api.ts:agentFetch',
-      message: 'fetch_response',
-      data: { url: urlStr.slice(0, 400), status: res.status, ok: res.ok },
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  return res;
+  return globalThis.fetch(input, init);
 }
-function agentLogXhr(hypothesisId: string, path: string, status: number, ok: boolean): void {
-  fetch('http://127.0.0.1:7343/ingest/767aed2a-4a75-4bf7-922d-0437d34eb3ef', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '64890b' },
-    body: JSON.stringify({
-      sessionId: '64890b',
-      runId: 'run1',
-      hypothesisId,
-      location: 'api.ts:xhr',
-      message: 'xhr_response',
-      data: { path: path.slice(0, 400), status, ok },
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
+
+function isDesktopClient(): boolean {
+  if (typeof window === 'undefined') return false;
+  const trackai = (window as unknown as { trackai?: { isDesktop?: boolean } }).trackai;
+  const queryDesktop = new URLSearchParams(window.location.search).get('desktop') === '1';
+  if (trackai?.isDesktop === true || queryDesktop) {
+    window.sessionStorage.setItem('trackai_desktop_client', '1');
+    return true;
+  }
+  return window.sessionStorage.getItem('trackai_desktop_client') === '1';
 }
-// #endregion
+
+function clientHeaders(extra?: Record<string, string>): Record<string, string> {
+  return {
+    ...(extra || {}),
+    ...(isDesktopClient() ? { 'X-TrackAI-Client': 'desktop' } : {}),
+  };
+}
 
 export interface VideoAnalysisResult {
   success: boolean;
@@ -85,6 +66,8 @@ export interface VideoAnalysisResult {
       auto_scale: number;
       source: string;
     };
+    r3_camera_points?: number[][];  // Все позиции камер R³ для отрисовки облака точек
+    r3_pose_confidence?: number[];  // Уверенность каждой позиции
     total_processing_time: number;
     video_info: {
       width: number;
@@ -108,6 +91,11 @@ export interface MapContext {
   drawn_plan?: unknown[] | null;
   reference_point?: { x: number; y: number } | null;
   direction_point?: { x: number; y: number } | null;
+  batch_id?: string | null;
+  batch_size?: number | null;
+  employee_name?: string | null;
+  client_source?: string | null;
+  gpu_upload_url?: string | null;
 }
 
 export interface VideoListItem {
@@ -163,17 +151,35 @@ export class ApiClient {
   async uploadVideo(
     file: File,
     onUploadProgress?: (progress: number) => void,
-    employeeName?: string
+    employeeName?: string,
+    batchId?: string,
+    batchSize?: number
   ): Promise<{ success: boolean; video_id: string; filename: string; original_filename: string; file_size: number }> {
-    const formData = new FormData();
-    formData.append('file', file);
-    if (employeeName) {
-      formData.append('employee_name', employeeName);
+    // Шаг 1: инициализация — получаем video_id (без загрузки файла)
+    const initResp = await fetch(`${this.baseUrl}/api/init-upload`, {
+      method: 'POST',
+      headers: clientHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        filename: file.name,
+        employee_name: employeeName || null,
+        client_source: isDesktopClient() ? 'desktop' : 'web',
+      }),
+    });
+    if (!initResp.ok) {
+      const err = await initResp.text().catch(() => 'init failed');
+      throw new Error(`Init upload failed: ${err.slice(0, 200)}`);
     }
+    const initData = await initResp.json();
+    const videoId: string = initData.video_id;
 
+    // Шаг 2: загрузка raw-байтов файла на proxy (минуя multipart)
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', `${this.baseUrl}/api/upload-video`);
+      xhr.open('POST', `${this.baseUrl}/api/upload-video/${videoId}`);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      if (isDesktopClient()) {
+        xhr.setRequestHeader('X-TrackAI-Client', 'desktop');
+      }
 
       if (xhr.upload && onUploadProgress) {
         xhr.upload.addEventListener('progress', (event) => {
@@ -184,12 +190,10 @@ export class ApiClient {
       }
 
       xhr.onload = () => {
-        // #region agent log
-        agentLogXhr('H4', `${this.baseUrl}/api/upload-video`, xhr.status, xhr.status >= 200 && xhr.status < 300);
-        // #endregion
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
-            resolve(JSON.parse(xhr.responseText));
+            const result = JSON.parse(xhr.responseText);
+            resolve({ ...result, video_id: videoId });
           } catch {
             reject(new Error('Ошибка ответа сервера'));
           }
@@ -204,8 +208,8 @@ export class ApiClient {
       };
       xhr.onerror = () => reject(new Error('Сетевая ошибка при загрузке'));
       xhr.ontimeout = () => reject(new Error('Таймаут загрузки (2 часа). Проверьте соединение.'));
-      xhr.timeout = 2 * 60 * 60 * 1000; // 2 часа
-      xhr.send(formData);
+      xhr.timeout = 2 * 60 * 60 * 1000;
+      xhr.send(file);
     });
   }
 
@@ -217,25 +221,44 @@ export class ApiClient {
     originalFilename?: string,
     trackingOptions?: TrackingOptions,
     mapContext?: MapContext,
-    employeeName?: string
+    employeeName?: string,
+    analysisMethod?: 'slam' | 'r3' | 'lingbot',
+    r3Options?: { frame_stride?: number; max_frames?: number; ckpt?: string; size?: number; mode?: string },
+    forceReprocess: boolean = false
   ): Promise<VideoAnalysisResult> {
+    const body: Record<string, unknown> = {
+      video_id: videoId,
+      scale_factor: scaleFactor,
+      stabilize,
+      original_filename: originalFilename || 'video',
+      detect_interval: trackingOptions?.detect_interval ?? 5,
+      turn_vote_threshold: trackingOptions?.turn_vote_threshold ?? 3,
+      use_ml_roi: trackingOptions?.use_ml_roi ?? true,
+      floor_plan_data: mapContext?.floor_plan_data ?? null,
+      drawn_plan: mapContext?.drawn_plan ?? null,
+      reference_point: mapContext?.reference_point ?? null,
+      direction_point: mapContext?.direction_point ?? null,
+      employee_name: employeeName,
+      analysis_method: analysisMethod || 'slam',
+      force_reprocess: forceReprocess,
+    };
+    if (analysisMethod === 'r3') {
+      body.frame_stride = r3Options?.frame_stride ?? 5;
+      body.max_frames = r3Options?.max_frames ?? 1500;
+      body.ckpt = r3Options?.ckpt ?? 'r3_long.safetensors';
+      body.size = r3Options?.size ?? 392;
+      body.mode = r3Options?.mode ?? 'strided';
+    } else if (analysisMethod === 'lingbot') {
+      body.lingbot_fps = 10;
+      body.lingbot_keyframe_interval = 6;
+      body.lingbot_use_sdpa = true;
+      body.lingbot_mask_sky = false;
+    }
+
     const response = await agentFetch(`${this.baseUrl}/api/analyze-video-by-id`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        video_id: videoId,
-        scale_factor: scaleFactor,
-        stabilize,
-        original_filename: originalFilename || 'video',
-        detect_interval: trackingOptions?.detect_interval ?? 5,
-        turn_vote_threshold: trackingOptions?.turn_vote_threshold ?? 3,
-        use_ml_roi: trackingOptions?.use_ml_roi ?? true,
-        floor_plan_data: mapContext?.floor_plan_data ?? null,
-        drawn_plan: mapContext?.drawn_plan ?? null,
-        reference_point: mapContext?.reference_point ?? null,
-        direction_point: mapContext?.direction_point ?? null,
-        employee_name: employeeName
-      }),
+      headers: clientHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {
@@ -278,6 +301,12 @@ export class ApiClient {
     if (mapContext?.drawn_plan) {
       formData.append('drawn_plan', JSON.stringify(mapContext.drawn_plan));
     }
+    if (mapContext?.batch_id) {
+      formData.append('batch_id', String(mapContext.batch_id));
+    }
+    if (mapContext?.batch_size !== undefined) {
+      formData.append('batch_size', String(mapContext.batch_size));
+    }
     if (mapContext?.reference_point) {
       formData.append('reference_point', JSON.stringify(mapContext.reference_point));
     }
@@ -293,6 +322,9 @@ export class ApiClient {
       const startTime = Date.now();
 
       xhr.open('POST', `${this.baseUrl}/api/analyze-video`);
+      if (isDesktopClient()) {
+        xhr.setRequestHeader('X-TrackAI-Client', 'desktop');
+      }
 
       if (xhr.upload && onUploadProgress) {
         xhr.upload.addEventListener('progress', (event) => {
@@ -307,9 +339,6 @@ export class ApiClient {
         const endTime = Date.now();
         const responseTime = (endTime - startTime) / 1000;
         console.log(`📡 API: Получен ответ от сервера (${xhr.status}) за ${responseTime.toFixed(1)} сек`);
-        // #region agent log
-        agentLogXhr('H4', `${this.baseUrl}/api/analyze-video`, xhr.status, xhr.status >= 200 && xhr.status < 300);
-        // #endregion
 
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
@@ -383,6 +412,59 @@ export class ApiClient {
     return response.json();
   }
 
+  async registerExistingVideoTask(
+    videoId: string,
+    employeeName?: string
+  ): Promise<{ success: boolean; video_id: string; status: string }> {
+    const response = await agentFetch(`${this.baseUrl}/api/admin/tasks/${videoId}/register-existing`, {
+      method: 'POST',
+      headers: clientHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        employee_name: employeeName || null,
+        client_source: isDesktopClient() ? 'desktop' : 'web',
+      }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Не удалось зарегистрировать видео в админке');
+    }
+    return response.json();
+  }
+
+  async deleteAdminTask(id: string): Promise<{ success: boolean; id: string }> {
+    const response = await agentFetch(`${this.baseUrl}/api/admin/tasks/${id}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      let detail = 'Не удалось удалить задачу';
+      try {
+        const err = await response.json();
+        if (err?.detail) detail = typeof err.detail === 'string' ? err.detail : detail;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(detail);
+    }
+    return response.json();
+  }
+
+  async clearAdminDatabase(): Promise<{ success: boolean; message?: string }> {
+    const response = await agentFetch(`${this.baseUrl}/api/admin/clear-database`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+      let detail = 'Не удалось очистить базу';
+      try {
+        const err = await response.json();
+        if (err?.detail) detail = typeof err.detail === 'string' ? err.detail : detail;
+      } catch {
+        /* ignore */
+      }
+      throw new Error(detail);
+    }
+    return response.json();
+  }
+
   async updateTaskContext(taskId: string, context: {
     floor_plan_data?: string | null;
     drawn_plan?: unknown[] | null;
@@ -392,7 +474,7 @@ export class ApiClient {
   }): Promise<{ success: boolean }> {
     const response = await agentFetch(`${this.baseUrl}/api/admin/tasks/${taskId}/context`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: clientHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(context),
     });
     if (!response.ok) {
@@ -413,6 +495,10 @@ export class ApiClient {
 
   getUploadedVideoUrl(videoId: string): string {
     return `${this.baseUrl}/api/uploaded-video/${videoId}/stream`;
+  }
+
+  getUploadedVideoPreviewUrl(videoId: string): string {
+    return `${this.baseUrl}/api/uploaded-video/${videoId}/preview.mp4`;
   }
 
   async getManualTrajectory(videoId: string): Promise<ManualTrajectoryResponse> {
@@ -596,6 +682,195 @@ export class ApiClient {
       }
       await new Promise((r) => setTimeout(r, 1500));
     }
+  }
+
+  /** Subscribe to real-time R³ streaming events via SSE */
+  subscribeR3Stream(
+    videoId: string,
+    callbacks: {
+      onFrameProcessed?: (data: {
+        num_processed: number;
+        new_trajectory_points?: number[][];
+        new_poses?: unknown[];
+      }) => void;
+      onVideoInfo?: (data: { frames: number; fps: number; width: number; height: number }) => void;
+      onComplete?: (data: Record<string, unknown>) => void;
+      onError?: (error: string) => void;
+      onStatus?: (data: Record<string, unknown>) => void;
+    }
+  ): () => void {
+    const url = `${this.baseUrl}/api/r3-stream/${videoId}`;
+    const eventSource = new EventSource(url);
+
+    eventSource.addEventListener('frame_processed', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        callbacks.onFrameProcessed?.(data);
+      } catch { /* ignore parse errors */ }
+    });
+
+    eventSource.addEventListener('video_info', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        callbacks.onVideoInfo?.(data);
+      } catch { /* ignore */ }
+    });
+
+    eventSource.addEventListener('complete', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        callbacks.onComplete?.(data);
+      } catch { /* ignore */ }
+    });
+
+    eventSource.addEventListener('error', (event) => {
+      try {
+        const data = event.data ? JSON.parse(event.data) : {};
+        callbacks.onError?.(data.message || 'SSE connection error');
+      } catch {
+        callbacks.onError?.('SSE connection error');
+      }
+    });
+
+    // Generic handler for any other events
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        callbacks.onStatus?.(data);
+      } catch { /* ignore */ }
+    };
+
+    // Support extra events
+    eventSource.addEventListener('connected', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'connected' }); } catch {}
+    });
+    eventSource.addEventListener('receiving', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'receiving' }); } catch {}
+    });
+    eventSource.addEventListener('video_received', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'video_received' }); } catch {}
+    });
+    eventSource.addEventListener('processing_started', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_start' }); } catch {}
+    });
+    eventSource.addEventListener('r3_start', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_start' }); } catch {}
+    });
+    eventSource.addEventListener('replay', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'replay' }); } catch {}
+    });
+
+    // Return unsubscribe function
+    return () => {
+      eventSource.close();
+    };
+  }
+
+  /** Получить полное облако точек R³ через отдельный API (не через SSE). */
+  async getR3PointCloud(videoId: string, maxPoints: number = 100000, minConf: number = 1.0): Promise<{
+    success: boolean;
+    video_id: string;
+    num_points: number;
+    num_points_total: number;
+    points: number[][];
+  }> {
+    const resp = await agentFetch(
+      `${this.baseUrl}/api/r3-pointcloud/${videoId}?max_points=${maxPoints}&min_conf=${minConf}`,
+    );
+    if (!resp.ok) {
+      throw new Error(`Point cloud fetch failed (HTTP ${resp.status})`);
+    }
+    return resp.json();
+  }
+
+  /** Получить серверно отфильтрованное облако R³. */
+  async getR3PointCloudFiltered(videoId: string, params: {
+    maxPoints?: number;
+    minConf?: number;
+    frameStart?: number;
+    frameEnd?: number;
+    samplingStrategy?: "confidence_top" | "random" | "voxel" | "per_frame_uniform";
+    includeTrajectory?: boolean;
+    includeCameras?: boolean;
+  } = {}): Promise<{
+    success: boolean;
+    video_id: string;
+    points: number[][];
+    trajectory?: number[][];
+    cameras?: unknown[];
+    stats?: {
+      source_points: number;
+      filtered_points: number;
+      returned_points: number;
+      min_conf: number;
+      frame_start: number | null;
+      frame_end: number | null;
+      sampling_strategy: string;
+      trajectory_quality?: {
+        quality?: string;
+        raw_points?: number;
+        cleaned_points?: number;
+        raw_step_median?: number;
+        raw_step_p90?: number;
+        raw_step_p99?: number;
+        step_limit?: number;
+        clipped_steps?: number;
+        cleaned_distance?: number;
+      } | null;
+    };
+    diagnostics?: {
+      pointcloud_file: string;
+      pointcloud_shape: number[];
+      has_conf: boolean;
+      has_frame_idx: boolean;
+      run_params?: Record<string, unknown>;
+      stale_run?: boolean;
+    };
+  }> {
+    const query = new URLSearchParams();
+    query.set("max_points", String(params.maxPoints ?? 100000));
+    query.set("min_conf", String(params.minConf ?? 1.4));
+    query.set("sampling_strategy", params.samplingStrategy ?? "random");
+    query.set("include_trajectory", String(params.includeTrajectory ?? false));
+    query.set("include_cameras", String(params.includeCameras ?? false));
+    if (typeof params.frameStart === "number") query.set("frame_start", String(params.frameStart));
+    if (typeof params.frameEnd === "number") query.set("frame_end", String(params.frameEnd));
+
+    const resp = await agentFetch(
+      `${this.baseUrl}/api/r3-pointcloud-filtered/${videoId}?${query.toString()}`,
+    );
+    if (!resp.ok) {
+      throw new Error(`Filtered point cloud fetch failed (HTTP ${resp.status})`);
+    }
+    return resp.json();
+  }
+
+  /** Диагностика R³ output: файлы, pointcloud shape, confidence percentiles. */
+  async getR3Diagnostics(videoId: string): Promise<{
+    success: boolean;
+    video_id: string;
+    output_exists: boolean;
+    files?: Record<string, number>;
+    pointcloud?: {
+      exists: boolean;
+      file?: string;
+      shape?: number[];
+      has_conf?: boolean;
+      has_frame_idx?: boolean;
+      rgb_min?: number[];
+      rgb_max?: number[];
+    };
+    conf_stats?: {
+      percentiles?: Record<string, number>;
+      counts_by_threshold?: Record<string, number>;
+    };
+    run_params?: Record<string, unknown>;
+  }> {
+    const resp = await agentFetch(`${this.baseUrl}/api/r3-diagnostics/${videoId}`);
+    if (!resp.ok) {
+      throw new Error(`R3 diagnostics fetch failed (HTTP ${resp.status})`);
+    }
+    return resp.json();
   }
 }
 

@@ -11,7 +11,7 @@ import TrajectoryMap, {
   type TurnPoint,
 } from "@/components/TrajectoryMap";
 import VideoLibrary from "@/components/VideoLibrary";
-import RealtimeTrajectoryVideo, { type TrajPoint } from "@/components/RealtimeTrajectoryVideo";
+import R3SyncReview from "@/components/R3SyncReview";
 import { apiClient, VideoListItem, Plan } from "@/lib/api";
 import { toast } from "sonner";
 import PlanEditor from "@/components/PlanEditor";
@@ -358,7 +358,18 @@ const TrajectoryAnalysisPage = () => {
     newTrajectory: number[][] | { x: number; y: number; z?: number }[],
     newTurnPoints: Record<string, unknown>[],
     newStats: Record<string, unknown>,
-    trajectories?: { trajectory: unknown; turnPoints: Record<string, unknown>[]; ownerName: string; color: string; mapAligned?: boolean }[]
+    trajectories?: {
+      trajectory: unknown;
+      turnPoints: Record<string, unknown>[];
+      ownerName: string;
+      color: string;
+      videoId?: string;
+      method?: string;
+      mapAligned?: boolean;
+      manualPlanSpace?: boolean;
+      r3AutoFitToPlan?: boolean;
+      mapScaleFactor?: number;
+    }[]
   ) => {
     console.log('📥 handleTrajectoryAnalyzed called with:', {
       newTrajectory: newTrajectory ? newTrajectory.length : 'null/undefined',
@@ -367,10 +378,26 @@ const TrajectoryAnalysisPage = () => {
       trajectories: trajectories ? trajectories.length : 'null/undefined'
     });
 
+    if (
+      trajectories &&
+      trajectories.length === 0 &&
+      (!newTrajectory || newTrajectory.length === 0) &&
+      newStats?.cleared === true
+    ) {
+      setTrajectory([]);
+      setTurnPoints([]);
+      setStats(null);
+      return;
+    }
+
     if (trajectories && trajectories.length > 0) {
       // Используем множественные траектории
       console.log('🎯 Setting trajectories (multiple):', trajectories.length, 'items');
       setTrajectory(trajectories);
+      const firstVideoId = trajectories.find((item) => item.videoId)?.videoId;
+      if (firstVideoId) {
+        setVideoUrl(apiClient.getUploadedVideoPreviewUrl(firstVideoId));
+      }
     } else {
       // Обратная совместимость с одиночной траекторией
       console.log('🎯 Setting single trajectory:', newTrajectory?.length || 0, 'points');
@@ -382,7 +409,10 @@ const TrajectoryAnalysisPage = () => {
 
   const handleVideoSelected = (video: VideoListItem) => {
     setSelectedVideo(video);
-    setVideoUrl(apiClient.getVideoDownloadUrl(video.video_id));
+    setVideoUrl(apiClient.getUploadedVideoPreviewUrl(video.video_id));
+    setTrajectory([]);
+    setTurnPoints([]);
+    setStats(null);
   };
 
   // Сырой массив точек траектории для вывода и выгрузки (поддержка одного и нескольких треков)
@@ -452,17 +482,31 @@ const TrajectoryAnalysisPage = () => {
       return [];
     };
     const converted = convertTrajectory(newTrajectory);
+    const manualOverride = Boolean(newStats?.manual_override);
     const trajectoriesData = [{
       trajectory: converted,
       turnPoints: newTurnPoints || [],
       ownerName: 'Библиотека',
       color: '#3b82f6',
-      mapAligned: Boolean(newStats?.map_matching_applied)
+      videoId: selectedVideo?.video_id,
+      method: String(newStats?.method || ""),
+      mapAligned: Boolean(newStats?.map_matching_applied) || manualOverride,
+      manualPlanSpace: manualOverride,
     }];
     setTrajectory(trajectoriesData);
     setTurnPoints(newTurnPoints || []);
     setStats(newStats ?? null);
   };
+
+  const trajectoryItems: TrajectoryData[] =
+    Array.isArray(trajectory) &&
+    trajectory.length > 0 &&
+    typeof trajectory[0] === "object" &&
+    trajectory[0] !== null &&
+    "trajectory" in trajectory[0]
+      ? (trajectory as TrajectoryData[])
+      : [];
+  const showSyncReview = trajectoryItems.length > 0 && Boolean(videoUrl);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
@@ -878,63 +922,57 @@ const TrajectoryAnalysisPage = () => {
                 )}
               </div>
 
-              <div className="lg:col-span-1">
-                <Card className="h-[600px]">
-                  <CardContent className="p-0 h-full">
-                    <TrajectoryMap
-                      trajectories={
-                        Array.isArray(trajectory) &&
-                        trajectory.length > 0 &&
-                        typeof trajectory[0] === "object" &&
-                        trajectory[0] !== null &&
-                        "trajectory" in trajectory[0]
-                          ? (trajectory as TrajectoryData[])
-                          : undefined
-                      }
-                      trajectory={
-                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
-                          ? (trajectory as unknown as TrajectoryPoint[])
-                          : undefined
-                      }
-                      turnPoints={
-                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
-                          ? (turnPoints as unknown as TurnPoint[])
-                          : undefined
-                      }
-                      stats={stats ?? undefined}
-                      floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
-                      drawnPlan={drawnPlan}
-                      referencePoint={referencePoint}
-                      directionPoint={directionPoint}
-                      setDirectionMode={setDirectionMode}
-                      onSetDirectionModeChange={setSetDirectionMode}
-                      onDirectionPointSet={handleDirectionPointSet}
-                    />
-                  </CardContent>
-                </Card>
+              <div className={showSyncReview ? "lg:col-span-2" : "lg:col-span-1"}>
+                {showSyncReview ? (
+                <R3SyncReview
+                  videoUrl={videoUrl}
+                  trajectories={trajectoryItems}
+                  stats={stats}
+                  floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
+                  drawnPlan={drawnPlan}
+                  referencePoint={referencePoint}
+                  directionPoint={directionPoint}
+                  setDirectionMode={setDirectionMode}
+                  onSetDirectionModeChange={setSetDirectionMode}
+                  onDirectionPointSet={handleDirectionPointSet}
+                />
+                ) : (
+                  <Card className="h-[600px]">
+                    <CardContent className="p-0 h-full">
+                      <TrajectoryMap
+                        trajectories={
+                          Array.isArray(trajectory) &&
+                          trajectory.length > 0 &&
+                          typeof trajectory[0] === "object" &&
+                          trajectory[0] !== null &&
+                          "trajectory" in trajectory[0]
+                            ? (trajectory as TrajectoryData[])
+                            : undefined
+                        }
+                        trajectory={
+                          !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                            ? (trajectory as unknown as TrajectoryPoint[])
+                            : undefined
+                        }
+                        turnPoints={
+                          !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                            ? (turnPoints as unknown as TurnPoint[])
+                            : undefined
+                        }
+                        stats={stats ?? undefined}
+                        floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
+                        drawnPlan={drawnPlan}
+                        referencePoint={referencePoint}
+                        directionPoint={directionPoint}
+                        setDirectionMode={setDirectionMode}
+                        onSetDirectionModeChange={setSetDirectionMode}
+                        onDirectionPointSet={handleDirectionPointSet}
+                      />
+                    </CardContent>
+                  </Card>
+                )}
               </div>
             </div>
-
-            {/* Real-time video with trajectory overlay */}
-            {trajectory && trajectory.length > 0 && videoUrl && (
-              <div className="mt-6">
-                <RealtimeTrajectoryVideo
-                  videoUrl={videoUrl}
-                  trajectory={
-                    (Array.isArray(trajectory) && trajectory.length > 0 && typeof trajectory[0] !== "object"
-                      ? trajectory
-                      : Array.isArray(trajectory) &&
-                          trajectory[0] &&
-                          typeof trajectory[0] === "object" &&
-                          "trajectory" in trajectory[0]
-                        ? (trajectory[0] as TrajectoryData).trajectory
-                        : []) as TrajPoint[]
-                  }
-                  turnPoints={turnPoints}
-                  scaleFactor={finiteNum(stats?.scale_factor, 12.306)}
-                />
-              </div>
-            )}
           </TabsContent>
 
           <TabsContent value="library" className="space-y-6">
@@ -997,29 +1035,11 @@ const TrajectoryAnalysisPage = () => {
                   </Card>
                 )}
 
-                <Card className="h-[400px]">
-                  <CardContent className="p-0 h-full">
-                    <TrajectoryMap
-                      trajectories={
-                        Array.isArray(trajectory) &&
-                        trajectory.length > 0 &&
-                        typeof trajectory[0] === "object" &&
-                        trajectory[0] !== null &&
-                        "trajectory" in trajectory[0]
-                          ? (trajectory as TrajectoryData[])
-                          : undefined
-                      }
-                      trajectory={
-                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
-                          ? (trajectory as unknown as TrajectoryPoint[])
-                          : undefined
-                      }
-                      turnPoints={
-                        !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
-                          ? (turnPoints as unknown as TurnPoint[])
-                          : undefined
-                      }
-                      stats={stats ?? undefined}
+                {showSyncReview ? (
+                    <R3SyncReview
+                      videoUrl={videoUrl}
+                      trajectories={trajectoryItems}
+                      stats={stats}
                       floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
                       drawnPlan={drawnPlan}
                       referencePoint={referencePoint}
@@ -1028,28 +1048,40 @@ const TrajectoryAnalysisPage = () => {
                       onSetDirectionModeChange={setSetDirectionMode}
                       onDirectionPointSet={handleDirectionPointSet}
                     />
-                  </CardContent>
-                </Card>
-
-                {/* Real-time video with trajectory overlay in library tab */}
-                {trajectory && trajectory.length > 0 && videoUrl && (
-                  <div className="mt-6">
-                    <RealtimeTrajectoryVideo
-                      videoUrl={videoUrl}
-                      trajectory={
-                        (Array.isArray(trajectory) && trajectory.length > 0 && typeof trajectory[0] !== "object"
-                          ? trajectory
-                          : Array.isArray(trajectory) &&
-                              trajectory[0] &&
-                              typeof trajectory[0] === "object" &&
-                              "trajectory" in trajectory[0]
-                            ? (trajectory[0] as TrajectoryData).trajectory
-                            : []) as TrajPoint[]
-                      }
-                      turnPoints={turnPoints}
-                      scaleFactor={finiteNum(stats?.scale_factor, 12.306)}
-                    />
-                  </div>
+                ) : (
+                  <Card className="h-[400px]">
+                    <CardContent className="p-0 h-full">
+                      <TrajectoryMap
+                        trajectories={
+                          Array.isArray(trajectory) &&
+                          trajectory.length > 0 &&
+                          typeof trajectory[0] === "object" &&
+                          trajectory[0] !== null &&
+                          "trajectory" in trajectory[0]
+                            ? (trajectory as TrajectoryData[])
+                            : undefined
+                        }
+                        trajectory={
+                          !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                            ? (trajectory as unknown as TrajectoryPoint[])
+                            : undefined
+                        }
+                        turnPoints={
+                          !Array.isArray(trajectory) || (trajectory.length > 0 && typeof trajectory[0] !== "object")
+                            ? (turnPoints as unknown as TurnPoint[])
+                            : undefined
+                        }
+                        stats={stats ?? undefined}
+                        floorPlan={floorPlanFile?.type === "application/pdf" ? null : floorPlan}
+                        drawnPlan={drawnPlan}
+                        referencePoint={referencePoint}
+                        directionPoint={directionPoint}
+                        setDirectionMode={setDirectionMode}
+                        onSetDirectionModeChange={setSetDirectionMode}
+                        onDirectionPointSet={handleDirectionPointSet}
+                      />
+                    </CardContent>
+                  </Card>
                 )}
               </div>
             </div>

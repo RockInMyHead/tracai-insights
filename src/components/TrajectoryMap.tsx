@@ -30,7 +30,43 @@ export interface TrajectoryData {
   turnPoints: TurnPoint[];
   ownerName: string;
   color: string;
+  videoId?: string;
+  method?: string;
   mapAligned?: boolean;
+  /** Точки в системе админки 800×600 с letterbox растра — перевести в натуральный viewBox */
+  manualPlanSpace?: boolean;
+  /** Все позиции камер R³ (облако точек для визуализации) */
+  r3CameraPoints?: number[][];
+  /** Pixels-per-meter (or user map scale) applied only during map rendering. */
+  mapScaleFactor?: number;
+  /** R³ uses reconstruction coordinates; fit its 2D projection into the floor plan before manual calibration. */
+  r3AutoFitToPlan?: boolean;
+}
+
+const ADMIN_PLAN_W = 800;
+const ADMIN_PLAN_H = 600;
+
+/** Админка сохраняет x,y в контейнере 800×600 (как <image meet>); карта пользователя — натуральный размер картинки. */
+function convertAdminManualPointsToNaturalViewBox(
+  pts: TrajectoryPoint[],
+  floorPlan: string | null | undefined,
+  imageSize: { width: number; height: number }
+): TrajectoryPoint[] {
+  if (pts.length === 0) return pts;
+  if (!floorPlan || floorPlan.includes("application/pdf")) return pts;
+  const nw = imageSize.width;
+  const nh = imageSize.height;
+  if (nw <= 0 || nh <= 0) return pts;
+  const s = Math.min(ADMIN_PLAN_W / nw, ADMIN_PLAN_H / nh);
+  const cw = nw * s;
+  const ch = nh * s;
+  const ox = (ADMIN_PLAN_W - cw) / 2;
+  const oy = (ADMIN_PLAN_H - ch) / 2;
+  return pts.map((p) => ({
+    ...p,
+    x: (p.x - ox) / s,
+    y: (p.y - oy) / s,
+  }));
 }
 
 interface TrajectoryMapProps {
@@ -42,6 +78,8 @@ interface TrajectoryMapProps {
   drawnPlan?: unknown[] | null;
   referencePoint?: { x: number; y: number } | null;
   directionPoint?: { x: number; y: number } | null;
+  playbackPointLimit?: number | null;
+  reviewMode?: boolean;
   setDirectionMode?: boolean;
   onSetDirectionModeChange?: (enabled: boolean) => void;
   onDirectionPointSet?: (point: { x: number; y: number }) => void;
@@ -69,7 +107,10 @@ function normalizeTrajectoryPoints(traj: unknown): TrajectoryPoint[] {
   return [];
 }
 
-const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
+const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
+  const [planScale, setPlanScale] = useState(1);
+  const [imageSize, setImageSize] = useState({ width: 800, height: 600 });
+
   // Поддержка старого формата + нормализация точек (массив массивов → {x,y,z}[])
   const trajectoryData = useMemo(() => {
     const raw = trajectories || (trajectory ? [{
@@ -78,11 +119,26 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       ownerName: 'Пользователь',
       color: '#3b82f6'
     }] : []);
-    return raw.map((item) => ({
-      ...item,
-      trajectory: normalizeTrajectoryPoints(item.trajectory),
-    }));
-  }, [trajectories, trajectory, turnPoints]);
+    return raw.map((item) => {
+      let pts = normalizeTrajectoryPoints(item.trajectory);
+      if (item.manualPlanSpace) {
+        pts = convertAdminManualPointsToNaturalViewBox(pts, floorPlan, imageSize);
+      }
+      // Нормализуем R³ camera points (if present)
+      let camPts: TrajectoryPoint[] = [];
+      if (item.r3CameraPoints && Array.isArray(item.r3CameraPoints)) {
+        camPts = normalizeTrajectoryPoints(item.r3CameraPoints);
+        if (item.manualPlanSpace) {
+          camPts = convertAdminManualPointsToNaturalViewBox(camPts, floorPlan, imageSize);
+        }
+      }
+      return {
+        ...item,
+        trajectory: pts,
+        r3CameraPoints: camPts.length > 0 ? camPts : undefined,
+      };
+    });
+  }, [trajectories, trajectory, turnPoints, floorPlan, imageSize.width, imageSize.height]);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -94,10 +150,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
   const [fixedViewBox, setFixedViewBox] = useState<{ width: number; height: number } | null>(null);
   const [hoveredPoint, setHoveredPoint] = useState<TurnPoint | null>(null);
   const [showHeatmap, setShowHeatmap] = useState(false);
-
-  // State for independent floor plan zoom/scale
-  const [planScale, setPlanScale] = useState(1);
-  const [imageSize, setImageSize] = useState({ width: 800, height: 600 });
+  const [showR3PointCloud, setShowR3PointCloud] = useState(true);
 
   // Trajectory calibration states
   const [trajScale, setTrajScale] = useState(1);
@@ -212,17 +265,44 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       );
 
       if (validPoints.length === 0) return { ...data, trajectory: [] };
+      const visibleCount = typeof playbackPointLimit === "number" && Number.isFinite(playbackPointLimit)
+        ? Math.max(1, Math.min(Math.floor(playbackPointLimit), validPoints.length))
+        : validPoints.length;
+      const isPlaybackLimited = visibleCount < validPoints.length;
       if (data.mapAligned) {
+        const visiblePoints = validPoints.slice(0, visibleCount);
         return {
           ...data,
-          trajectory: validPoints,
-          turnPoints: data.turnPoints || []
+          trajectory: visiblePoints,
+          turnPoints: (data.turnPoints || []).filter((turn) => {
+            const idx = finiteNum((turn as unknown as Record<string, unknown>).trajectory_index, -1);
+            return idx < 0 || idx < visibleCount;
+          }),
+          r3CameraPoints: data.r3CameraPoints,  // сохраняем для мап-аллайнмент
         };
       }
 
       // Base coordinates from the first point of THIS trajectory
       const startX = validPoints[0].x;
       const startY = validPoints[0].y;
+      const dataScale = finiteNum(data.mapScaleFactor, 1);
+      let autoFitScale = 1;
+      if (data.r3AutoFitToPlan && floorPlan && viewBox.width > 0 && viewBox.height > 0) {
+        const xs = validPoints.map(p => p.x);
+        const ys = validPoints.map(p => p.y);
+        const spanX = Math.max(...xs) - Math.min(...xs);
+        const spanY = Math.max(...ys) - Math.min(...ys);
+        const targetW = viewBox.width * 0.55;
+        const targetH = viewBox.height * 0.55;
+        const scaleX = spanX > 1e-6 ? targetW / spanX : 1;
+        const scaleY = spanY > 1e-6 ? targetH / spanY : 1;
+        const fitted = Math.min(scaleX, scaleY);
+        if (Number.isFinite(fitted) && fitted > 0) {
+          autoFitScale = fitted;
+        }
+      }
+      const renderScale = trajScale * (dataScale > 0 ? dataScale : 1);
+      const finalRenderScale = renderScale * autoFitScale;
 
       let transformed: { x: number; y: number; z?: number }[] = [];
       let refX: number, refY: number;
@@ -233,8 +313,8 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
 
         transformed = validPoints.map(point => ({
           ...point,
-          x: (point.x - startX) * trajScale + refX + trajOffset.x,
-          y: (point.y - startY) * trajScale + refY + trajOffset.y
+          x: (point.x - startX) * finalRenderScale + refX + trajOffset.x,
+          y: (point.y - startY) * finalRenderScale + refY + trajOffset.y
         }));
       } else {
         refX = viewBox.width / 2;
@@ -242,8 +322,8 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
 
         transformed = validPoints.map(point => ({
           ...point,
-          x: (point.x - startX) * trajScale + refX + trajOffset.x,
-          y: (point.y - startY) * trajScale + refY + trajOffset.y
+          x: (point.x - startX) * finalRenderScale + refX + trajOffset.x,
+          y: (point.y - startY) * finalRenderScale + refY + trajOffset.y
         }));
       }
 
@@ -262,10 +342,10 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
             const segLen = Math.max(2, Math.min(20, Math.floor(validPoints.length * 0.1)));
             const p0 = validPoints[0];
             const pN = validPoints[segLen - 1];
-            const dx = (pN.x - p0.x) * trajScale;
-            const dy = (pN.y - p0.y) * trajScale;
+            const dx = (pN.x - p0.x) * finalRenderScale;
+            const dy = (pN.y - p0.y) * finalRenderScale;
             const segDist = Math.hypot(dx, dy);
-            const trajAngle = segDist > 1e-6 ? Math.atan2(dy, dx) : Math.atan2((validPoints[1].y - p0.y) * trajScale, (validPoints[1].x - p0.x) * trajScale);
+            const trajAngle = segDist > 1e-6 ? Math.atan2(dy, dx) : Math.atan2((validPoints[1].y - p0.y) * finalRenderScale, (validPoints[1].x - p0.x) * finalRenderScale);
             rotationRad = directionAngle - trajAngle;
             if (directionFlip180) rotationRad += Math.PI;
             rotationRad += (directionAngleOffset * Math.PI) / 180;
@@ -305,19 +385,34 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         const pyVal =
           typeof pos[1] === "number" ? pos[1] : finiteNum((posRec as Record<string, unknown>).y);
         if (typeof pxVal !== 'number' || typeof pyVal !== 'number' || isNaN(pxVal) || isNaN(pyVal)) return turn;
-        const px = (pxVal - startX) * trajScale + refX + trajOffset.x;
-        const py = (pyVal - startY) * trajScale + refY + trajOffset.y;
+        const px = (pxVal - startX) * finalRenderScale + refX + trajOffset.x;
+        const py = (pyVal - startY) * finalRenderScale + refY + trajOffset.y;
         const rotated = applyRotation(px, py);
         return { ...turn, position: [rotated.x, rotated.y, pos[2] ?? 0] };
       });
 
+      const visibleTransformed = isPlaybackLimited ? transformed.slice(0, visibleCount) : transformed;
+      const visibleTurnPoints = transformedTurnPoints.filter((turn) => {
+        const idx = finiteNum((turn as unknown as Record<string, unknown>).trajectory_index, -1);
+        return idx < 0 || idx < visibleCount;
+      });
+
       return {
         ...data,
-        trajectory: transformed,
-        turnPoints: transformedTurnPoints
+        trajectory: visibleTransformed,
+        turnPoints: visibleTurnPoints,
+        // Трансформируем R³ camera points так же, как траекторию
+        r3CameraPoints: data.r3CameraPoints ? data.r3CameraPoints.map(p => ({
+          x: ((p.x - startX) * finalRenderScale + refX + trajOffset.x),
+          y: ((p.y - startY) * finalRenderScale + refY + trajOffset.y),
+          z: p.z,
+        })).map(p => {
+          const r = applyRotation(p.x, p.y);
+          return { ...p, x: r.x, y: r.y };
+        }) : undefined,
       };
     });
-  }, [trajectoryData, referencePoint, directionPoint, viewBox.width, viewBox.height, trajScale, trajOffset, compassAngle, directionFlip180, directionAngleOffset]);
+  }, [trajectoryData, floorPlan, referencePoint, directionPoint, playbackPointLimit, viewBox.width, viewBox.height, trajScale, trajOffset, compassAngle, directionFlip180, directionAngleOffset]);
 
   // Get transformed turn points for all trajectories
   const getAllTransformedTurnPoints = useMemo(() => {
@@ -636,7 +731,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       )}
 
       {/* Floor Plan Controls (Top-Left) */}
-      {(floorPlan || drawnPlan) && (
+      {!reviewMode && (floorPlan || drawnPlan) && (
         <div className="absolute top-4 left-4 z-20 flex flex-col gap-2 bg-background/80 backdrop-blur-md p-2 rounded-lg border border-border/50 shadow-xl" onClick={(e) => e.stopPropagation()}>
           <span className="text-[10px] font-bold text-center text-muted-foreground uppercase tracking-wider mb-1">План</span>
           {referencePoint && onSetDirectionModeChange && (
@@ -733,6 +828,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       )}
 
       {/* View controls */}
+      {!reviewMode && (
       <div className="absolute top-4 right-4 z-20 flex flex-col gap-2">
         <div className="flex flex-col gap-1 p-1 bg-background/80 backdrop-blur-md rounded-lg border border-border/50 shadow-xl">
           <Button
@@ -776,6 +872,16 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         </Button>
 
         <Button
+          variant={showR3PointCloud ? "default" : "outline"}
+          size="icon"
+          className="h-10 w-10 shadow-lg backdrop-blur-md"
+          onClick={(e) => { e.stopPropagation(); setShowR3PointCloud(!showR3PointCloud); }}
+          title={showR3PointCloud ? "Скрыть облако точек R³" : "Показать облако точек R³"}
+        >
+          <Footprints className="h-5 w-5" />
+        </Button>
+
+        <Button
           variant={showCalibration ? "default" : "outline"}
           size="icon"
           className="h-10 w-10 shadow-lg backdrop-blur-md bg-orange-500/10 border-orange-500/50 hover:bg-orange-500/20"
@@ -798,6 +904,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           {isFullscreen ? <Minimize2 className="h-5 w-5" /> : <Maximize2 className="h-5 w-5" />}
         </Button>
       </div>
+      )}
 
       {/* Calibration Panel */}
       {showCalibration && (
@@ -912,7 +1019,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       )}
 
       {/* Компас внизу чертежа — ориентация плана */}
-      {(floorPlan || drawnPlan) && (
+      {!reviewMode && (floorPlan || drawnPlan) && (
         <div
           className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1 bg-background/90 backdrop-blur-md p-2 rounded-xl border border-border/50 shadow-lg"
           onClick={(e) => e.stopPropagation()}
@@ -1098,13 +1205,31 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                 />
               ))
             ) : (
-              /* Multiple trajectory paths */
-              (() => {
-                const transformedTrajectories = getTransformedTrajectories;
-                return transformedTrajectories.map((data, trajectoryIndex) => {
+              <g>
+              {/* R³ Point Cloud — все позиции камер как полупрозрачные точки */}
+              {showR3PointCloud && getTransformedTrajectories
+                .filter(d => d.r3CameraPoints && d.r3CameraPoints.length > 0)
+                .flatMap((data, ti) =>
+                  data.r3CameraPoints!.flatMap((point, pi) => {
+                    if (!point || typeof point.x !== 'number' || isNaN(point.x)) return [];
+                    return [(
+                      <circle
+                        key={`r3cloud-${ti}-${pi}`}
+                        cx={point.x}
+                        cy={point.y}
+                        r="1.2"
+                        fill={data.color}
+                        opacity={0.4}
+                      />
+                    )];
+                  })
+                )}
+
+              {/* Multiple trajectory paths */}
+              {getTransformedTrajectories.map((data, trajectoryIndex) => {
                   const corrected = correctedPaths.get(trajectoryIndex);
                   // При указанном направлении используем raw траекторию — pathfinding может давать артефакты
-                  const pathPoints = usePathfinding && floorPlan && !directionPoint && corrected && corrected.length >= 2
+                  const pathPoints = usePathfinding && floorPlan && !directionPoint && !data.r3AutoFitToPlan && corrected && corrected.length >= 2
                     ? corrected
                     : data.trajectory;
                   return (
@@ -1137,9 +1262,9 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                         />
                       ))}
                   </g>
-                );});
-              })()
-            )}
+                );
+              })}
+            </g>)}
 
             {/* Start and end points for all trajectories */}
             {(() => {
