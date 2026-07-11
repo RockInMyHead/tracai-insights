@@ -67,7 +67,11 @@ export interface VideoAnalysisResult {
       source: string;
     };
     r3_camera_points?: number[][];  // Все позиции камер R³ для отрисовки облака точек
-    r3_pose_confidence?: number[];  // Уверенность каждой позиции
+    r3_raw_camera_points?: number[][];
+    raw_trajectory_3d?: number[][];
+    plan_trajectory?: number[][];
+    r3_source_frame_indices?: Array<number | null>;
+    r3_pose_confidence?: Array<number | null>;  // Уверенность каждой позиции
     total_processing_time: number;
     video_info: {
       width: number;
@@ -796,7 +800,22 @@ export class ApiClient {
     success: boolean;
     video_id: string;
     points: number[][];
+    /** Plan-space path for the floor map. This remains the compatibility trajectory. */
     trajectory?: number[][];
+    plan_trajectory?: number[][];
+    /** Cleaned c2w translations for Three.js only; never use these as map X/Y. */
+    raw_trajectory_3d?: number[][];
+    turn_points?: Array<{
+      frame_index: number;
+      r3_frame_index?: number;
+      source_frame_index?: number | null;
+      trajectory_index: number;
+      angle_degrees: number;
+      position: number[];
+      turn_type: string;
+      confidence?: number | null;
+    }>;
+    source_frame_indices?: Array<number | null>;
     cameras?: unknown[];
     stats?: {
       source_points: number;
@@ -815,7 +834,10 @@ export class ApiClient {
         raw_step_p99?: number;
         step_limit?: number;
         clipped_steps?: number;
+        outlier_points?: number;
+        smoothed_points?: number;
         cleaned_distance?: number;
+        projection?: Record<string, unknown>;
       } | null;
     };
     diagnostics?: {

@@ -160,8 +160,11 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
           includeTrajectory: true,
           includeCameras: false,
         }).then(resp => {
-          if (resp.success && Array.isArray(resp.trajectory) && resp.trajectory.length >= 2) {
-            const validTrajectory = resp.trajectory.filter(p => Array.isArray(p) && p.length >= 3);
+          // The 3D viewer must receive c2w translations.  `trajectory` is now
+          // plan-space and is deliberately reserved for the floor-map screen.
+          const rawTrajectory = resp.raw_trajectory_3d ?? resp.trajectory;
+          if (resp.success && Array.isArray(rawTrajectory) && rawTrajectory.length >= 2) {
+            const validTrajectory = rawTrajectory.filter(p => Array.isArray(p) && p.length >= 3);
             if (validTrajectory.length >= 2) {
               setPoints(validTrajectory);
               pointsRef.current = validTrajectory;

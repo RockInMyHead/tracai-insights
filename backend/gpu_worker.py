@@ -20,6 +20,11 @@ from video_tracker.src.processor import FullFeatureProcessor
 from video_tracker.src.map_postprocessing import apply_map_postprocessing
 from video_tracker.src.stabilization import stabilize_video
 
+try:
+    from r3_trajectory import build_r3_trajectory
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_trajectory import build_r3_trajectory
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("gpu_worker")
 
@@ -707,6 +712,42 @@ def _r3_conf_stats(conf_values):
     }
 
 
+def _load_r3_trajectory_bundle(base: Path) -> tuple[dict, list[dict]]:
+    """Load R3 pose artifacts once and keep 3D/plan-space products separate."""
+    import numpy as np
+
+    camera_poses: list[dict] = []
+    for camera_file in sorted((base / "camera").glob("*.npz")):
+        try:
+            camera = np.load(str(camera_file))
+            pose = camera["pose"]
+            camera_poses.append({
+                "frame": int(camera_file.stem),
+                "pose": pose.tolist(),
+                "intrinsics": camera["intrinsics"].tolist() if "intrinsics" in camera else None,
+            })
+        except Exception:
+            continue
+
+    pose_confidence = None
+    pose_confidence_path = base / "pose_conf.npy"
+    if pose_confidence_path.exists():
+        try:
+            pose_confidence = np.load(str(pose_confidence_path)).tolist()
+        except Exception:
+            pose_confidence = None
+
+    frame_selection = {}
+    selection_path = base / "frame_selection.json"
+    if selection_path.exists():
+        try:
+            frame_selection = json.loads(selection_path.read_text())
+        except Exception:
+            frame_selection = {}
+
+    return build_r3_trajectory(camera_poses, pose_confidence, frame_selection), camera_poses
+
+
 def _clean_r3_trajectory_points(raw_points):
     """Return a display-safe R³ camera path with pose-jump clipping and smoothing."""
     import numpy as np
@@ -1030,6 +1071,46 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         except Exception as e:
             camera_sample.append({"file": cf.name, "error": str(e)})
 
+    pose_confidence = {"exists": False}
+    pose_confidence_path = base / "pose_conf.npy"
+    if pose_confidence_path.exists():
+        try:
+            values = np.load(str(pose_confidence_path))
+            finite_values = values[np.isfinite(values)]
+            pose_confidence = {
+                "exists": True,
+                "count": int(values.size),
+                "finite_count": int(finite_values.size),
+                "percentiles": _r3_conf_stats(finite_values).get("percentiles", {}),
+            }
+        except Exception as e:
+            pose_confidence = {"exists": True, "error": str(e)}
+
+    pose_edges = {"exists": False}
+    pose_edges_path = base / "pose_edge_log.json"
+    if pose_edges_path.exists():
+        try:
+            edges = json.loads(pose_edges_path.read_text())
+            type_counts: Dict[str, int] = {}
+            for edge in edges if isinstance(edges, list) else []:
+                edge_type = str(edge.get("edge_type", "unknown")) if isinstance(edge, dict) else "unknown"
+                type_counts[edge_type] = type_counts.get(edge_type, 0) + 1
+            pose_edges = {"exists": True, "count": len(edges) if isinstance(edges, list) else 0, "type_counts": type_counts}
+        except Exception as e:
+            pose_edges = {"exists": True, "error": str(e)}
+
+    trajectory = {"quality": "unavailable"}
+    try:
+        trajectory_bundle, _ = _load_r3_trajectory_bundle(base)
+        trajectory = {
+            "points": len(trajectory_bundle.get("plan_trajectory", [])),
+            "turns": len(trajectory_bundle.get("turn_points", [])),
+            "quality": trajectory_bundle.get("trajectory_quality", {}),
+            "source_frame_indices": trajectory_bundle.get("source_frame_indices", []),
+        }
+    except Exception as e:
+        trajectory = {"quality": "error", "error": str(e)}
+
     return {
         "success": True,
         "video_id": video_id,
@@ -1041,6 +1122,9 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         "run_params": run_params,
         "camera_sample": camera_sample,
         "camera_translation_sample": _r3_camera_translation_samples(base),
+        "pose_confidence": pose_confidence,
+        "pose_edges": pose_edges,
+        "trajectory": trajectory,
     }
 
 
@@ -1461,10 +1545,15 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
         saved_ckpt = str(params.get("ckpt") or "")
         saved_mode = str(params.get("mode") or "").lower()
         mode_l = str(mode or "").lower()
+        expected_pose_method = (os.getenv("R3_REL_POSE_METHOD") or (
+            "pgo" if mode_l in {"long", "strided"} else "greedy"
+        )).strip().lower()
+        saved_pose_method = str(params.get("rel_pose_reconstruction_method") or "greedy").lower()
         basic_match = (
             int(params.get("max_frames") or 0) == int(max_frames)
             and saved_ckpt.endswith(str(ckpt))
             and saved_mode == mode_l
+            and saved_pose_method == expected_pose_method
         )
         if not basic_match:
             return False
@@ -1868,7 +1957,13 @@ async def r3_get_pointcloud_filtered(
         filtered_frame_stats = _r3_frame_stats(filtered)
         returned_frame_stats = _r3_frame_stats(sampled)
 
+        # ``trajectory`` is plan-space for backwards compatibility.  The raw
+        # c2w translations are intentionally returned separately so a map can
+        # never accidentally treat R3's vertical axis as its Y coordinate.
         trajectory = []
+        raw_trajectory_3d = []
+        turn_points = []
+        source_frame_indices = []
         cameras = []
         trajectory_quality = None
         base = _r3_output_dir(video_id)
@@ -1883,32 +1978,26 @@ async def r3_get_pointcloud_filtered(
         # Missing mode means the output was produced by an older wrapper that
         # cannot be trusted for the new strided+fallback+metric R3 preset.
         stale_run = run_mode != "strided"
-        camera_files = sorted((base / "camera").glob("*.npz"))
         if include_trajectory or include_cameras:
-            import numpy as np
-            raw_trajectory = []
-            for cf in camera_files:
-                try:
-                    cam = np.load(str(cf))
-                    pose = cam["pose"]
-                    point = [float(pose[0, 3]), float(pose[1, 3]), float(pose[2, 3])]
-                    raw_trajectory.append(point)
-                    if include_cameras:
-                        cameras.append({
-                            "frame": int(cf.stem),
-                            "pose": pose.tolist(),
-                            "intrinsics": cam["intrinsics"].tolist() if "intrinsics" in cam else None,
-                        })
-                except Exception:
-                    continue
+            trajectory_bundle, loaded_cameras = _load_r3_trajectory_bundle(base)
             if include_trajectory:
-                trajectory, trajectory_quality = _clean_r3_trajectory_points(raw_trajectory)
+                trajectory = trajectory_bundle["plan_trajectory"]
+                raw_trajectory_3d = trajectory_bundle["raw_trajectory_3d"]
+                turn_points = trajectory_bundle["turn_points"]
+                source_frame_indices = trajectory_bundle["source_frame_indices"]
+                trajectory_quality = trajectory_bundle["trajectory_quality"]
+            if include_cameras:
+                cameras = loaded_cameras
 
         return {
             "success": True,
             "video_id": video_id,
             "points": sampled[:, :8].tolist() if sampled.ndim == 2 and sampled.shape[1] > 7 else sampled[:, :7].tolist(),
             "trajectory": trajectory,
+            "plan_trajectory": trajectory,
+            "raw_trajectory_3d": raw_trajectory_3d,
+            "turn_points": turn_points,
+            "source_frame_indices": source_frame_indices,
             "cameras": cameras,
             "stats": {
                 "source_points": source_points,
