@@ -35,7 +35,7 @@ export interface TrajectoryData {
   mapAligned?: boolean;
   /** Точки в системе админки 800×600 с letterbox растра — перевести в натуральный viewBox */
   manualPlanSpace?: boolean;
-  /** Все позиции камер R³ (облако точек для визуализации) */
+  /** Camera samples already projected into the same plan space as `trajectory`. */
   r3CameraPoints?: number[][];
   /** Pixels-per-meter (or user map scale) applied only during map rendering. */
   mapScaleFactor?: number;

@@ -20,6 +20,11 @@ import uuid
 import math as _math
 import fitz  # PyMuPDF
 
+try:
+    from r3_trajectory import build_r3_trajectory
+except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
+    from backend.r3_trajectory import build_r3_trajectory
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -438,12 +443,9 @@ def _make_manual_result(trajectory: Any, turn_points: Optional[List[Any]] = None
     }
 
 # Telegram bot configuration
-TELEGRAM_BOT_TOKEN = "8231968530:AAGh0gdqmcTYka2q-zEPaSurhHvibEooDQE"
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-DESKTOP_UPLOAD_BOT_TOKEN = (
-    os.getenv("TRACKAI_DESKTOP_UPLOAD_BOT_TOKEN")
-    or "8622333188:AAHY0kkcOJkTmqjW4yUHj42coNRBVWyevDw"
-).strip()
+DESKTOP_UPLOAD_BOT_TOKEN = (os.getenv("TRACKAI_DESKTOP_UPLOAD_BOT_TOKEN") or "").strip()
 TELEGRAM_DESKTOP_SUBSCRIBERS_PATH = DB_PATH.parent / "telegram_desktop_subscribers.json"
 _tg_desktop_sub_lock = threading.Lock()
 
@@ -968,10 +970,7 @@ def _clean_r3_plan_trajectory(points: List[List[float]]) -> List[List[float]]:
 
 
 def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
-    """
-    Конвертирует R³ camera poses (4×4 c2w матрицы) в стандартный формат траектории.
-    Возвращает dict с trajectory, turn_points, processing_stats, video_info.
-    """
+    """Convert R3 c2w poses into matching plan and 3D trajectory products."""
     camera_poses = r3_result.get("camera_poses", r3_result.get("camera_poses", []))
     if not camera_poses:
         # Fallback: читаем из output_dir
@@ -985,68 +984,28 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
                     try:
                         import numpy as _np2
                         data = _np2.load(str(cf))
-                        pose = data["pose"].tolist() if hasattr(data, "pose") else None
+                        pose = data["pose"].tolist() if "pose" in data else None
                         if pose:
                             camera_poses.append({"frame": int(cf.stem), "pose": pose})
                     except Exception:
                         pass
 
-    # Извлекаем 3D путь как перевод камер (последняя колонка 4x4 матрицы).
-    raw_camera_points = []
-    for cp in camera_poses:
-        pose = cp.get("pose", [])
-        if pose and len(pose) >= 3:
-            # Матрица 4×4 c2w: последняя колонка — [x, y, z, 1]
-            if len(pose[0]) >= 4:
-                x = float(pose[0][3])
-                y = float(pose[1][3])
-                z = float(pose[2][3])
-            elif len(pose[0]) >= 3:
-                x = float(pose[0][3]) if len(pose[0]) > 3 else 0.0
-                y = float(pose[1][3]) if len(pose[1]) > 3 else 0.0
-                z = 0.0
-            else:
-                x, y, z = 0.0, 0.0, 0.0
-            raw_camera_points.append([x, y, z])
-
-    # Для 2D-плана нельзя брать X/Y напрямую: в R3 Y часто вертикальная ось.
-    # Проецируем полный 3D путь на доминирующую плоскость движения.
-    projected_trajectory = _project_r3_camera_path_to_2d(raw_camera_points)
-    trajectory = _clean_r3_plan_trajectory(projected_trajectory)
-
-    # Вычисляем повороты (между последовательными кадрами)
-    turn_points = []
-    for i in range(1, len(camera_poses)):
-        prev_pose = camera_poses[i - 1].get("pose", [])
-        curr_pose = camera_poses[i].get("pose", [])
-        if len(prev_pose) >= 3 and len(curr_pose) >= 3:
-            # Угол между rotation матрицами (первые 3x3)
-            import math as _m
-            try:
-                import numpy as _np2
-                prev_R = _np2.array([[float(v) for v in row[:3]] for row in prev_pose[:3]])
-                curr_R = _np2.array([[float(v) for v in row[:3]] for row in curr_pose[:3]])
-                delta_R = prev_R.T @ curr_R
-                angle = _m.degrees(_m.acos(max(-1, min(1, (_np2.trace(delta_R) - 1) / 2))))
-                if angle > 5.0:  # порог поворота 5 градусов
-                    turn_points.append({
-                        "frame_index": camera_poses[i].get("frame", i),
-                        "trajectory_index": i,
-                        "angle_degrees": round(angle, 1),
-                        "position": trajectory[i] if i < len(trajectory) else [0, 0, 0],
-                        "turn_type": "sharp" if angle > 20 else "gentle",
-                    })
-            except Exception:
-                pass
-
+    trajectory_bundle = build_r3_trajectory(
+        camera_poses,
+        pose_confidence=r3_result.get("pose_confidence"),
+        frame_selection=r3_result.get("frame_selection"),
+    )
+    trajectory = trajectory_bundle["plan_trajectory"]
+    raw_trajectory_3d = trajectory_bundle["raw_trajectory_3d"]
+    turn_points = trajectory_bundle["turn_points"]
     num_frames = len(trajectory)
-    confidence = r3_result.get("pose_confidence", [])
-    valid_conf = [c for c in confidence if c is not None] if confidence else []
+    confidence = trajectory_bundle.get("pose_confidence") or []
+    valid_conf = [value for value in confidence if value is not None]
 
     run_params = r3_result.get("run_params", {})
     inference_time = run_params.get("inference_time_s", 0) or 0
 
-    # Примерное расстояние (сумма евклидовых расстояний между точками)
+    # Distance is measured in plan-space, never from the display-only 3D path.
     estimated_distance = 0.0
     for i in range(1, len(trajectory)):
         dx = trajectory[i][0] - trajectory[i - 1][0]
@@ -1068,12 +1027,16 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
     return {
         "method": "r3_reconstruction",
         "trajectory": trajectory,
+        "plan_trajectory": trajectory,
+        "raw_trajectory_3d": raw_trajectory_3d,
         "turn_points": turn_points,
         "frame_count": num_frames,
         "trajectory_points": len(trajectory),
-        "r3_camera_points": raw_camera_points,  # исходные 3D позиции камер для R³-визуализации
-        "r3_pose_confidence": valid_conf if valid_conf else None,  # уверенность каждой точки
-        "r3_projection": "pca_motion_plane_smoothed",
+        "r3_camera_points": raw_trajectory_3d,
+        "r3_raw_camera_points": trajectory_bundle["raw_camera_points"],
+        "r3_source_frame_indices": trajectory_bundle["source_frame_indices"],
+        "r3_pose_confidence": confidence or None,
+        "r3_projection": trajectory_bundle["trajectory_quality"].get("projection", {}).get("method", "robust_floor_plane"),
         "processing_stats": {
             "estimated_distance": round(estimated_distance, 2),
             "scale_factor": 1.0,
@@ -1082,6 +1045,7 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
             "fps": round(num_frames / max(inference_time, 0.1), 1) if inference_time > 0 else 0,
             "turns_detected": len(turn_points),
             "avg_pose_confidence": avg_conf,
+            "r3_trajectory_quality": trajectory_bundle["trajectory_quality"],
         },
         "total_processing_time": inference_time,
         "video_info": {
@@ -3418,7 +3382,7 @@ async def chat_with_ai(request: Dict[str, Any]):
             logger.warning("Skipping Telegram notification: chat_id not found")
 
         # DeepSeek API configuration
-        deepseek_api_key = os.environ["DEEPSEEK_API_KEY"]
+        deepseek_api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -3460,7 +3424,7 @@ async def chat_with_ai(request: Dict[str, Any]):
 
                         async with aiohttp.ClientSession() as session:
                             async with session.post(
-                                'https://api.telegram.org/bot8231968530:AAGh0gdqmcTYka2q-zEPaSurhHvibEooDQE/sendMessage',
+                                f"{TELEGRAM_API_URL}/sendMessage",
                                 json={
                                     'chat_id': chat_id_int,
                                     'text': telegram_response[:4096]  # Ограничение Telegram API

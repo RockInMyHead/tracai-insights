@@ -287,6 +287,44 @@ function buildDisplayTransform(points: number[][]) {
   };
 }
 
+/**
+ * Apply the same similarity transform to a complete c2w pose as to cloud
+ * points.  Moving only the translation made camera frustums face the wrong
+ * way after the [x,y,z] → [x,z,-y] viewer conversion.
+ */
+function transformPoseForDisplay(
+  pose: number[][],
+  transform: ReturnType<typeof buildDisplayTransform>,
+): number[][] {
+  if (!Array.isArray(pose) || pose.length < 3 || !Array.isArray(pose[0]) || pose[0].length < 4) {
+    return pose;
+  }
+  const raw = new THREE.Matrix4();
+  raw.set(
+    pose[0][0], pose[0][1], pose[0][2], pose[0][3],
+    pose[1][0], pose[1][1], pose[1][2], pose[1][3],
+    pose[2][0], pose[2][1], pose[2][2], pose[2][3],
+    0, 0, 0, 1,
+  );
+  const axis = new THREE.Matrix4().set(
+    1, 0, 0, 0,
+    0, 0, 1, 0,
+    0, -1, 0, 0,
+    0, 0, 0, 1,
+  );
+  const translate = new THREE.Matrix4().makeTranslation(-transform.center.x, -transform.center.y, -transform.center.z);
+  const scale = new THREE.Matrix4().makeScale(transform.scale, transform.scale, transform.scale);
+  const rawToDisplay = axis.clone().multiply(scale).multiply(translate);
+  const display = rawToDisplay.clone().multiply(raw).multiply(rawToDisplay.clone().invert());
+  const e = display.elements;
+  return [
+    [e[0], e[4], e[8], e[12]],
+    [e[1], e[5], e[9], e[13]],
+    [e[2], e[6], e[10], e[14]],
+    [0, 0, 0, 1],
+  ];
+}
+
 function cleanPointCloudForDisplay(
   cloud: number[][],
   trajectory: number[][],
@@ -430,6 +468,7 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
   const [minConfidence, setMinConfidence] = useState(1.4);
   const [frameStart, setFrameStart] = useState(0);
   const [frameEnd, setFrameEnd] = useState(Math.max(0, totalFrames - 1));
+  const [r3FrameCount, setR3FrameCount] = useState(0);
   const [samplingStrategy, setSamplingStrategy] = useState<SamplingStrategy>("per_frame_uniform");
   const [colorMode, setColorMode] = useState<R3ColorMode>("rgb");
   const [filteredPointCloud, setFilteredPointCloud] = useState<number[][] | null>(null);
@@ -474,14 +513,19 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
   } | null>(null);
   const initRef = useRef(false);
 
-  const r3FrameMax = Math.max(0, totalFrames - 1);
+  // Debug clouds use sequential R3 frame ids, not original video frame ids.
+  const r3FrameMax = Math.max(0, (r3FrameCount || totalFrames) - 1);
   const effectivePointCloud = filteredPointCloud ?? pointCloud;
   const effectiveTrajectory = filteredTrajectory && filteredTrajectory.length >= 2 ? filteredTrajectory : points;
 
   useEffect(() => {
+    setR3FrameCount(0);
+  }, [videoId]);
+
+  useEffect(() => {
     setFrameStart(0);
-    setFrameEnd(Math.max(0, totalFrames - 1));
-  }, [totalFrames]);
+    setFrameEnd(r3FrameMax);
+  }, [r3FrameMax]);
 
   useEffect(() => {
     if (!videoId || points.length < 2) return;
@@ -492,8 +536,8 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
       apiClient.getR3PointCloudFiltered(videoId, {
         maxPoints: maxRenderPoints,
         minConf: minConfidence,
-        frameStart: totalFrames > 0 ? frameStart : undefined,
-        frameEnd: totalFrames > 0 ? frameEnd : undefined,
+        frameStart: r3FrameMax > 0 ? frameStart : undefined,
+        frameEnd: r3FrameMax > 0 ? frameEnd : undefined,
         samplingStrategy,
         includeTrajectory: true,
         includeCameras: false,
@@ -504,8 +548,12 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
           : [];
         if (resp.success && valid.length >= 50) {
           setFilteredPointCloud(valid);
-          if (Array.isArray(resp.trajectory) && resp.trajectory.length >= 2) {
-            setFilteredTrajectory(resp.trajectory.filter(p => Array.isArray(p) && p.length >= 3));
+          // Keep the Three.js scene in raw R3 world coordinates.  The map API
+          // returns its floor-plane path separately as `plan_trajectory`.
+          const rawTrajectory = resp.raw_trajectory_3d ?? resp.trajectory;
+          if (Array.isArray(rawTrajectory) && rawTrajectory.length >= 2) {
+            setFilteredTrajectory(rawTrajectory.filter(p => Array.isArray(p) && p.length >= 3));
+            setR3FrameCount(rawTrajectory.length);
           }
           setFilteredStats(resp.stats ?? null);
           setFilteredDiagnostics(resp.diagnostics ?? null);
@@ -523,7 +571,7 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
       controller.abort();
       window.clearTimeout(timeout);
     };
-  }, [videoId, points.length, maxRenderPoints, minConfidence, frameStart, frameEnd, samplingStrategy, totalFrames]);
+  }, [videoId, points.length, maxRenderPoints, minConfidence, frameStart, frameEnd, samplingStrategy, r3FrameMax]);
 
   useEffect(() => {
     if (!showDebug || !videoId) return;
@@ -852,12 +900,7 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
       let frustumPoses: PoseData[];
       if (validPoses.length >= 2) {
         frustumPoses = validPoses.map(p => {
-          const q = displayTransform.apply([p.pose[0][3], p.pose[1][3], p.pose[2][3]]);
-          const pose = p.pose.map(row => [...row]);
-          pose[0][3] = q.x;
-          pose[1][3] = q.y;
-          pose[2][3] = q.z;
-          return { ...p, pose };
+          return { ...p, pose: transformPoseForDisplay(p.pose, displayTransform) };
         });
       } else {
         frustumPoses = [];

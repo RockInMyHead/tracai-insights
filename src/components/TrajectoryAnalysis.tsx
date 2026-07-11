@@ -630,17 +630,28 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
                 includeTrajectory: true,
                 includeCameras: false,
               });
-              const filteredTrajectory = Array.isArray(filtered.trajectory)
-                ? filtered.trajectory.filter((p) => Array.isArray(p) && p.length >= 2)
+              const planTrajectory = Array.isArray(filtered.plan_trajectory ?? filtered.trajectory)
+                ? (filtered.plan_trajectory ?? filtered.trajectory ?? []).filter((p) => Array.isArray(p) && p.length >= 2)
                 : [];
-              if (filtered.success && filteredTrajectory.length >= 2) {
+              const rawTrajectory3d = Array.isArray(filtered.raw_trajectory_3d)
+                ? filtered.raw_trajectory_3d.filter((p) => Array.isArray(p) && p.length >= 3)
+                : [];
+              const refinedTurns = Array.isArray(filtered.turn_points) ? filtered.turn_points : [];
+              if (filtered.success && planTrajectory.length >= 2) {
                 const filteredStats = filtered.stats || {};
                 const cleanedDistance = filteredStats.trajectory_quality?.cleaned_distance;
                 const currentStats =
                   (analysisData.processing_stats as Record<string, unknown> | undefined) || {};
                 analysisData = {
                   ...analysisData,
-                  trajectory: filteredTrajectory,
+                  // The map must consume plan-space coordinates.  Raw c2w
+                  // translations belong only to the 3D viewer.
+                  trajectory: planTrajectory,
+                  plan_trajectory: planTrajectory,
+                  raw_trajectory_3d: rawTrajectory3d,
+                  r3_camera_points: rawTrajectory3d,
+                  r3_source_frame_indices: filtered.source_frame_indices ?? [],
+                  turn_points: refinedTurns.length > 0 ? refinedTurns : analysisData.turn_points,
                   estimated_distance:
                     typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
                       ? cleanedDistance
@@ -721,7 +732,11 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           const hasMapTrajectory = Boolean(video.analysisResult.map_trajectory);
           const isAlreadyInPlanSpace = (hasMapTrajectory && !isLingBot) || manualOverride;
           return {
-            trajectory: convertTrajectory(video.analysisResult.map_trajectory || video.analysisResult.trajectory),
+            trajectory: convertTrajectory(
+              video.analysisResult.map_trajectory ||
+              video.analysisResult.plan_trajectory ||
+              video.analysisResult.trajectory,
+            ),
             turnPoints: video.analysisResult.map_turn_points || video.analysisResult.turn_points || [],
             ownerName: video.ownerName,
             color: video.color,
@@ -729,7 +744,13 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             method: video.analysisResult.method,
             mapAligned: isAlreadyInPlanSpace,
             manualPlanSpace: manualOverride,
-            r3CameraPoints: undefined,
+            // TrajectoryMap is a 2D surface.  Its camera-dot overlay must use
+            // the same plan coordinates as the rendered path, never raw c2w.
+            r3CameraPoints: isR3 && Array.isArray(
+              video.analysisResult.plan_trajectory || video.analysisResult.trajectory,
+            )
+              ? (video.analysisResult.plan_trajectory || video.analysisResult.trajectory)
+              : undefined,
             mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(ps?.scale_factor, 1),
             r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace,
           };

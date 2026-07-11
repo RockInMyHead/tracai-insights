@@ -169,7 +169,25 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         ckpt_name = "r3_long.safetensors"
 
     kv_cache_mode = "all" if mode in {"test", "strided"} else "dynamic"
-    """Run R³ inference via subprocess using conda r3 env."""
+
+    def env_enabled(name: str, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.lower() in {"1", "true", "yes", "on"}
+
+    def env_choice(name: str, default: str, choices: set[str]) -> str:
+        value = (os.getenv(name) or default).strip().lower()
+        return value if value in choices else default
+
+    # Greedy is useful for a fast preview.  The completed long-video path now
+    # defaults to R3's global PGO reconstruction; it can be rolled back per
+    # worker with R3_REL_POSE_METHOD=greedy.
+    pose_method = env_choice(
+        "R3_REL_POSE_METHOD",
+        "pgo" if mode in {"long", "strided"} else "greedy",
+        {"greedy", "pgo"},
+    )
     ckpt_path = str(R3_DIR / "ckpt" / ckpt_name)
 
     cmd = CONDA_RUN + [
@@ -186,14 +204,8 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         "--keyframe_novelty_threshold", "0.985",
         "--keyframe_max_interval", "30",
         "--keyframe_max_keyframes", "100",
-        "--rel_pose_reconstruction_method", "greedy",
+        "--rel_pose_reconstruction_method", pose_method,
     ]
-
-    def env_enabled(name: str, default: bool) -> bool:
-        raw = os.getenv(name)
-        if raw is None:
-            return default
-        return raw.lower() in {"1", "true", "yes", "on"}
 
     # Match R3 demo.py release presets: long/strided need confidence fallback
     # re-anchoring. Without it, long indoor videos often produce pose teleports.
@@ -210,8 +222,11 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
             "--min_segment_frames", "16",
             "--max_segment_frames", max_segment_frames,
             "--fallback_replay_attention", "full",
-            "--disable_segment_pgo",
         ]
+        # Keep the old conservative fallback behavior by default, but make
+        # segment PGO an explicit quality-profile switch for A/B validation.
+        if env_enabled("R3_DISABLE_SEGMENT_PGO", True):
+            cmd.append("--disable_segment_pgo")
 
     # DA3 metric model is cached on the 3090 host; keep an env kill-switch for
     # emergency rollback without changing code.
