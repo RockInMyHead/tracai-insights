@@ -284,34 +284,246 @@ def _trajectory_headings(points: np.ndarray) -> tuple[np.ndarray, int]:
     return headings, half_window
 
 
+def _turn_spans(count: int, local_half_window: int) -> list[int]:
+    """Return multiple temporal scales at which a corner can be measured.
+
+    A turn can be instantaneous in the reconstructed path, but on a long
+    video R3 often spreads the same physical 90-degree corner over a few
+    dozen poses.  Looking only at the local tangent then reports the central
+    45--70 degrees (or misses the turn entirely).  The spans below let us
+    compare the straight approach with the straight exit without using a
+    global smoother.
+    """
+    if count < 2:
+        return []
+    max_span = min(72, max(3, (count - 1) // 2))
+    preferred = (2, 3, 4, 6, 8, 12, 18, 27, 40, 60, 72)
+    spans = {max(2, int(local_half_window))}
+    spans.update(span for span in preferred if span <= max_span)
+    spans.add(max_span)
+    return sorted(spans)
+
+
+def _position_turn_candidates(
+    plan_points: np.ndarray,
+    local_half_window: int,
+) -> list[dict[str, Any]]:
+    """Measure each possible turn from approach/exit anchor segments.
+
+    The returned candidate is intentionally based on two pieces outside the
+    candidate centre.  It therefore preserves the *full* angle of a rounded
+    or slowly reconstructed corner, instead of measuring only its centre.
+    """
+    count = len(plan_points)
+    if count < 6:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for center in range(1, count - 1):
+        best: dict[str, Any] | None = None
+        for span in _turn_spans(count, local_half_window):
+            # Leave a gap around the prospective corner.  With a rounded turn
+            # this moves each heading estimate onto the stable straight side.
+            guard = max(1, int(round(span * 0.4)))
+            approach_start = max(0, center - span)
+            approach_end = center - guard
+            exit_start = center + guard
+            exit_end = min(count - 1, center + span)
+            if approach_end <= approach_start or exit_end <= exit_start:
+                continue
+
+            incoming = plan_points[approach_end, :2] - plan_points[approach_start, :2]
+            outgoing = plan_points[exit_end, :2] - plan_points[exit_start, :2]
+            incoming_length = float(np.linalg.norm(incoming))
+            outgoing_length = float(np.linalg.norm(outgoing))
+            if incoming_length <= 1e-7 or outgoing_length <= 1e-7:
+                continue
+
+            incoming_heading = math.atan2(float(incoming[1]), float(incoming[0]))
+            outgoing_heading = math.atan2(float(outgoing[1]), float(outgoing[0]))
+            angle = math.degrees(_angle_delta_rad(outgoing_heading, incoming_heading))
+            candidate = {
+                "center": center,
+                "angle": angle,
+                "magnitude": abs(angle),
+                "span": span,
+                "guard": guard,
+                "approach_start": approach_start,
+                "approach_end": approach_end,
+                "exit_start": exit_start,
+                "exit_end": exit_end,
+                "support": min(incoming_length, outgoing_length),
+            }
+            if best is None or candidate["magnitude"] > best["magnitude"]:
+                best = candidate
+        if best is not None:
+            candidates.append(best)
+    return candidates
+
+
+def _mean_heading(headings: np.ndarray, start: int, end: int) -> tuple[float | None, float]:
+    """Return circular mean and concentration for an inclusive range."""
+    values = headings[max(0, start): min(len(headings), end + 1)]
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None, 0.0
+    mean_sin = float(np.mean(np.sin(values)))
+    mean_cos = float(np.mean(np.cos(values)))
+    concentration = float(math.hypot(mean_sin, mean_cos))
+    if concentration <= 1e-8:
+        return None, 0.0
+    return math.atan2(mean_sin, mean_cos), concentration
+
+
+def _camera_heading_signal(
+    rotations: Sequence[np.ndarray] | None,
+    plan_points: np.ndarray,
+    floor_basis: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Project camera-forward axes into plan space and validate them.
+
+    Camera orientation is useful only when it follows motion.  We align its
+    global sign with position tangents and expose a reliability score so an
+    unrelated camera pan cannot inflate a path turn.
+    """
+    count = len(plan_points)
+    empty = np.full(count, np.nan, dtype=np.float64)
+    diagnostics: dict[str, Any] = {
+        "available": False,
+        "reliable": False,
+        "valid_headings": 0,
+        "alignment": None,
+        "alignment_support": None,
+        "camera_axis": None,
+    }
+    if not rotations or floor_basis is None or len(rotations) != count:
+        return empty, diagnostics
+
+    e1, e2, normal = floor_basis
+    trajectory_headings, _ = _trajectory_headings(plan_points)
+    required_valid = max(6, min(40, count // 5))
+    best: tuple[float, float, float, np.ndarray, int, int] | None = None
+    # R3 normally follows the OpenCV Z-forward convention.  Test X as well:
+    # its yaw deltas are equivalent, and this keeps the signal usable for
+    # checkpoints exported with a different camera-axis convention.
+    for axis in (2, 0):
+        headings = empty.copy()
+        for index, rotation in enumerate(rotations):
+            if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
+                continue
+            direction = rotation[:, axis]
+            direction = direction - float(np.dot(direction, normal)) * normal
+            if float(np.linalg.norm(direction)) <= 1e-7:
+                continue
+            headings[index] = math.atan2(float(np.dot(direction, e2)), float(np.dot(direction, e1)))
+
+        valid = np.isfinite(headings) & np.isfinite(trajectory_headings)
+        valid_count = int(valid.sum())
+        if valid_count < required_valid:
+            continue
+        alignment_values = np.cos(headings[valid] - trajectory_headings[valid])
+        # The camera axis may be saved in the opposite sign.  Choose a single
+        # global sign, never a per-frame flip, to preserve turn direction.
+        if float(np.median(alignment_values)) < 0.0:
+            headings[np.isfinite(headings)] += math.pi
+            alignment_values = np.cos(headings[valid] - trajectory_headings[valid])
+        alignment = float(np.median(alignment_values))
+        support = float(np.mean(alignment_values >= math.cos(math.radians(55.0))))
+        score = alignment * support
+        if best is None or score > best[0]:
+            best = (score, alignment, support, headings, valid_count, axis)
+
+    if best is None:
+        return empty, diagnostics
+
+    _, alignment, support, headings, valid_count, axis = best
+    diagnostics.update({
+        "available": True,
+        "valid_headings": valid_count,
+        "alignment": round(alignment, 4),
+        "alignment_support": round(support, 4),
+        "camera_axis": "z" if axis == 2 else "x",
+        "reliable": bool(alignment >= 0.55 and support >= 0.65),
+    })
+    return headings, diagnostics
+
+
 def _detect_turns(
     plan_points: np.ndarray,
     source_frame_indices: Sequence[int | None],
     confidence: np.ndarray,
-) -> list[dict[str, Any]]:
+    rotations: Sequence[np.ndarray] | None = None,
+    floor_basis: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(plan_points) < 6:
-        return []
+        return [], {"method": "multi_scale_anchors", "quality": "too_short"}
 
-    headings, half_window = _trajectory_headings(plan_points)
+    local_headings, half_window = _trajectory_headings(plan_points)
     local_degrees = np.zeros(len(plan_points), dtype=np.float64)
-    for i in range(len(plan_points)):
-        left = max(0, i - half_window)
-        right = min(len(plan_points) - 1, i + half_window)
-        local_degrees[i] = math.degrees(_angle_delta_rad(float(headings[right]), float(headings[left])))
+    for index in range(len(plan_points)):
+        left = max(0, index - half_window)
+        right = min(len(plan_points) - 1, index + half_window)
+        local_degrees[index] = math.degrees(
+            _angle_delta_rad(float(local_headings[right]), float(local_headings[left]))
+        )
+    candidates = _position_turn_candidates(plan_points, half_window)
+    camera_headings, camera_diagnostics = _camera_heading_signal(rotations, plan_points, floor_basis)
 
-    active = np.abs(local_degrees) >= 24.0
+    # Camera orientation is an independent cue for the common R3 failure
+    # mode where a real 90-degree corner is reconstructed as a 45--70-degree
+    # arc.  It is only allowed to take precedence after global validation.
+    for candidate in candidates:
+        candidate["event_angle"] = candidate["angle"]
+        candidate["angle_source"] = "trajectory_multiscale"
+        candidate["orientation_angle"] = None
+        if not camera_diagnostics["reliable"]:
+            continue
+        before, before_concentration = _mean_heading(
+            camera_headings, candidate["approach_start"], candidate["approach_end"]
+        )
+        after, after_concentration = _mean_heading(
+            camera_headings, candidate["exit_start"], candidate["exit_end"]
+        )
+        if before is None or after is None or min(before_concentration, after_concentration) < 0.7:
+            continue
+        orientation_angle = math.degrees(_angle_delta_rad(after, before))
+        candidate["orientation_angle"] = orientation_angle
+        position_magnitude = abs(float(candidate["angle"]))
+        orientation_magnitude = abs(orientation_angle)
+        same_direction = (
+            position_magnitude < 18.0
+            or math.copysign(1.0, float(candidate["angle"])) == math.copysign(1.0, orientation_angle)
+        )
+        # Do not turn a 90-degree path corner into an orientation-only
+        # U-turn.  We only correct material under-estimation in the same
+        # direction and stay within normal left/right turn magnitudes.
+        if (
+            same_direction
+            and 32.0 <= orientation_magnitude < 150.0
+            and position_magnitude < orientation_magnitude * 0.8
+        ):
+            candidate["event_angle"] = orientation_angle
+            candidate["angle_source"] = "camera_orientation"
+
+    active = [abs(float(candidate["event_angle"])) >= 28.0 for candidate in candidates]
     groups: list[tuple[int, int]] = []
     start: int | None = None
     last_active = -1
-    merge_gap = max(1, half_window)
+    active_sign = 0
+    merge_gap = max(2, half_window * 2)
     for index, is_active in enumerate(active):
         if is_active:
-            if start is None:
+            sign = 1 if float(candidates[index]["event_angle"]) > 0 else -1
+            if start is None or (active_sign and sign != active_sign):
+                if start is not None:
+                    groups.append((start, last_active))
                 start = index
+                active_sign = sign
             last_active = index
         elif start is not None and index - last_active > merge_gap:
             groups.append((start, last_active))
             start = None
+            active_sign = 0
     if start is not None:
         groups.append((start, last_active))
 
@@ -321,15 +533,18 @@ def _detect_turns(
     last_turn_index = -10_000
 
     for group_start, group_end in groups:
-        left = max(0, group_start - half_window)
-        right = min(len(plan_points) - 1, group_end + half_window)
-        angle = math.degrees(_angle_delta_rad(float(headings[right]), float(headings[left])))
+        peak = max(
+            candidates[group_start:group_end + 1],
+            key=lambda candidate: abs(float(candidate["event_angle"])),
+        )
+        angle = float(peak["event_angle"])
         magnitude = abs(angle)
-        if magnitude < 28.0:
-            continue
-
-        center = max(range(group_start, group_end + 1), key=lambda i: abs(float(local_degrees[i])))
-        movement = float(np.linalg.norm(plan_points[right, :2] - plan_points[left, :2]))
+        # The largest multi-scale candidate can begin before the physical
+        # corner.  Use the strongest local heading change for the marker and
+        # source video frame, while retaining the peak's full-angle anchors.
+        group_centers = [candidate["center"] for candidate in candidates[group_start:group_end + 1]]
+        center = max(group_centers, key=lambda index: abs(float(local_degrees[index])))
+        movement = float(peak["support"])
         if movement <= 1e-6:
             continue
         pose_is_weak = not np.isfinite(confidence[center]) or confidence[center] <= weak_conf
@@ -354,9 +569,26 @@ def _detect_turns(
             "position": [round(float(v), 6) for v in plan_points[center]],
             "turn_type": turn_type,
             "confidence": round(float(confidence[center]), 5) if np.isfinite(confidence[center]) else None,
+            "angle_source": peak["angle_source"],
+            "trajectory_angle_degrees": round(float(peak["angle"]), 1),
+            "camera_angle_degrees": (
+                round(float(peak["orientation_angle"]), 1)
+                if peak["orientation_angle"] is not None
+                else None
+            ),
+            "span_points": int(peak["span"]),
+            "approach_index": int(peak["approach_end"]),
+            "exit_index": int(peak["exit_start"]),
         })
         last_turn_index = center
-    return turns
+    return turns, {
+        "method": "multi_scale_anchors",
+        "local_half_window": half_window,
+        "spans": _turn_spans(len(plan_points), half_window),
+        "candidate_count": len(candidates),
+        "active_groups": len(groups),
+        "camera_orientation": camera_diagnostics,
+    }
 
 
 def _source_frame_indices(camera_poses: Sequence[Mapping[str, Any]], frame_selection: Any) -> list[int | None]:
@@ -428,8 +660,14 @@ def build_r3_trajectory(
     confidence = _pose_confidences(valid_poses, pose_confidence)
     source_indices = _source_frame_indices(valid_poses, frame_selection)
     cleaned_3d, filter_quality = _clean_positions(raw, confidence)
-    plan, plane, _ = _project_to_floor(cleaned_3d, rotations)
-    turns = _detect_turns(plan, source_indices, confidence)
+    plan, plane, floor_basis = _project_to_floor(cleaned_3d, rotations)
+    turns, turn_detection = _detect_turns(
+        plan,
+        source_indices,
+        confidence,
+        rotations=rotations,
+        floor_basis=floor_basis,
+    )
     clean_steps = np.linalg.norm(np.diff(plan[:, :2], axis=0), axis=1) if len(plan) > 1 else np.array([])
 
     return {
@@ -443,6 +681,7 @@ def build_r3_trajectory(
         "trajectory_quality": {
             **filter_quality,
             "projection": plane,
+            "turn_detection": turn_detection,
             "cleaned_distance": round(float(clean_steps.sum()), 6) if clean_steps.size else 0.0,
             "turns_detected": len(turns),
         },
