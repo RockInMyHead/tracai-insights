@@ -18,6 +18,11 @@ try:
 except ImportError:  # pragma: no cover - package-style startup
     from backend.r3_pointcloud import build_sampled_pointcloud
 
+try:
+    from r3_long_video import align_segment_poses, plan_segment_windows
+except ImportError:  # pragma: no cover - package-style startup
+    from backend.r3_long_video import align_segment_poses, plan_segment_windows
+
 R3_DIR = Path("/home/artem/trackai/R3")
 CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
 
@@ -46,7 +51,15 @@ def conf_stats(conf_values):
     }
 
 
-def extract_frames(video_path: str, output_dir: str, frame_stride: int = 5, max_frames: int = 0):
+def extract_frames(
+    video_path: str,
+    output_dir: str,
+    frame_stride: int = 5,
+    max_frames: int = 0,
+    segmented_long: bool = False,
+    segment_min_duration: float = 600.0,
+    long_target_fps: float = 5.0,
+):
     """Extract frames from video using OpenCV.
 
     If max_frames is lower than the number of stride-selected frames, sample
@@ -74,8 +87,16 @@ def extract_frames(video_path: str, output_dir: str, frame_stride: int = 5, max_
         "width": width, "height": height, "duration": duration,
     })
 
-    frame_stride = max(1, int(frame_stride or 1))
-    max_frames = max(0, int(max_frames or 0))
+    requested_frame_stride = max(1, int(frame_stride or 1))
+    requested_max_frames = max(0, int(max_frames or 0))
+    segmented_selection = bool(segmented_long and duration >= max(60.0, segment_min_duration))
+    if segmented_selection and fps > 0 and long_target_fps > 0:
+        frame_stride = max(requested_frame_stride, int(round(fps / long_target_fps)))
+    else:
+        frame_stride = requested_frame_stride
+    # The max_frames limit becomes a per-segment GPU budget for long videos.
+    # Short videos keep the existing uniform full-video cap.
+    max_frames = 0 if segmented_selection else requested_max_frames
 
     candidate_indices = list(range(0, total_frames, frame_stride)) if total_frames > 0 else []
     if max_frames > 0 and len(candidate_indices) > max_frames:
@@ -91,7 +112,11 @@ def extract_frames(video_path: str, output_dir: str, frame_stride: int = 5, max_
         "fps": fps,
         "duration": duration,
         "frame_stride": frame_stride,
+        "requested_frame_stride": requested_frame_stride,
         "max_frames": max_frames,
+        "requested_max_frames": requested_max_frames,
+        "segmented_long": segmented_selection,
+        "long_target_fps": long_target_fps if segmented_selection else None,
         "candidate_frames": len(candidate_indices),
         "selected_frames": len(selected_indices),
         "sampling_mode": sampling_mode,
@@ -138,7 +163,11 @@ def extract_frames(video_path: str, output_dir: str, frame_stride: int = 5, max_
         "fps": fps,
         "duration": duration,
         "frame_stride": frame_stride,
+        "requested_frame_stride": requested_frame_stride,
         "max_frames": max_frames,
+        "requested_max_frames": requested_max_frames,
+        "segmented_long": segmented_selection,
+        "long_target_fps": long_target_fps if segmented_selection else None,
         "candidate_frames": len(candidate_indices),
         "selected_frames_requested": len(selected_list),
         "saved_frames": saved_count,
@@ -185,6 +214,14 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         value = (os.getenv(name) or default).strip().lower()
         return value if value in choices else default
 
+    def env_number(name: str, default: str, minimum: float) -> str:
+        raw = (os.getenv(name) or default).strip()
+        try:
+            value = max(minimum, float(raw))
+        except ValueError:
+            value = float(default)
+        return str(int(value)) if value.is_integer() else str(value)
+
     # Greedy is useful for a fast preview.  The completed long-video path now
     # defaults to R3's global PGO reconstruction; it can be rolled back per
     # worker with R3_REL_POSE_METHOD=greedy.
@@ -206,9 +243,13 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         "--online_kv_backend", "dense",
         "--online_kv_cache_mode", kv_cache_mode,
         "--keyframe_mode", "novelty",
-        "--keyframe_novelty_threshold", "0.985",
-        "--keyframe_max_interval", "30",
-        "--keyframe_max_keyframes", "100",
+        "--keyframe_novelty_threshold", env_number("R3_KEYFRAME_NOVELTY_THRESHOLD", "0.985", 0.0),
+        "--keyframe_max_interval", env_number(
+            "R3_KEYFRAME_MAX_INTERVAL", "15" if mode in {"long", "strided"} else "30", 1.0,
+        ),
+        "--keyframe_max_keyframes", env_number(
+            "R3_KEYFRAME_MAX_KEYFRAMES", "160" if mode in {"long", "strided"} else "100", 16.0,
+        ),
         "--rel_pose_reconstruction_method", pose_method,
     ]
 
@@ -228,9 +269,9 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
             "--max_segment_frames", max_segment_frames,
             "--fallback_replay_attention", "full",
         ]
-        # Keep the old conservative fallback behavior by default, but make
-        # segment PGO an explicit quality-profile switch for A/B validation.
-        if env_enabled("R3_DISABLE_SEGMENT_PGO", True):
+        # Long segments now use their own PGO by default. It remains possible
+        # to disable this on a constrained worker without changing code.
+        if env_enabled("R3_DISABLE_SEGMENT_PGO", False):
             cmd.append("--disable_segment_pgo")
 
     # DA3 metric model is cached on the 3090 host; keep an env kill-switch for
@@ -275,6 +316,254 @@ def run_r3_inference(frames_dir: str, output_dir: str, ckpt_name: str = "r3.safe
         except Exception as exc:
             emit("warning", {"message": f"failed to update run_params mode: {exc}"})
 
+    return output_dir
+
+
+def _merge_segment_artifacts(
+    segment_output: Path,
+    combined_output: Path,
+    global_indices: list[int],
+    merged_poses: dict[int, object],
+    merged_confidence,
+) -> dict:
+    """Align and copy one R3 segment into the combined output namespace."""
+    import numpy as np
+
+    resolved = find_r3_output_dir(segment_output)
+    camera_files = sorted((resolved / "camera").glob("*.npz"))
+    local_poses: dict[int, np.ndarray] = {}
+    camera_by_local: dict[int, Path] = {}
+    for order, camera_file in enumerate(camera_files):
+        try:
+            stem_index = int(camera_file.stem)
+        except ValueError:
+            stem_index = order
+        local_index = stem_index if 0 <= stem_index < len(global_indices) else order
+        if local_index >= len(global_indices):
+            continue
+        camera = np.load(str(camera_file))
+        local_poses[local_index] = np.asarray(camera["pose"], dtype=np.float64)
+        camera_by_local[local_index] = camera_file
+
+    if not local_poses:
+        raise RuntimeError(f"No camera poses produced for segment {segment_output.name}")
+    aligned, scale, diagnostics = align_segment_poses(
+        local_poses,
+        global_indices,
+        merged_poses,
+    )
+
+    for name in ("camera", "depth", "conf", "color"):
+        (combined_output / name).mkdir(parents=True, exist_ok=True)
+
+    segment_confidence = None
+    confidence_path = resolved / "pose_conf.npy"
+    if confidence_path.exists():
+        try:
+            segment_confidence = np.asarray(np.load(str(confidence_path)), dtype=np.float64).reshape(-1)
+        except Exception:
+            segment_confidence = None
+
+    copied = 0
+    overlap = 0
+    for local_index, global_index in enumerate(global_indices):
+        camera_file = camera_by_local.get(local_index)
+        transformed_pose = aligned.get(global_index)
+        if camera_file is None or transformed_pose is None:
+            continue
+
+        if segment_confidence is not None and local_index < len(segment_confidence):
+            value = float(segment_confidence[local_index])
+            if np.isfinite(value):
+                current = merged_confidence[global_index]
+                merged_confidence[global_index] = value if not np.isfinite(current) else max(current, value)
+
+        if global_index in merged_poses:
+            overlap += 1
+            continue
+
+        camera = np.load(str(camera_file))
+        camera_payload = {key: camera[key] for key in camera.files}
+        camera_payload["pose"] = transformed_pose.astype(np.float32)
+        np.savez_compressed(
+            combined_output / "camera" / f"{global_index:06d}.npz",
+            **camera_payload,
+        )
+        merged_poses[global_index] = transformed_pose
+
+        local_stem = camera_file.stem
+        depth_path = resolved / "depth" / f"{local_stem}.npy"
+        if depth_path.exists():
+            depth = np.asarray(np.load(str(depth_path)), dtype=np.float32)
+            np.save(combined_output / "depth" / f"{global_index:06d}.npy", depth * float(scale))
+        conf_path = resolved / "conf" / f"{local_stem}.npy"
+        if conf_path.exists():
+            shutil.copy2(conf_path, combined_output / "conf" / f"{global_index:06d}.npy")
+        color_path = resolved / "color" / f"{local_stem}.png"
+        if color_path.exists():
+            shutil.copy2(color_path, combined_output / "color" / f"{global_index:06d}.png")
+        copied += 1
+
+    return {
+        **diagnostics,
+        "input_poses": len(local_poses),
+        "copied_new_poses": copied,
+        "overlap_poses": overlap,
+        "resolved_output": str(resolved),
+    }
+
+
+def run_r3_inference_segmented(
+    frames_dir: str,
+    output_dir: str,
+    ckpt_name: str,
+    mode: str,
+    size: int,
+    segment_frames: int,
+    overlap_frames: int,
+) -> str:
+    """Run overlapping R3 blocks and stitch their c2w products with Sim(3)."""
+    import numpy as np
+
+    source_frames = sorted(Path(frames_dir).glob("frame_*.jpg"))
+    windows = plan_segment_windows(len(source_frames), segment_frames, overlap_frames)
+    if len(windows) <= 1:
+        return run_r3_inference(frames_dir, output_dir, ckpt_name, mode, size, 0)
+
+    combined_output = Path(output_dir)
+    segments_root = combined_output / "segments"
+    segments_root.mkdir(parents=True, exist_ok=True)
+    merged_poses: dict[int, np.ndarray] = {}
+    merged_confidence = np.full(len(source_frames), np.nan, dtype=np.float64)
+    manifest: dict = {
+        "enabled": True,
+        "total_selected_frames": len(source_frames),
+        "segment_frames": segment_frames,
+        "overlap_frames": overlap_frames,
+        "segments": [],
+    }
+    first_run_params: dict = {}
+    keep_segments = (os.getenv("R3_KEEP_SEGMENT_OUTPUTS") or "false").lower() in {"1", "true", "yes", "on"}
+
+    for window in windows:
+        segment_dir = segments_root / f"segment_{window.index:03d}"
+        segment_frames_dir = segment_dir / "frames"
+        segment_output = segment_dir / "output"
+        if segment_dir.exists():
+            shutil.rmtree(segment_dir)
+        segment_frames_dir.mkdir(parents=True, exist_ok=True)
+        segment_output.mkdir(parents=True, exist_ok=True)
+
+        global_indices = list(range(window.start, window.end))
+        for local_index, global_index in enumerate(global_indices):
+            source = source_frames[global_index]
+            target = segment_frames_dir / f"frame_{local_index:06d}.jpg"
+            try:
+                target.symlink_to(source.resolve())
+            except OSError:
+                shutil.copy2(source, target)
+
+        cmd, resolved_mode, resolved_ckpt = _build_r3_infer_cmd(
+            str(segment_frames_dir),
+            str(segment_output),
+            ckpt_name,
+            mode,
+            size,
+            0,
+        )
+        emit("r3_segment_start", {
+            "segment": window.index + 1,
+            "segments_total": len(windows),
+            "selected_start": window.start,
+            "selected_end": window.end - 1,
+            "frames": window.frame_count,
+        })
+        started = time.time()
+        env = os.environ.copy()
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+            cwd=str(R3_DIR),
+            env=env,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"R³ segment {window.index + 1}/{len(windows)} failed: {detail[-6000:]}"
+            )
+
+        resolved_output = find_r3_output_dir(segment_output)
+        params_path = resolved_output / "run_params.json"
+        if not first_run_params and params_path.exists():
+            try:
+                first_run_params = json.loads(params_path.read_text())
+            except Exception:
+                first_run_params = {}
+        previously_merged = set(merged_poses)
+        stitch = _merge_segment_artifacts(
+            segment_output,
+            combined_output,
+            global_indices,
+            merged_poses,
+            merged_confidence,
+        )
+        new_global_indices = sorted(set(merged_poses) - previously_merged)
+        for batch_start in range(0, len(new_global_indices), 100):
+            batch_indices = new_global_indices[batch_start:batch_start + 100]
+            emit("frame_processed", {
+                "num_processed": len(merged_poses),
+                "num_total": len(source_frames),
+                "new_trajectory_points": [
+                    [float(value) for value in merged_poses[index][:3, 3]]
+                    for index in batch_indices
+                ],
+            })
+        item = {
+            "index": window.index,
+            "selected_start": window.start,
+            "selected_end": window.end - 1,
+            "frames": window.frame_count,
+            "inference_seconds": round(time.time() - started, 2),
+            "mode": resolved_mode,
+            "checkpoint": resolved_ckpt,
+            "stitch": stitch,
+        }
+        manifest["segments"].append(item)
+        emit("r3_segment_complete", item)
+
+        if not keep_segments:
+            shutil.rmtree(segment_dir, ignore_errors=True)
+
+    if np.isfinite(merged_confidence).any():
+        np.save(combined_output / "pose_conf.npy", merged_confidence.astype(np.float32))
+    manifest["merged_poses"] = len(merged_poses)
+    (combined_output / "segment_manifest.json").write_text(
+        json.dumps(sanitize_json(manifest), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    first_run_params.update({
+        "mode": mode,
+        "wrapper_requested_mode": mode,
+        "wrapper_resolved_ckpt": ckpt_name,
+        "segmented_long": True,
+        "segment_count": len(windows),
+        "segment_frames": segment_frames,
+        "segment_overlap_frames": overlap_frames,
+        "max_frames": segment_frames,
+        "inference_time_s": round(sum(item["inference_seconds"] for item in manifest["segments"]), 2),
+        "rel_pose_reconstruction_method": os.getenv("R3_REL_POSE_METHOD", "pgo"),
+    })
+    (combined_output / "run_params.json").write_text(
+        json.dumps(sanitize_json(first_run_params), indent=2),
+        encoding="utf-8",
+    )
+    emit("r3_segmented_complete", {
+        "segments": len(windows),
+        "merged_poses": len(merged_poses),
+    })
     return output_dir
 
 
@@ -630,6 +919,10 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "wrapper_mode": run_params.get("wrapper_mode"),
             "mode": run_params.get("mode"),
             "inference_time_s": run_params.get("inference_time_s"),
+            "segmented_long": run_params.get("segmented_long", False),
+            "segment_count": run_params.get("segment_count"),
+            "segment_frames": run_params.get("segment_frames"),
+            "segment_overlap_frames": run_params.get("segment_overlap_frames"),
         },
         "camera_poses": sanitize_json(poses),
         "num_poses_total": len(poses),
@@ -680,11 +973,47 @@ def main():
 
     emit("start", {"video": args.video_path, "live": args.live})
 
-    # Step 1: Extract frames
-    frames_dir, num_frames = extract_frames(args.video_path, args.output_dir, args.frame_stride, args.max_frames)
+    segmented_enabled = (
+        args.mode.lower() in {"long", "strided", "sampled", "sparse"}
+        and (os.getenv("R3_SEGMENTED_LONG") or "true").lower() in {"1", "true", "yes", "on"}
+    )
+    segment_min_duration = float(os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "600"))
+    long_target_fps = float(os.getenv("R3_LONG_TARGET_FPS", "5"))
+
+    # Step 1: Extract a dense-enough long-video sequence. max_frames remains
+    # the per-segment budget rather than thinning the entire recording.
+    frames_dir, num_frames = extract_frames(
+        args.video_path,
+        args.output_dir,
+        args.frame_stride,
+        args.max_frames,
+        segmented_long=segmented_enabled,
+        segment_min_duration=segment_min_duration,
+        long_target_fps=long_target_fps,
+    )
+    frame_selection = {}
+    selection_path = output_path / "frame_selection.json"
+    if selection_path.exists():
+        try:
+            frame_selection = json.loads(selection_path.read_text())
+        except Exception:
+            frame_selection = {}
+    segment_frames = max(256, int(os.getenv("R3_SEGMENT_FRAMES", str(args.max_frames or 1500))))
+    overlap_frames = max(16, int(os.getenv("R3_SEGMENT_OVERLAP_FRAMES", "90")))
+    use_segmented = bool(frame_selection.get("segmented_long") and num_frames > segment_frames)
 
     # Step 2: Run R³ inference (live or standard)
-    if args.live:
+    if use_segmented:
+        run_r3_inference_segmented(
+            frames_dir,
+            args.output_dir,
+            args.ckpt,
+            args.mode,
+            args.size,
+            segment_frames,
+            overlap_frames,
+        )
+    elif args.live:
         run_r3_inference_live(frames_dir, args.output_dir, camera_dir,
                               args.ckpt, args.mode, args.size, args.max_frames)
     else:
