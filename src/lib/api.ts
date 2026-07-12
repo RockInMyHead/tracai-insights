@@ -763,11 +763,34 @@ export class ApiClient {
     eventSource.addEventListener('replay', (event) => {
       try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'replay' }); } catch {}
     });
+    eventSource.addEventListener('pointcloud_status', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'pointcloud_status' }); } catch {}
+    });
 
     // Return unsubscribe function
     return () => {
       eventSource.close();
     };
+  }
+
+  /** Статус фонового построения production point cloud. */
+  async getR3PointCloudStatus(videoId: string): Promise<{
+    video_id: string;
+    status: "not_started" | "queued" | "processing" | "completed" | "error" | "cancelled";
+    stage: string;
+    progress: number;
+    message: string;
+    points?: number;
+    source_points?: number;
+    frames_used?: number;
+    elapsed_seconds?: number;
+    error?: string;
+  }> {
+    const resp = await agentFetch(`${this.baseUrl}/api/r3-pointcloud-status/${videoId}`);
+    if (!resp.ok) {
+      throw new Error(`Point cloud status fetch failed (HTTP ${resp.status})`);
+    }
+    return resp.json();
   }
 
   /** Получить полное облако точек R³ через отдельный API (не через SSE). */

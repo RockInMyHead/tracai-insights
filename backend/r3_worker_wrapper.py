@@ -13,6 +13,11 @@ Output:
 import os, sys, json, time, shutil, subprocess, tempfile, math, threading
 from pathlib import Path
 
+try:
+    from r3_pointcloud import build_sampled_pointcloud
+except ImportError:  # pragma: no cover - package-style startup
+    from backend.r3_pointcloud import build_sampled_pointcloud
+
 R3_DIR = Path("/home/artem/trackai/R3")
 CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
 
@@ -636,7 +641,12 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
     # Generate point cloud from depth maps
     if export_pointcloud and (r3_output / "depth").exists():
         try:
-            pcloud = backproject_depth_pointcloud(output_path)
+            cloud_result = build_sampled_pointcloud(
+                r3_output,
+                stride=max(1, int(os.getenv("R3_POINTCLOUD_STRIDE", "4"))),
+                max_points=max(1_000, int(os.getenv("R3_POINTCLOUD_MAX_POINTS", "200000"))),
+            )
+            pcloud = cloud_result.get("points") or []
             if pcloud and len(pcloud) > 0:
                 # Send only a small sample in the complete event (full cloud available via API)
                 sample = pcloud[:2000] if len(pcloud) > 2000 else pcloud
@@ -680,8 +690,16 @@ def main():
     else:
         run_r3_inference(frames_dir, args.output_dir, args.ckpt, args.mode, args.size, args.max_frames)
 
-    # Step 3: Final collect with point cloud
-    result = collect_results(args.output_dir, export_pointcloud=True)
+    # Step 3: Return trajectory immediately.  Production point-cloud export
+    # is scheduled by GPU Worker after this wrapper exits, so the user no
+    # longer waits for CPU back-projection and NPZ compression.
+    inline_pointcloud = (os.getenv("R3_INLINE_POINTCLOUD") or "false").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    result = collect_results(args.output_dir, export_pointcloud=inline_pointcloud)
+    result["pointcloud_deferred"] = bool(
+        not inline_pointcloud and (find_r3_output_dir(output_path) / "depth").exists()
+    )
     result["total_time_s"] = round(time.time() - start, 1)
     emit("complete", {"result": result})
 

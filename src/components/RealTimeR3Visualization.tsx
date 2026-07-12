@@ -60,6 +60,9 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
         } else if (data.event_type === "replay") {
           const numFiles = data.npz_files || 0;
           setStatusMessage(`Загрузка готовых результатов R³ (${numFiles} точек)...`);
+        } else if (data.event_type === "pointcloud_status") {
+          const progress = typeof data.progress === "number" ? ` (${data.progress}%)` : "";
+          setStatusMessage(`${String(data.message || "Строится 3D-облако")}${progress}`);
         }
       },
       onVideoInfo: (data) => {

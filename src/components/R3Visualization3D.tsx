@@ -493,6 +493,8 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [isRefetchingCloud, setIsRefetchingCloud] = useState(false);
   const [cloudFetchError, setCloudFetchError] = useState<string | null>(null);
+  const [cloudBuildStatus, setCloudBuildStatus] = useState<{ progress: number; message: string } | null>(null);
+  const [cloudRetryToken, setCloudRetryToken] = useState(0);
   const [showTrajectory, setShowTrajectory] = useState(true);
   const [showCameras, setShowCameras] = useState(false);
   const [showGrid, setShowGrid] = useState(true);
@@ -520,6 +522,8 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
 
   useEffect(() => {
     setR3FrameCount(0);
+    setCloudBuildStatus(null);
+    setCloudRetryToken(0);
   }, [videoId]);
 
   useEffect(() => {
@@ -530,6 +534,7 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
   useEffect(() => {
     if (!videoId || points.length < 2) return;
     const controller = new AbortController();
+    let retryTimeout: number | null = null;
     const timeout = window.setTimeout(() => {
       setIsRefetchingCloud(true);
       setCloudFetchError(null);
@@ -547,6 +552,7 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
           ? resp.points.filter(p => Array.isArray(p) && p.length >= 3)
           : [];
         if (resp.success && valid.length >= 50) {
+          setCloudBuildStatus(null);
           setFilteredPointCloud(valid);
           // Keep the Three.js scene in raw R3 world coordinates.  The map API
           // returns its floor-plane path separately as `plan_trajectory`.
@@ -558,10 +564,26 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
           setFilteredStats(resp.stats ?? null);
           setFilteredDiagnostics(resp.diagnostics ?? null);
         }
-      }).catch((err) => {
+      }).catch(async (err) => {
         if (controller.signal.aborted) return;
-        console.warn("Failed to fetch filtered R3 point cloud:", err);
-        setCloudFetchError(err instanceof Error ? err.message : String(err));
+        try {
+          const status = await apiClient.getR3PointCloudStatus(videoId);
+          if (controller.signal.aborted) return;
+          if (["not_started", "queued", "processing"].includes(status.status)) {
+            setCloudFetchError(null);
+            setCloudBuildStatus({
+              progress: typeof status.progress === "number" ? status.progress : 0,
+              message: status.message || "Строится 3D-облако",
+            });
+            retryTimeout = window.setTimeout(() => setCloudRetryToken(value => value + 1), 2000);
+            return;
+          }
+          setCloudBuildStatus(null);
+          setCloudFetchError(status.error || status.message || (err instanceof Error ? err.message : String(err)));
+        } catch {
+          console.warn("Failed to fetch filtered R3 point cloud:", err);
+          setCloudFetchError(err instanceof Error ? err.message : String(err));
+        }
       }).finally(() => {
         if (!controller.signal.aborted) setIsRefetchingCloud(false);
       });
@@ -570,8 +592,9 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
     return () => {
       controller.abort();
       window.clearTimeout(timeout);
+      if (retryTimeout !== null) window.clearTimeout(retryTimeout);
     };
-  }, [videoId, points.length, maxRenderPoints, minConfidence, frameStart, frameEnd, samplingStrategy, r3FrameMax]);
+  }, [videoId, points.length, maxRenderPoints, minConfidence, frameStart, frameEnd, samplingStrategy, r3FrameMax, cloudRetryToken]);
 
   useEffect(() => {
     if (!showDebug || !videoId) return;
@@ -1377,7 +1400,9 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
       ].join(" ")}>
         {hasRealCloud
           ? `${hasRgbCloud ? "✓ REAL R³ RGB filtered point cloud" : "✓ REAL R³ filtered depth point cloud"}${isRefetchingCloud ? " • loading..." : ""} • Drag to rotate • Scroll to zoom`
-          : `Drag to rotate • Scroll to zoom • Right-click to pan${cloudFetchError ? " • pointcloud fetch error" : ""}`}
+          : cloudBuildStatus
+            ? `${cloudBuildStatus.message} (${cloudBuildStatus.progress}%) • Траектория уже готова`
+            : `Drag to rotate • Scroll to zoom • Right-click to pan${cloudFetchError ? " • pointcloud fetch error" : ""}`}
       </div>
     </div>
   );
