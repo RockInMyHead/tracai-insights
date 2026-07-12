@@ -25,6 +25,11 @@ try:
 except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_trajectory import build_r3_trajectory
 
+try:
+    from r3_pointcloud import PointCloudBuildCancelled, build_sampled_pointcloud
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_pointcloud import PointCloudBuildCancelled, build_sampled_pointcloud
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("gpu_worker")
 
@@ -556,6 +561,159 @@ R3_OUTPUT_DIR = WORK_DIR / "r3_output"
 
 CONF_THRESHOLDS = [0.5, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
 
+_r3_pointcloud_lock = threading.Lock()
+_r3_pointcloud_jobs: Dict[str, threading.Event] = {}
+_r3_pointcloud_statuses: Dict[str, dict] = {}
+
+
+def _r3_pointcloud_status_path(output_dir: Path) -> Path:
+    return output_dir / "pointcloud_status.json"
+
+
+def _set_r3_pointcloud_status(video_id: str, output_dir: Path, **updates: Any) -> dict:
+    with _r3_pointcloud_lock:
+        current = dict(_r3_pointcloud_statuses.get(video_id, {}))
+        current.update({
+            "video_id": video_id,
+            "updated_at": time.time(),
+            **updates,
+        })
+        _r3_pointcloud_statuses[video_id] = current
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        status_path = _r3_pointcloud_status_path(output_dir)
+        temp_path = status_path.with_suffix(".json.tmp")
+        temp_path.write_text(json.dumps(_to_json_serializable(current), indent=2), encoding="utf-8")
+        os.replace(temp_path, status_path)
+    except Exception:
+        pass
+    return current
+
+
+def _get_r3_pointcloud_status(video_id: str, output_dir: Path) -> dict:
+    with _r3_pointcloud_lock:
+        current = _r3_pointcloud_statuses.get(video_id)
+        if current:
+            return dict(current)
+    status_path = _r3_pointcloud_status_path(output_dir)
+    if status_path.exists():
+        try:
+            return json.loads(status_path.read_text())
+        except Exception:
+            pass
+    pointcloud_path = output_dir / "pointcloud.npz"
+    if pointcloud_path.exists():
+        return {
+            "video_id": video_id,
+            "status": "completed",
+            "stage": "ready",
+            "progress": 100,
+            "message": "3D-облако готово",
+        }
+    return {
+        "video_id": video_id,
+        "status": "not_started",
+        "stage": "waiting",
+        "progress": 0,
+        "message": "3D-облако ещё не запущено",
+    }
+
+
+def _cancel_r3_pointcloud_job(video_id: str) -> None:
+    with _r3_pointcloud_lock:
+        cancel_event = _r3_pointcloud_jobs.get(video_id)
+    if cancel_event is not None:
+        cancel_event.set()
+
+
+def _schedule_r3_pointcloud_build(video_id: str, output_dir: Path) -> dict:
+    """Start memory-bounded point-cloud export without blocking trajectory."""
+    pointcloud_path = output_dir / "pointcloud.npz"
+    if pointcloud_path.exists():
+        return _set_r3_pointcloud_status(
+            video_id,
+            output_dir,
+            status="completed",
+            stage="ready",
+            progress=100,
+            message="3D-облако готово",
+        )
+
+    with _r3_pointcloud_lock:
+        existing = _r3_pointcloud_jobs.get(video_id)
+        if existing is not None and not existing.is_set():
+            return dict(_r3_pointcloud_statuses.get(video_id, {}))
+        cancel_event = threading.Event()
+        _r3_pointcloud_jobs[video_id] = cancel_event
+
+    queued = _set_r3_pointcloud_status(
+        video_id,
+        output_dir,
+        status="queued",
+        stage="queued",
+        progress=0,
+        message="Траектория готова; 3D-облако поставлено в фоновую очередь",
+    )
+
+    def run() -> None:
+        try:
+            def on_progress(payload: dict[str, Any]) -> None:
+                _set_r3_pointcloud_status(video_id, output_dir, **payload)
+
+            result = build_sampled_pointcloud(
+                output_dir,
+                stride=max(1, int(os.getenv("R3_POINTCLOUD_STRIDE", "4"))),
+                max_points=max(1_000, int(os.getenv("R3_POINTCLOUD_MAX_POINTS", "200000"))),
+                min_conf=float(os.getenv("R3_POINTCLOUD_MIN_CONF", "1.0")),
+                progress_callback=on_progress,
+                should_cancel=cancel_event.is_set,
+                return_points=False,
+            )
+            _set_r3_pointcloud_status(
+                video_id,
+                output_dir,
+                status="completed",
+                stage="ready",
+                progress=100,
+                message=f"3D-облако готово: {result['num_points']:,} точек",
+                points=result["num_points"],
+                source_points=result["source_points"],
+                frames_used=result["frames_used"],
+                elapsed_seconds=result["elapsed_seconds"],
+                full_debug_saved=result["full_debug_saved"],
+            )
+        except PointCloudBuildCancelled:
+            _set_r3_pointcloud_status(
+                video_id,
+                output_dir,
+                status="cancelled",
+                stage="cancelled",
+                progress=0,
+                message="Построение 3D-облака отменено новым запуском",
+            )
+        except Exception as exc:
+            logger.error(f"[{video_id}] Background R3 point cloud failed: {exc}", exc_info=True)
+            _set_r3_pointcloud_status(
+                video_id,
+                output_dir,
+                status="error",
+                stage="error",
+                progress=0,
+                message=f"Ошибка построения 3D-облака: {exc}",
+                error=str(exc),
+            )
+        finally:
+            with _r3_pointcloud_lock:
+                if _r3_pointcloud_jobs.get(video_id) is cancel_event:
+                    _r3_pointcloud_jobs.pop(video_id, None)
+
+    threading.Thread(
+        target=run,
+        name=f"r3-pointcloud-{video_id[:12]}",
+        daemon=True,
+    ).start()
+    return queued
+
 
 def _sanitize_for_json(obj):
     """Recursively convert NaN/Inf to None for JSON serialization."""
@@ -617,7 +775,7 @@ def _sample_points(points, max_points: int, strategy: str = "random"):
         if points.ndim != 2 or points.shape[1] <= 7:
             raise HTTPException(
                 status_code=409,
-                detail="per_frame_uniform requires pointcloud_full_debug.npz with frame_idx",
+                detail="per_frame_uniform requires a point cloud with frame_idx",
             )
         frames = points[:, 7]
         valid_frames = frames[np.isfinite(frames)]
@@ -682,7 +840,7 @@ def _filter_r3_points(
         if points.shape[1] <= 7:
             raise HTTPException(
                 status_code=409,
-                detail="Frame filtering requires pointcloud_full_debug.npz with frame_idx; regenerate R³ point cloud",
+                detail="Frame filtering requires a point cloud with frame_idx; regenerate R³ point cloud",
             )
         frames = points[:, 7]
         mask = mask & np.isfinite(frames)
@@ -1356,6 +1514,9 @@ async def r3_process_video(
         if not final_result:
             raise Exception("No R³ result found in output")
 
+        final_result["pointcloud_status"] = _schedule_r3_pointcloud_build(
+            video_id, video_output_dir,
+        )
         elapsed = time.time() - start_ts
         logger.info(f"[{video_id}] R³ completed in {elapsed:.1f}s, {final_result.get('num_frames', 0)} frames")
 
@@ -1479,6 +1640,9 @@ async def r3_process_video_raw(
         if not final_result:
             raise Exception("No R³ result found in output")
 
+        final_result["pointcloud_status"] = _schedule_r3_pointcloud_build(
+            video_id, video_output_dir,
+        )
         elapsed = time.time() - start_ts
         logger.info(f"[{video_id}] R³ completed in {elapsed:.1f}s, {final_result.get('num_frames', 0)} frames")
 
@@ -1530,6 +1694,7 @@ def _r3_clear_busy(video_id: str) -> None:
 
 def _reset_r3_output_dir(output_dir: Path) -> None:
     """Remove stale R³ artifacts before a fresh inference for the same video_id."""
+    _cancel_r3_pointcloud_job(output_dir.name)
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1730,20 +1895,9 @@ async def r3_process_stream(
                     except Exception as e:
                         logger.warning(f"[{video_id}] Failed to load pointcloud.npz: {e}")
                 elif depth_dir.exists() and list(depth_dir.glob("*.npy")):
-                    # Generate point cloud from depth files on-the-fly
-                    try:
-                        yield f"event: pointcloud_status\ndata: {json.dumps({'status': 'generating from depth'})}\n\n"
-                        pc_points = _backproject_depth_pointcloud(
-                            video_output_dir, stride=4, max_points=80000,
-                        )
-                        if pc_points and len(pc_points) > 0:
-                            # Only send a tiny sample in SSE
-                            sample = pc_points[:2000] if len(pc_points) > 2000 else pc_points
-                            complete_payload["pointcloud_sample"] = sample
-                            complete_payload["pointcloud_count"] = len(pc_points)
-                            logger.info(f"[{video_id}] Generated pointcloud from depth ({len(pc_points)} pts, sending 2000 sample in SSE)")
-                    except Exception as e:
-                        logger.warning(f"[{video_id}] Failed to generate pointcloud: {e}")
+                    cloud_status = _schedule_r3_pointcloud_build(video_id, video_output_dir)
+                    complete_payload["pointcloud_status"] = cloud_status
+                    yield f"event: pointcloud_status\ndata: {json.dumps(_sanitize_for_json(cloud_status))}\n\n"
 
                 yield "event: complete\ndata: " + json.dumps(complete_payload) + "\n\n"
                 # Keepalive — не закрываем соединение
@@ -1825,6 +1979,8 @@ async def r3_process_stream(
                         final_result = _sanitize_for_json(final_result)
                         elapsed = time.time() - start_ts
                         final_result["total_time_s"] = round(elapsed, 1)
+                        cloud_status = _schedule_r3_pointcloud_build(video_id, video_output_dir)
+                        final_result["pointcloud_status"] = cloud_status
                         # Strip full point cloud from SSE (too large) and keep only a tiny sample
                         pc_full = final_result.pop("pointcloud", None)
                         if pc_full and isinstance(pc_full, list) and len(pc_full) > 0:
@@ -1898,6 +2054,18 @@ async def r3_process_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.get("/api/r3-pointcloud-status/{video_id}")
+async def r3_get_pointcloud_status(video_id: str):
+    """Return background point-cloud build stage and real progress."""
+    output_dir = _r3_output_dir(video_id)
+    if not output_dir.exists():
+        raise HTTPException(status_code=404, detail=f"No R³ output for {video_id}")
+    status = _get_r3_pointcloud_status(video_id, output_dir)
+    if status.get("status") == "not_started" and (output_dir / "depth").exists():
+        status = _schedule_r3_pointcloud_build(video_id, output_dir)
+    return _sanitize_for_json(status)
 
 
 @app.get("/api/r3-pointcloud/{video_id}")
