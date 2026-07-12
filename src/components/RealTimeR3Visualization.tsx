@@ -63,6 +63,16 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
         } else if (data.event_type === "pointcloud_status") {
           const progress = typeof data.progress === "number" ? ` (${data.progress}%)` : "";
           setStatusMessage(`${String(data.message || "Строится 3D-облако")}${progress}`);
+        } else if (data.event_type === "r3_segment_start") {
+          setStatusMessage(
+            `Длинное видео: R³ блок ${String(data.segment || "?")}/${String(data.segments_total || "?")}...`
+          );
+        } else if (data.event_type === "r3_segment_complete") {
+          setStatusMessage(
+            `Готов блок ${String(data.index !== undefined ? Number(data.index) + 1 : "?")} — сшиваю траекторию...`
+          );
+        } else if (data.event_type === "r3_segmented_complete") {
+          setStatusMessage(`Все ${String(data.segments || "")} блоки объединены`);
         }
       },
       onVideoInfo: (data) => {
