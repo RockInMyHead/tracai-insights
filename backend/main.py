@@ -1036,6 +1036,7 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
         "r3_raw_camera_points": trajectory_bundle["raw_camera_points"],
         "r3_source_frame_indices": trajectory_bundle["source_frame_indices"],
         "r3_pose_confidence": confidence or None,
+        "pointcloud_status": r3_result.get("pointcloud_status"),
         "r3_projection": trajectory_bundle["trajectory_quality"].get("projection", {}).get("method", "robust_floor_plane"),
         "processing_stats": {
             "estimated_distance": round(estimated_distance, 2),
@@ -3691,6 +3692,24 @@ async def r3_stream_proxy(video_id: str, request: Request):
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+@app.get("/api/r3-pointcloud-status/{video_id}")
+async def r3_pointcloud_status_proxy(video_id: str):
+    """Proxy background point-cloud progress from GPU Worker."""
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-pointcloud-status/{video_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(gpu_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                text = await resp.text()
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    payload = {"detail": "GPU Worker returned invalid point-cloud status JSON"}
+                return JSONResponse(payload, status_code=resp.status)
+    except Exception as exc:
+        logger.error(f"[{video_id}] R³ pointcloud status proxy error: {exc}", exc_info=True)
+        return JSONResponse({"detail": str(exc)}, status_code=502)
 
 
 @app.get("/api/r3-pointcloud/{video_id}")
