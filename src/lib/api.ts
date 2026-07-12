@@ -766,6 +766,15 @@ export class ApiClient {
     eventSource.addEventListener('pointcloud_status', (event) => {
       try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'pointcloud_status' }); } catch {}
     });
+    eventSource.addEventListener('r3_segment_start', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segment_start' }); } catch {}
+    });
+    eventSource.addEventListener('r3_segment_complete', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segment_complete' }); } catch {}
+    });
+    eventSource.addEventListener('r3_segmented_complete', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segmented_complete' }); } catch {}
+    });
 
     // Return unsubscribe function
     return () => {
