@@ -89,7 +89,7 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(len(result["turn_points"]), 1)
         turn = result["turn_points"][0]
         self.assertAlmostEqual(abs(turn["angle_degrees"]), 90.0, delta=2.0)
-        self.assertEqual(turn["angle_source"], "trajectory_multiscale")
+        self.assertEqual(turn["angle_source"], "trajectory_curvature")
         self.assertGreater(turn["span_points"], 20)
 
     def test_camera_heading_corrects_underestimated_position_turn(self) -> None:
@@ -136,6 +136,58 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(result["turn_points"], [])
         orientation = result["trajectory_quality"]["turn_detection"]["camera_orientation"]
         self.assertFalse(orientation["reliable"])
+
+    def test_separates_repeated_turns_and_repairs_underestimated_loop(self) -> None:
+        # This reproduces the field regression: the reconstructed translation
+        # bends only 20 degrees at each physical 90-degree corner.  The old
+        # largest-span candidate merged all four same-sign turns into one and
+        # globally disabled the otherwise correct camera-yaw signal.
+        poses = []
+        x = 0.0
+        z = 0.0
+        trajectory_heading = 0.0
+        for side in range(4):
+            camera_heading = side * math.pi / 2.0
+            for _ in range(25):
+                x += math.cos(trajectory_heading)
+                z += math.sin(trajectory_heading)
+                poses.append(make_pose(
+                    len(poses),
+                    x,
+                    0.0,
+                    z,
+                    rotation_for_forward(math.cos(camera_heading), 0.0, math.sin(camera_heading)),
+                ))
+            for index in range(1, 21):
+                position_yaw = trajectory_heading + math.radians(20.0) * index / 20.0
+                camera_yaw = camera_heading + math.pi / 2.0 * index / 20.0
+                x += math.cos(position_yaw)
+                z += math.sin(position_yaw)
+                poses.append(make_pose(
+                    len(poses),
+                    x,
+                    0.0,
+                    z,
+                    rotation_for_forward(math.cos(camera_yaw), 0.0, math.sin(camera_yaw)),
+                ))
+            trajectory_heading += math.radians(20.0)
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+
+        self.assertEqual(len(result["turn_points"]), 4)
+        for turn in result["turn_points"]:
+            self.assertEqual(turn["angle_source"], "camera_orientation")
+            self.assertAlmostEqual(abs(turn["trajectory_angle_degrees"]), 20.0, delta=2.0)
+            self.assertAlmostEqual(abs(turn["angle_degrees"]), 90.0, delta=2.0)
+
+        raw_plan = np.asarray(result["raw_plan_trajectory"], dtype=np.float64)
+        corrected_plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
+        raw_closure_error = float(np.linalg.norm(raw_plan[-1, :2] - raw_plan[0, :2]))
+        corrected_closure_error = float(np.linalg.norm(corrected_plan[-1, :2] - corrected_plan[0, :2]))
+        self.assertGreater(raw_closure_error, 100.0)
+        self.assertLess(corrected_closure_error, 12.0)
+        correction = result["trajectory_quality"]["heading_correction"]
+        self.assertEqual(correction["applied_count"], 4)
 
 
 if __name__ == "__main__":

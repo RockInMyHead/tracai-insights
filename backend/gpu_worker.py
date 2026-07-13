@@ -1707,15 +1707,28 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
         return False
     try:
         params = json.loads(params_path.read_text())
+        selection_path = output_dir / "frame_selection.json"
+        if not selection_path.exists():
+            # Older runs may only cover the first minutes of long AVI files.
+            return False
+        selection = json.loads(selection_path.read_text())
+
         saved_ckpt = str(params.get("ckpt") or "")
         saved_mode = str(params.get("mode") or "").lower()
-        mode_l = str(mode or "").lower()
-        expected_pose_method = (os.getenv("R3_REL_POSE_METHOD") or (
-            "pgo" if mode_l in {"long", "strided"} else "greedy"
-        )).strip().lower()
+        requested_mode = str(mode or "").lower()
+        mode_l = "long" if selection.get("continuous_long") else requested_mode
+        release_preset = (os.getenv("R3_USE_RELEASE_PRESET") or "true").lower() in {
+            "1", "true", "yes", "on",
+        }
+        expected_pose_method = (
+            "greedy"
+            if release_preset
+            else (os.getenv("R3_REL_POSE_METHOD") or "greedy").strip().lower()
+        )
         saved_pose_method = str(params.get("rel_pose_reconstruction_method") or "greedy").lower()
+        expected_max_frames = 0 if selection.get("long_video_sampling") else int(max_frames)
         basic_match = (
-            int(params.get("max_frames") or 0) == int(max_frames)
+            int(params.get("max_frames") or 0) == expected_max_frames
             and saved_ckpt.endswith(str(ckpt))
             and saved_mode == mode_l
             and saved_pose_method == expected_pose_method
@@ -1723,12 +1736,6 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
         if not basic_match:
             return False
 
-        selection_path = output_dir / "frame_selection.json"
-        if not selection_path.exists():
-            # Older runs may only cover the first minutes of long AVI files.
-            return False
-
-        selection = json.loads(selection_path.read_text())
         total_frames = int(selection.get("total_frames") or 0)
         source_frame_max = selection.get("source_frame_max")
         saved_frames = int(selection.get("saved_frames") or 0)
@@ -2129,6 +2136,7 @@ async def r3_get_pointcloud_filtered(
         # c2w translations are intentionally returned separately so a map can
         # never accidentally treat R3's vertical axis as its Y coordinate.
         trajectory = []
+        raw_plan_trajectory = []
         raw_trajectory_3d = []
         turn_points = []
         source_frame_indices = []
@@ -2145,11 +2153,12 @@ async def r3_get_pointcloud_filtered(
         run_mode = str(run_params.get("mode") or "").lower()
         # Missing mode means the output was produced by an older wrapper that
         # cannot be trusted for the new strided+fallback+metric R3 preset.
-        stale_run = run_mode != "strided"
+        stale_run = run_mode not in {"long", "strided"}
         if include_trajectory or include_cameras:
             trajectory_bundle, loaded_cameras = _load_r3_trajectory_bundle(base)
             if include_trajectory:
                 trajectory = trajectory_bundle["plan_trajectory"]
+                raw_plan_trajectory = trajectory_bundle.get("raw_plan_trajectory", trajectory)
                 raw_trajectory_3d = trajectory_bundle["raw_trajectory_3d"]
                 turn_points = trajectory_bundle["turn_points"]
                 source_frame_indices = trajectory_bundle["source_frame_indices"]
@@ -2163,6 +2172,7 @@ async def r3_get_pointcloud_filtered(
             "points": sampled[:, :8].tolist() if sampled.ndim == 2 and sampled.shape[1] > 7 else sampled[:, :7].tolist(),
             "trajectory": trajectory,
             "plan_trajectory": trajectory,
+            "raw_plan_trajectory": raw_plan_trajectory,
             "raw_trajectory_3d": raw_trajectory_3d,
             "turn_points": turn_points,
             "source_frame_indices": source_frame_indices,
