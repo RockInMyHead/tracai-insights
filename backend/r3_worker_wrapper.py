@@ -56,6 +56,7 @@ def extract_frames(
     output_dir: str,
     frame_stride: int = 5,
     max_frames: int = 0,
+    continuous_long: bool = False,
     segmented_long: bool = False,
     segment_min_duration: float = 600.0,
     long_target_fps: float = 5.0,
@@ -89,14 +90,21 @@ def extract_frames(
 
     requested_frame_stride = max(1, int(frame_stride or 1))
     requested_max_frames = max(0, int(max_frames or 0))
-    segmented_selection = bool(segmented_long and duration >= max(60.0, segment_min_duration))
-    if segmented_selection and fps > 0 and long_target_fps > 0:
+    long_video_selection = bool(
+        (continuous_long or segmented_long)
+        and duration >= max(60.0, segment_min_duration)
+    )
+    segmented_selection = bool(segmented_long and long_video_selection)
+    continuous_selection = bool(continuous_long and long_video_selection and not segmented_selection)
+    if long_video_selection and fps > 0 and long_target_fps > 0:
         frame_stride = max(requested_frame_stride, int(round(fps / long_target_fps)))
     else:
         frame_stride = requested_frame_stride
-    # The max_frames limit becomes a per-segment GPU budget for long videos.
-    # Short videos keep the existing uniform full-video cap.
-    max_frames = 0 if segmented_selection else requested_max_frames
+    # R3's native long mode has bounded memory and needs one continuous frame
+    # stream to retain its keyframe bank and reconnect loops.  Keep max_frames
+    # only for short videos; otherwise it silently lowers effective FPS as the
+    # video becomes longer.
+    max_frames = 0 if long_video_selection else requested_max_frames
 
     candidate_indices = list(range(0, total_frames, frame_stride)) if total_frames > 0 else []
     if max_frames > 0 and len(candidate_indices) > max_frames:
@@ -115,8 +123,10 @@ def extract_frames(
         "requested_frame_stride": requested_frame_stride,
         "max_frames": max_frames,
         "requested_max_frames": requested_max_frames,
+        "long_video_sampling": long_video_selection,
+        "continuous_long": continuous_selection,
         "segmented_long": segmented_selection,
-        "long_target_fps": long_target_fps if segmented_selection else None,
+        "long_target_fps": long_target_fps if long_video_selection else None,
         "candidate_frames": len(candidate_indices),
         "selected_frames": len(selected_indices),
         "sampling_mode": sampling_mode,
@@ -166,8 +176,10 @@ def extract_frames(
         "requested_frame_stride": requested_frame_stride,
         "max_frames": max_frames,
         "requested_max_frames": requested_max_frames,
+        "long_video_sampling": long_video_selection,
+        "continuous_long": continuous_selection,
         "segmented_long": segmented_selection,
-        "long_target_fps": long_target_fps if segmented_selection else None,
+        "long_target_fps": long_target_fps if long_video_selection else None,
         "candidate_frames": len(candidate_indices),
         "selected_frames_requested": len(selected_list),
         "saved_frames": saved_count,
@@ -222,13 +234,30 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
             value = float(default)
         return str(int(value)) if value.is_integer() else str(value)
 
-    # Greedy is useful for a fast preview.  The completed long-video path now
-    # defaults to R3's global PGO reconstruction; it can be rolled back per
-    # worker with R3_REL_POSE_METHOD=greedy.
-    pose_method = env_choice(
-        "R3_REL_POSE_METHOD",
-        "pgo" if mode in {"long", "strided"} else "greedy",
-        {"greedy", "pgo"},
+    # Match the official R3 release presets by default.  Greedy reconstruction
+    # plus disabled fallback-segment PGO is deliberate upstream behaviour;
+    # forcing both PGO layers made physical corners much smoother and added a
+    # long post-inference optimization phase on CPU.
+    release_preset = env_enabled("R3_USE_RELEASE_PRESET", True)
+    pose_method = (
+        "greedy"
+        if release_preset
+        else env_choice("R3_REL_POSE_METHOD", "greedy", {"greedy", "pgo"})
+    )
+    keyframe_novelty = (
+        "0.985"
+        if release_preset
+        else env_number("R3_KEYFRAME_NOVELTY_THRESHOLD", "0.985", 0.0)
+    )
+    keyframe_interval = (
+        "30"
+        if release_preset
+        else env_number("R3_KEYFRAME_MAX_INTERVAL", "30", 1.0)
+    )
+    keyframe_count = (
+        "100"
+        if release_preset
+        else env_number("R3_KEYFRAME_MAX_KEYFRAMES", "100", 16.0)
     )
     ckpt_path = str(R3_DIR / "ckpt" / ckpt_name)
 
@@ -243,13 +272,9 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         "--online_kv_backend", "dense",
         "--online_kv_cache_mode", kv_cache_mode,
         "--keyframe_mode", "novelty",
-        "--keyframe_novelty_threshold", env_number("R3_KEYFRAME_NOVELTY_THRESHOLD", "0.985", 0.0),
-        "--keyframe_max_interval", env_number(
-            "R3_KEYFRAME_MAX_INTERVAL", "15" if mode in {"long", "strided"} else "30", 1.0,
-        ),
-        "--keyframe_max_keyframes", env_number(
-            "R3_KEYFRAME_MAX_KEYFRAMES", "160" if mode in {"long", "strided"} else "100", 16.0,
-        ),
+        "--keyframe_novelty_threshold", keyframe_novelty,
+        "--keyframe_max_interval", keyframe_interval,
+        "--keyframe_max_keyframes", keyframe_count,
         "--rel_pose_reconstruction_method", pose_method,
     ]
 
@@ -269,9 +294,10 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
             "--max_segment_frames", max_segment_frames,
             "--fallback_replay_attention", "full",
         ]
-        # Long segments now use their own PGO by default. It remains possible
-        # to disable this on a constrained worker without changing code.
-        if env_enabled("R3_DISABLE_SEGMENT_PGO", False):
+        # The official demo explicitly disables fallback-segment PGO.  The
+        # new opt-in variable also neutralizes stale deployments that still
+        # contain R3_DISABLE_SEGMENT_PGO=false from the regressed version.
+        if release_preset or not env_enabled("R3_ENABLE_SEGMENT_PGO", False):
             cmd.append("--disable_segment_pgo")
 
     # DA3 metric model is cached on the 3090 host; keep an env kill-switch for
@@ -973,20 +999,37 @@ def main():
 
     emit("start", {"video": args.video_path, "live": args.live})
 
-    segmented_enabled = (
-        args.mode.lower() in {"long", "strided", "sampled", "sparse"}
-        and (os.getenv("R3_SEGMENTED_LONG") or "true").lower() in {"1", "true", "yes", "on"}
+    long_mode = args.mode.lower() in {"long", "strided", "sampled", "sparse"}
+    # R3 is already a bounded-memory long/streaming model.  External
+    # independent segmentation loses the global keyframe bank and loop
+    # re-registration, so it is now an explicit experimental opt-in.  The new
+    # variable intentionally ignores stale R3_SEGMENTED_LONG=true values.
+    segmented_enabled = bool(
+        long_mode
+        and (os.getenv("R3_ENABLE_EXTERNAL_SEGMENTATION") or "false").lower()
+        in {"1", "true", "yes", "on"}
     )
-    segment_min_duration = float(os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "600"))
+    continuous_long_enabled = bool(
+        long_mode
+        and (os.getenv("R3_CONTINUOUS_LONG") or "true").lower()
+        in {"1", "true", "yes", "on"}
+    )
+    segment_min_duration = float(
+        os.getenv(
+            "R3_LONG_MIN_DURATION_SECONDS",
+            os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "600"),
+        )
+    )
     long_target_fps = float(os.getenv("R3_LONG_TARGET_FPS", "5"))
 
-    # Step 1: Extract a dense-enough long-video sequence. max_frames remains
-    # the per-segment budget rather than thinning the entire recording.
+    # Step 1: preserve a dense-enough sequence across the whole route. Native
+    # long mode receives every selected frame in one process.
     frames_dir, num_frames = extract_frames(
         args.video_path,
         args.output_dir,
         args.frame_stride,
         args.max_frames,
+        continuous_long=continuous_long_enabled,
         segmented_long=segmented_enabled,
         segment_min_duration=segment_min_duration,
         long_target_fps=long_target_fps,
@@ -1001,6 +1044,8 @@ def main():
     segment_frames = max(256, int(os.getenv("R3_SEGMENT_FRAMES", str(args.max_frames or 1500))))
     overlap_frames = max(16, int(os.getenv("R3_SEGMENT_OVERLAP_FRAMES", "90")))
     use_segmented = bool(frame_selection.get("segmented_long") and num_frames > segment_frames)
+    inference_max_frames = 0 if frame_selection.get("long_video_sampling") else args.max_frames
+    inference_mode = "long" if frame_selection.get("continuous_long") else args.mode
 
     # Step 2: Run R³ inference (live or standard)
     if use_segmented:
@@ -1015,9 +1060,16 @@ def main():
         )
     elif args.live:
         run_r3_inference_live(frames_dir, args.output_dir, camera_dir,
-                              args.ckpt, args.mode, args.size, args.max_frames)
+                              args.ckpt, inference_mode, args.size, inference_max_frames)
     else:
-        run_r3_inference(frames_dir, args.output_dir, args.ckpt, args.mode, args.size, args.max_frames)
+        run_r3_inference(
+            frames_dir,
+            args.output_dir,
+            args.ckpt,
+            inference_mode,
+            args.size,
+            inference_max_frames,
+        )
 
     # Step 3: Return trajectory immediately.  Production point-cloud export
     # is scheduled by GPU Worker after this wrapper exits, so the user no
