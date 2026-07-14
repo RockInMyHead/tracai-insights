@@ -23,6 +23,11 @@ try:
 except ImportError:  # pragma: no cover - package-style startup
     from backend.r3_long_video import align_segment_poses, plan_segment_windows
 
+try:
+    from r3_trajectory import summarize_fallback_edges
+except ImportError:  # pragma: no cover - package-style startup
+    from backend.r3_trajectory import summarize_fallback_edges
+
 R3_DIR = Path("/home/artem/trackai/R3")
 CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
 
@@ -282,12 +287,24 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
     # re-anchoring. Without it, long indoor videos often produce pose teleports.
     if mode in {"long", "strided"} and env_enabled("R3_ENABLE_FALLBACK", True):
         max_segment_frames = "300" if mode == "long" else "100"
+        bridge_baseline_ratio = (
+            "0.35"
+            if release_preset
+            else env_number("R3_FALLBACK_MIN_BRIDGE_BASELINE_RATIO", "0.35", 0.0)
+        )
+        bridge_lookback = (
+            "40"
+            if release_preset
+            else env_number("R3_FALLBACK_MAX_BRIDGE_LOOKBACK", "40", 10.0)
+        )
         cmd += [
             "--online_fallback_enabled",
             "--fallback_drought_length", "3",
             "--fallback_drought_threshold", "0",
             "--fallback_drought_threshold_pct", "45.0",
             "--fallback_num_bridge_frames", "10",
+            "--fallback_min_bridge_baseline_ratio", bridge_baseline_ratio,
+            "--fallback_max_bridge_lookback", bridge_lookback,
             "--evict_low_conf_threshold", "0",
             "--fallback_ref_mode", "bridge",
             "--min_segment_frames", "16",
@@ -946,6 +963,25 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
     if pose_conf_path.exists():
         pose_conf = np.load(str(pose_conf_path)).tolist()
 
+    pose_edges = []
+    pose_edges_path = r3_output / "pose_edge_log.json"
+    if pose_edges_path.exists():
+        try:
+            loaded_edges = json.loads(pose_edges_path.read_text())
+            if isinstance(loaded_edges, list):
+                pose_edges = loaded_edges
+        except Exception:
+            pose_edges = []
+    try:
+        bridge_window = int(run_params.get("fallback_num_bridge_frames") or 10)
+    except (TypeError, ValueError):
+        bridge_window = 10
+    fallback_summary = summarize_fallback_edges(
+        pose_edges,
+        point_count=len(poses),
+        bridge_window=bridge_window,
+    )
+
     result = {
         "success": True,
         "num_frames": len(poses),
@@ -964,6 +1000,11 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "segment_count": run_params.get("segment_count"),
             "segment_frames": run_params.get("segment_frames"),
             "segment_overlap_frames": run_params.get("segment_overlap_frames"),
+            "fallback_min_bridge_baseline_ratio": run_params.get("fallback_min_bridge_baseline_ratio"),
+            "fallback_max_bridge_lookback": run_params.get("fallback_max_bridge_lookback"),
+            "fallback_boundaries": fallback_summary["boundaries"],
+            "fallback_boundary_source": fallback_summary["source"],
+            "fallback_events": fallback_summary["events"],
         },
         "camera_poses": sanitize_json(poses),
         "num_poses_total": len(poses),

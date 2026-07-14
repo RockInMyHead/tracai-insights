@@ -71,6 +71,7 @@ interface TrajectoryData {
   color: string;
   videoId?: string;
   method?: string;
+  coordinateConvention?: string;
   mapAligned?: boolean;
   manualPlanSpace?: boolean;
   r3CameraPoints?: number[][];  // все позиции камер R³
@@ -731,6 +732,8 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           const isLingBot = method === "lingbot_map";
           const hasMapTrajectory = Boolean(video.analysisResult.map_trajectory);
           const isAlreadyInPlanSpace = (hasMapTrajectory && !isLingBot) || manualOverride;
+          const r3Quality = ps?.r3_trajectory_quality as Record<string, unknown> | undefined;
+          const r3Projection = r3Quality?.projection as Record<string, unknown> | undefined;
           return {
             trajectory: convertTrajectory(
               video.analysisResult.map_trajectory ||
@@ -742,6 +745,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             color: video.color,
             videoId: video.video_id,
             method: video.analysisResult.method,
+            coordinateConvention: String(r3Projection?.plan_coordinate_convention || "") || undefined,
             mapAligned: isAlreadyInPlanSpace,
             manualPlanSpace: manualOverride,
             // TrajectoryMap is a 2D surface.  Its camera-dot overlay must use
