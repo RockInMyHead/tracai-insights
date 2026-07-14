@@ -25,6 +25,8 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
   const [fps, setFps] = useState(0);
   const [processingTime, setProcessingTime] = useState(0);
   const [errorMessage, setErrorMessage] = useState("");
+  // Сразу fullscreen — компонент должен занимать всю страницу
+  const [isFullscreen3d, setIsFullscreen3d] = useState(true);
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const pointsRef = useRef<number[][]>([]);
   const posesRef = useRef<{frame: number; pose: number[][]; intrinsics?: number[][]}[]>([]);
@@ -223,7 +225,20 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
   const isLive = status === "connecting" || status === "processing";
 
   return (
-    <Card className="w-full border-2 border-primary/20">
+    <Card className={`w-full border-2 border-primary/20 ${isFullscreen3d ? "fixed inset-0 z-[99] rounded-none border-0" : ""}`}>
+      {/* Кнопка закрытия при fullscreen */}
+      {isFullscreen3d && (
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={handleClose}
+          className="absolute top-4 left-4 z-50 h-9 w-9 rounded-full bg-background/60 backdrop-blur-sm hover:bg-background/90"
+          title="Закрыть"
+        >
+          <EyeOff className="h-5 w-5" />
+        </Button>
+      )}
+      {!isFullscreen3d && (<>
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between">
           <CardTitle className="flex items-center gap-2 text-lg">
@@ -273,6 +288,7 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
               pointCloud={pointCloud}
               totalFrames={totalFrames}
               distance={distance}
+              onFullscreenChange={(full) => setIsFullscreen3d(full)}
             />
           ) : (
             <div
@@ -307,6 +323,7 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
           </div>
         </div>
       </CardContent>
+      </>)}
     </Card>
   );
 }

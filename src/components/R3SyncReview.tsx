@@ -265,7 +265,7 @@ export default function R3SyncReview({
                 referencePoint={referencePoint}
                 directionPoint={directionPoint}
                 playbackPointLimit={currentIndex + 1}
-                reviewMode
+                compactMode
                 setDirectionMode={setDirectionMode}
                 onSetDirectionModeChange={onSetDirectionModeChange}
                 onDirectionPointSet={onDirectionPointSet}

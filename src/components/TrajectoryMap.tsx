@@ -80,6 +80,8 @@ interface TrajectoryMapProps {
   directionPoint?: { x: number; y: number } | null;
   playbackPointLimit?: number | null;
   reviewMode?: boolean;
+  /** Компактная тулбар — только зум, сброс, поворот, направление. Без калибровки, pathfinding, fullscreen. */
+  compactMode?: boolean;
   setDirectionMode?: boolean;
   onSetDirectionModeChange?: (enabled: boolean) => void;
   onDirectionPointSet?: (point: { x: number; y: number }) => void;
@@ -112,7 +114,7 @@ function isR3TrajectoryMethod(method: unknown): boolean {
   return value.startsWith("r3") || value.includes("r³");
 }
 
-const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
+const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, compactMode = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
   const [planScale, setPlanScale] = useState(1);
   const [imageSize, setImageSize] = useState({ width: 800, height: 600 });
 
@@ -770,8 +772,159 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         </div>
       )}
 
-      {/* Floor Plan Controls (Top-Left) */}
-      {!reviewMode && (floorPlan || drawnPlan) && (
+      {/* Компактная тулбар (низ) — зум, сброс, компас, направление */}
+      {!reviewMode && compactMode && (floorPlan || drawnPlan) && (
+        <div
+          className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center gap-1.5 bg-background/90 backdrop-blur-md p-1.5 rounded-xl border border-border/50 shadow-lg"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Zoom */}
+          <div className="flex items-center gap-0.5 px-1.5 border-r border-border/40">
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={(e) => { e.stopPropagation(); zoomOut(); }} title="Уменьшить вид">
+              <ZoomOut className="h-3.5 w-3.5" />
+            </Button>
+            <span className="text-[10px] font-mono w-10 text-center select-none">{Math.round(scale * 100)}%</span>
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={(e) => { e.stopPropagation(); zoomIn(); }} title="Увеличить вид">
+              <ZoomIn className="h-3.5 w-3.5" />
+            </Button>
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={(e) => { e.stopPropagation(); resetView(); }} title="Сбросить вид">
+              <RotateCcw className="h-3 w-3" />
+            </Button>
+          </div>
+
+          {/* Масштаб маршрута */}
+          <div className="flex items-center gap-1 px-1.5 border-r border-border/40">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 text-[11px] font-bold"
+              onClick={(e) => { e.stopPropagation(); setTrajScale(s => Math.max(s / 1.1, 0.05)); }}
+              title="Уменьшить маршрут"
+            >
+              <ZoomOut className="h-3 w-3" />
+              <span className="text-[8px] ml-0.5">📏</span>
+            </Button>
+            <span className="text-[10px] font-mono w-9 text-center select-none">{trajScale.toFixed(1)}×</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 text-[11px] font-bold"
+              onClick={(e) => { e.stopPropagation(); setTrajScale(s => Math.min(s * 1.1, 500)); }}
+              title="Увеличить маршрут"
+            >
+              <ZoomIn className="h-3 w-3" />
+              <span className="text-[8px] ml-0.5">📏</span>
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-6 p-0"
+              onClick={(e) => { e.stopPropagation(); setTrajScale(1); }}
+              title="Сбросить масштаб маршрута"
+            >
+              <RotateCcw className="h-2.5 w-2.5" />
+            </Button>
+          </div>
+
+          {/* Направление */}
+          {referencePoint && onSetDirectionModeChange && (
+            <div className="flex items-center gap-0.5 px-1.5 border-r border-border/40">
+              <Button
+                variant={setDirectionMode ? "default" : "ghost"}
+                size="sm"
+                className="h-7 gap-1 text-[10px] px-2"
+                onClick={(e) => { e.stopPropagation(); onSetDirectionModeChange(!setDirectionMode); }}
+                title="Указать направление движения"
+              >
+                <Compass className="h-3 w-3" />
+                {setDirectionMode ? "Кликните..." : "Направление"}
+              </Button>
+            </div>
+          )}
+
+          {/* Разворот 180°, лево/право и подстройка угла */}
+          {referencePoint && directionPoint && (
+            <div className="flex items-center gap-0.5 px-1.5 border-r border-border/40">
+              {hasR3Trajectory && (
+                <Button
+                  variant={mirrorLeftRight ? "default" : "ghost"}
+                  size="sm"
+                  className="h-7 px-1.5 text-[10px]"
+                  onClick={(e) => { e.stopPropagation(); setMirrorLeftRight(v => !v); }}
+                  title="Отразить траекторию (поменять лево и право)"
+                >
+                  <FlipHorizontal2 className="h-3 w-3" />
+                  ↔
+                </Button>
+              )}
+              <Button
+                variant={directionFlip180 ? "default" : "ghost"}
+                size="sm"
+                className="h-7 px-1.5 text-[10px]"
+                onClick={(e) => { e.stopPropagation(); setDirectionFlip180(v => !v); }}
+                title="Развернуть на 180°"
+              >
+                <RotateCcw className="h-3 w-3" />
+                180°
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-[10px]"
+                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 15); }}
+                title="-15°"
+              >
+                −15°
+              </Button>
+              <span className="text-[10px] font-mono min-w-[2.5ch] text-center">{directionAngleOffset}°</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-[10px]"
+                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 15); }}
+                title="+15°"
+              >
+                +15°
+              </Button>
+            </div>
+          )}
+
+          {/* Компас — поворот */}
+          <div className="flex items-center gap-1.5 px-1.5">
+            <input
+              type="range"
+              min="0"
+              max="360"
+              step="1"
+              value={compassAngle}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setCompassAngle(v);
+                try { localStorage.setItem("compassAngle", String(v)); } catch { /* */ }
+              }}
+              className="w-16 h-1 accent-primary"
+              title="Поворот траектории"
+            />
+            <span className="text-[10px] font-mono w-8 text-center">{compassAngle}°</span>
+            <div className="relative w-7 h-7">
+              <svg viewBox="0 0 100 100" className="w-full h-full">
+                <circle cx="50" cy="50" r="42" fill="none" stroke="hsl(var(--border))" strokeWidth="3" />
+                <text x="50" y="18" textAnchor="middle" fill="hsl(var(--muted-foreground))" fontSize="10" fontWeight="bold">С</text>
+                <line
+                  x1="50" y1="50"
+                  x2={50 + 32 * Math.sin((compassAngle * Math.PI) / 180)}
+                  y2={50 - 32 * Math.cos((compassAngle * Math.PI) / 180)}
+                  stroke="hsl(var(--primary))" strokeWidth="3" strokeLinecap="round"
+                />
+                <circle cx="50" cy="50" r="3" fill="hsl(var(--primary))" />
+              </svg>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Полноразмерные контролы (обычный режим) */}
+      {!reviewMode && !compactMode && (floorPlan || drawnPlan) && (
         <div className="absolute top-4 left-4 z-20 flex flex-col gap-2 bg-background/80 backdrop-blur-md p-2 rounded-lg border border-border/50 shadow-xl" onClick={(e) => e.stopPropagation()}>
           <span className="text-[10px] font-bold text-center text-muted-foreground uppercase tracking-wider mb-1">План</span>
           {referencePoint && onSetDirectionModeChange && (
@@ -893,7 +1046,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       )}
 
       {/* View controls */}
-      {!reviewMode && (
+      {!reviewMode && !compactMode && (
       <div className="absolute top-4 right-4 z-20 flex flex-col gap-2">
         <div className="flex flex-col gap-1 p-1 bg-background/80 backdrop-blur-md rounded-lg border border-border/50 shadow-xl">
           <Button
@@ -1083,8 +1236,8 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         </div>
       )}
 
-      {/* Компас внизу чертежа — ориентация плана */}
-      {!reviewMode && (floorPlan || drawnPlan) && (
+      {/* Компас внизу чертежа — ориентация плана (обычный режим) */}
+      {!reviewMode && !compactMode && (floorPlan || drawnPlan) && (
         <div
           className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1 bg-background/90 backdrop-blur-md p-2 rounded-xl border border-border/50 shadow-lg"
           onClick={(e) => e.stopPropagation()}

@@ -16,6 +16,8 @@ interface Props {
   pointCloud: number[][] | null;  // real point cloud from R³ depth maps
   totalFrames: number;
   distance: number;
+  /** Вызывается при изменении fullscreen */
+  onFullscreenChange?: (full: boolean) => void;
 }
 
 // ─── Terrain noise for synthetic fallback ──────────────────────────────
@@ -461,7 +463,7 @@ function pointFrameIdx(p: number[]): number | null {
 }
 
 // ─── Main Component ────────────────────────────────────────────────────
-export default function R3Visualization3D({ videoId, points, poses, pointCloud, totalFrames, distance }: Props) {
+export default function R3Visualization3D({ videoId, points, poses, pointCloud, totalFrames, distance, onFullscreenChange }: Props) {
   const [maxRenderPoints, setMaxRenderPoints] = useState(100000);
   const [pointSize, setPointSize] = useState(0.75);
   const [pointOpacity, setPointOpacity] = useState(0.72);
@@ -500,6 +502,35 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
   const [showGrid, setShowGrid] = useState(true);
   const [viewMode, setViewMode] = useState<ViewMode>("top");
   const containerRef = useRef<HTMLDivElement>(null);
+
+  // ── Fullscreen state ──────────────────────────────────────────────────
+  const outerRef = useRef<HTMLDivElement>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const toggleFullscreen = () => {
+    const el = outerRef.current;
+    if (!el) return;
+    if (!document.fullscreenElement && !(document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement) {
+      const req = el.requestFullscreen ?? (el as HTMLElement & { webkitRequestFullscreen?: () => Promise<void> }).webkitRequestFullscreen;
+      if (req) req.call(el).then(() => setIsFullscreen(true)).catch(() => {});
+    } else {
+      const ex = document.exitFullscreen ?? (document as Document & { webkitExitFullscreen?: () => Promise<void> }).webkitExitFullscreen;
+      if (ex) ex.call(document).then(() => setIsFullscreen(false)).catch(() => {});
+    }
+  };
+  useEffect(() => {
+    const handler = () => {
+      const isFs = !!(document.fullscreenElement ?? (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement);
+      setIsFullscreen(isFs);
+      onFullscreenChange?.(isFs);
+    };
+    document.addEventListener("fullscreenchange", handler);
+    document.addEventListener("webkitfullscreenchange", handler);
+    return () => {
+      document.removeEventListener("fullscreenchange", handler);
+      document.removeEventListener("webkitfullscreenchange", handler);
+    };
+  }, [onFullscreenChange]);
+
   const sceneRef = useRef<{
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
@@ -1065,10 +1096,15 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
   };
 
   return (
-    <div className="relative w-full h-full min-h-[400px] rounded-lg overflow-hidden border border-border/30">
+    <div
+      ref={outerRef}
+      className={`relative w-full h-full min-h-[400px] rounded-lg overflow-hidden border border-border/30 ${isFullscreen ? "fixed inset-0 z-[100] rounded-none border-0 bg-background min-w-full min-h-full" : ""}`}
+    >
       <div ref={containerRef} className="w-full h-full" style={{ minHeight: 500 }} />
 
-      {/* Info overlay */}
+      {/* Info overlay */
+      /* When fullscreen, show selected info inside a scrollable wrapper so it stays above the canvas. */}
+      <div className={`${isFullscreen ? "max-h-[60vh] overflow-y-auto" : ""}`}>
       <div className="absolute top-3 left-3 flex flex-wrap gap-2">
         <div className="px-2.5 py-1 rounded-md bg-background/80 backdrop-blur-sm border border-border/30 text-xs space-y-0.5">
           <div className="flex items-center gap-3">
@@ -1109,6 +1145,7 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
           )}
         </div>
       </div>
+      </div>  {/* end scrollable info wrapper */}
 
       <div
         className="absolute top-3 right-3 w-56 rounded-md bg-background/85 backdrop-blur-sm border border-border/30 p-3 text-xs text-foreground shadow-lg space-y-2"
@@ -1145,8 +1182,41 @@ export default function R3Visualization3D({ videoId, points, poses, pointCloud, 
             >
               reset
             </button>
+            <button
+              type="button"
+              className="text-[10px] text-muted-foreground hover:text-foreground"
+              onClick={toggleFullscreen}
+            >
+              {isFullscreen ? "exit" : "full"}
+            </button>
           </div>
         </div>
+
+        {/* Кнопка fullscreen на весь экран вне панели (сверху справа на канвасе) */}
+        <button
+          type="button"
+          className="absolute top-3 right-[232px] z-30 flex h-7 w-7 items-center justify-center rounded-md border border-border/40 bg-background/70 text-muted-foreground backdrop-blur-sm hover:text-foreground"
+          onClick={toggleFullscreen}
+          title={isFullscreen ? "Выйти с полноэкранного режима" : "На весь экран"}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+            {isFullscreen ? (
+              <>
+                <polyline points="4 14 10 14 10 20" />
+                <polyline points="20 10 14 10 14 4" />
+                <line x1="14" y1="10" x2="21" y2="3" />
+                <line x1="3" y1="21" x2="10" y2="14" />
+              </>
+            ) : (
+              <>
+                <polyline points="15 3 21 3 21 9" />
+                <polyline points="9 21 3 21 3 15" />
+                <line x1="21" y1="3" x2="14" y2="10" />
+                <line x1="3" y1="21" x2="10" y2="14" />
+              </>
+            )}
+          </svg>
+        </button>
 
         <div className="grid grid-cols-3 gap-1">
           {R3_PRESETS.map((preset) => (
