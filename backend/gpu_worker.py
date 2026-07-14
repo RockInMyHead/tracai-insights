@@ -903,7 +903,20 @@ def _load_r3_trajectory_bundle(base: Path) -> tuple[dict, list[dict]]:
         except Exception:
             frame_selection = {}
 
-    return build_r3_trajectory(camera_poses, pose_confidence, frame_selection), camera_poses
+    run_params = {}
+    run_params_path = base / "run_params.json"
+    if run_params_path.exists():
+        try:
+            run_params = json.loads(run_params_path.read_text())
+        except Exception:
+            run_params = {}
+
+    return build_r3_trajectory(
+        camera_poses,
+        pose_confidence,
+        frame_selection,
+        run_params,
+    ), camera_poses
 
 
 def _clean_r3_trajectory_points(raw_points):
@@ -1725,13 +1738,17 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
             if release_preset
             else (os.getenv("R3_REL_POSE_METHOD") or "greedy").strip().lower()
         )
+        scale_policy = (os.getenv("R3_SCALE_POLICY") or "bridge_continuity").strip().lower()
+        expected_metric_scale = scale_policy == "metric_reanchor"
         saved_pose_method = str(params.get("rel_pose_reconstruction_method") or "greedy").lower()
+        saved_metric_scale = bool(params.get("metric_scale_enabled"))
         expected_max_frames = 0 if selection.get("long_video_sampling") else int(max_frames)
         basic_match = (
             int(params.get("max_frames") or 0) == expected_max_frames
             and saved_ckpt.endswith(str(ckpt))
             and saved_mode == mode_l
             and saved_pose_method == expected_pose_method
+            and saved_metric_scale == expected_metric_scale
         )
         if not basic_match:
             return False

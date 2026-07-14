@@ -190,49 +190,122 @@ def _clean_positions(points: np.ndarray, confidence: np.ndarray) -> tuple[np.nda
 
 
 def _camera_up_normal(rotations: Sequence[np.ndarray]) -> tuple[np.ndarray | None, float]:
+    """Estimate physical camera-up in world space from OpenCV c2w poses.
+
+    R3 exports OpenCV camera axes (X right, Y down, Z forward).  Therefore
+    column 1 of c2w points *down*, and physical camera-up is ``-R[:, 1]``.
+    The sign is important: it defines whether positive plan Y means left or
+    right after the floor projection.
+    """
     vectors: list[np.ndarray] = []
     for rotation in rotations:
         if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
             continue
-        # R3 stores c2w.  Column 1 is camera Y in world space; its sign does
-        # not matter for the floor plane normal.
-        vectors.append(_normalize(rotation[:, 1]))
+        vectors.append(_normalize(-rotation[:, 1]))
     if len(vectors) < 3:
         return None, 0.0
 
+    # A corrupt/upside-down pose must not reverse the global map handedness.
+    # Keep one hemisphere for the entire run; never choose a sign per frame.
     reference = vectors[0]
     aligned = np.array([v if float(np.dot(v, reference)) >= 0 else -v for v in vectors])
     normal = _normalize(np.median(aligned, axis=0))
-    coherence = float(np.median(np.abs(aligned @ normal)))
+    coherence = float(np.median(aligned @ normal))
     return normal, coherence
 
 
+def _trajectory_plane_normal(points: np.ndarray) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Estimate the floor normal from the camera-centre trajectory itself.
+
+    Camera-local up is biased when an operator points the camera down.  That
+    bias compresses movement in the initial direction but not after a 90°
+    turn, which looks exactly like a scale change.  Once the route contains
+    two non-collinear directions, the least-varying PCA axis is a substantially
+    better estimate of the physical walking plane.
+    """
+    diagnostics: dict[str, Any] = {
+        "available": False,
+        "eligible": False,
+        "second_axis_ratio": None,
+        "planarity_ratio": None,
+    }
+    if len(points) < 6:
+        return None, diagnostics
+
+    centered = points - np.median(points, axis=0, keepdims=True)
+    try:
+        _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None, diagnostics
+    if len(singular_values) < 3 or not np.isfinite(singular_values).all():
+        return None, diagnostics
+
+    first = float(singular_values[0])
+    second = float(singular_values[1])
+    third = float(singular_values[2])
+    second_axis_ratio = second / max(first, 1e-9)
+    planarity_ratio = third / max(second, 1e-9)
+    normal = _normalize(vh[-1]) if first > 1e-8 else None
+    # Require genuine two-dimensional route coverage.  A nearly straight path
+    # leaves the plane normal underdetermined and must use camera-up instead.
+    eligible = bool(
+        normal is not None
+        and second_axis_ratio >= 0.035
+        and planarity_ratio <= 0.35
+    )
+    diagnostics.update({
+        "available": normal is not None,
+        "eligible": eligible,
+        "second_axis_ratio": round(second_axis_ratio, 6),
+        "planarity_ratio": round(planarity_ratio, 6),
+        "singular_values": [round(float(value), 6) for value in singular_values],
+    })
+    return normal, diagnostics
+
+
 def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tuple[np.ndarray, dict[str, Any], tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Project positions onto the camera's stable horizontal movement plane."""
+    """Project positions into canonical plan space: X forward, Y left, Z up."""
     if len(points) == 0:
         basis = (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0]))
         return points.copy(), {"method": "empty"}, basis
 
     origin = points[0].copy()
     centered = points - origin
-    normal, coherence = _camera_up_normal(rotations)
-    method = "camera_up"
+    camera_up, coherence = _camera_up_normal(rotations)
+    pca_normal, pca_diagnostics = _trajectory_plane_normal(points)
+    normal_sign_source = "camera_physical_up"
 
-    if normal is None or coherence < 0.72:
-        # Fallback for unusual camera orientations.  The least-varying PCA
-        # direction is the plane normal when the path spans a 2D floor.
-        if len(points) >= 3:
-            try:
-                _, _, vh = np.linalg.svd(centered - np.mean(centered, axis=0, keepdims=True), full_matrices=False)
-                candidate = vh[-1]
-                if np.isfinite(candidate).all() and np.linalg.norm(candidate) > 1e-8:
-                    normal = _normalize(candidate)
-                    method = "pca_plane"
-            except np.linalg.LinAlgError:
-                pass
-        if normal is None:
-            normal = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            method = "axis_fallback"
+    if pca_normal is not None and pca_diagnostics["eligible"]:
+        normal = pca_normal
+        method = "trajectory_plane_pca"
+        if camera_up is not None:
+            if float(np.dot(normal, camera_up)) < 0.0:
+                normal = -normal
+        else:
+            dominant = int(np.argmax(np.abs(normal)))
+            if normal[dominant] < 0.0:
+                normal = -normal
+            normal_sign_source = "deterministic_dominant_axis"
+    elif camera_up is not None and coherence >= 0.55:
+        normal = camera_up
+        method = "camera_physical_up"
+    elif pca_normal is not None:
+        normal = pca_normal
+        method = "trajectory_plane_pca_low_support"
+        if camera_up is not None:
+            if float(np.dot(normal, camera_up)) < 0.0:
+                normal = -normal
+        else:
+            dominant = int(np.argmax(np.abs(normal)))
+            if normal[dominant] < 0.0:
+                normal = -normal
+            normal_sign_source = "deterministic_dominant_axis"
+    else:
+        # R3's first c2w is normally close to identity, where physical up is
+        # -Y in OpenCV coordinates.
+        normal = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+        method = "opencv_axis_fallback"
+        normal_sign_source = "opencv_axis_convention"
 
     # Preserve initial walking direction as X+.  PCA alone leaves this sign
     # arbitrary and is one source of apparent 180-degree flips on the map.
@@ -249,6 +322,8 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
         heading = next((axis for axis in alternatives if abs(float(np.dot(axis, normal))) < 0.9), alternatives[0])
 
     e1 = _normalize(heading)
+    # physical_up x forward = physical_left.  This is a right-handed Cartesian
+    # plan basis; the SVG renderer performs the separate Y-up -> Y-down change.
     e2 = _normalize(np.cross(normal, e1))
     e1 = _normalize(np.cross(e2, normal))
     plan = np.column_stack((centered @ e1, centered @ e2, centered @ normal))
@@ -256,11 +331,198 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
     return plan, {
         "method": method,
         "camera_up_coherence": round(coherence, 5),
+        "camera_coordinate_convention": "opencv_x_right_y_down_z_forward",
+        "plan_coordinate_convention": "x_forward_y_left_z_up",
+        "normal_sign_source": normal_sign_source,
+        "chirality_confidence": "high" if normal_sign_source == "camera_physical_up" else "low",
+        "trajectory_plane": pca_diagnostics,
         "origin": [round(float(v), 6) for v in origin],
         "basis_e1": [round(float(v), 6) for v in e1],
         "basis_e2": [round(float(v), 6) for v in e2],
         "normal": [round(float(v), 6) for v in normal],
     }, (e1, e2, normal)
+
+
+def _step_window_stats(
+    steps: np.ndarray,
+    start: int,
+    end: int,
+    stationary_threshold: float,
+) -> tuple[float | None, float | None, int]:
+    values = steps[max(0, start): min(len(steps), end)]
+    values = values[np.isfinite(values) & (values > stationary_threshold)]
+    if values.size < max(4, (end - start) // 3):
+        return None, None, int(values.size)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return median, mad / max(median, 1e-9), int(values.size)
+
+
+def _stabilize_scale_regimes(
+    plan_points: np.ndarray,
+    confidence: np.ndarray,
+    run_params: Mapping[str, Any] | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Repair persistent per-segment scale resets without normalizing walking speed.
+
+    R3 fallback may re-anchor a long run with a new metric factor.  The upstream
+    implementation warns when that factor changes by more than 2x but still
+    accepts it.  We only repair a change when stable windows exist on both
+    sides and there is strong fallback evidence (known forced boundary, a
+    confidence collapse, or an extreme ratio).  Ordinary speed changes remain
+    untouched.
+    """
+    diagnostics: dict[str, Any] = {
+        "method": "persistent_step_regime_guard",
+        "applied": False,
+        "applied_count": 0,
+        "regime_changes": [],
+    }
+    if len(plan_points) < 40:
+        diagnostics["quality"] = "too_short"
+        return plan_points.copy(), diagnostics
+
+    deltas = np.diff(plan_points[:, :2], axis=0)
+    steps = np.linalg.norm(deltas, axis=1)
+    positive = steps[np.isfinite(steps) & (steps > 1e-9)]
+    if positive.size < 24:
+        diagnostics["quality"] = "insufficient_motion"
+        return plan_points.copy(), diagnostics
+
+    global_median = float(np.median(positive))
+    stationary_threshold = max(global_median * 0.06, 1e-9)
+    window = max(8, min(24, len(steps) // 10))
+    if len(steps) < window * 4 + 1:
+        diagnostics["quality"] = "insufficient_context"
+        diagnostics["window_points"] = window
+        return plan_points.copy(), diagnostics
+
+    params = run_params if isinstance(run_params, Mapping) else {}
+    try:
+        max_segment_frames = max(0, int(params.get("max_segment_frames") or 0))
+    except (TypeError, ValueError):
+        max_segment_frames = 0
+    fallback_enabled = bool(params.get("online_fallback_enabled"))
+    metric_enabled = bool(params.get("metric_scale_enabled"))
+
+    finite_confidence = confidence[np.isfinite(confidence)]
+    confidence_median = float(np.median(finite_confidence)) if finite_confidence.size else None
+    candidates: list[dict[str, Any]] = []
+    for boundary in range(window * 2, len(steps) - window * 2 + 1):
+        before_far, before_far_cv, _ = _step_window_stats(
+            steps, boundary - 2 * window, boundary - window, stationary_threshold
+        )
+        before, before_cv, _ = _step_window_stats(
+            steps, boundary - window, boundary, stationary_threshold
+        )
+        after, after_cv, _ = _step_window_stats(
+            steps, boundary, boundary + window, stationary_threshold
+        )
+        after_far, after_far_cv, _ = _step_window_stats(
+            steps, boundary + window, boundary + 2 * window, stationary_threshold
+        )
+        if None in (before_far, before, after, after_far):
+            continue
+        assert before_far is not None and before is not None and after is not None and after_far is not None
+        assert before_far_cv is not None and before_cv is not None and after_cv is not None and after_far_cv is not None
+        if max(before_far_cv, before_cv, after_cv, after_far_cv) > 0.55:
+            continue
+        pre_stability = max(before_far, before) / max(min(before_far, before), 1e-9)
+        post_stability = max(after, after_far) / max(min(after, after_far), 1e-9)
+        if pre_stability > 1.35 or post_stability > 1.35:
+            continue
+
+        ratio = after / max(before, 1e-9)
+        symmetric_ratio = max(ratio, 1.0 / max(ratio, 1e-9))
+        if symmetric_ratio < 1.45:
+            continue
+
+        near_forced_boundary = False
+        forced_distance: int | None = None
+        if fallback_enabled and max_segment_frames > 0:
+            nearest = int(round(boundary / max_segment_frames)) * max_segment_frames
+            forced_distance = abs(boundary - nearest)
+            near_forced_boundary = nearest > 0 and forced_distance <= max(window, 12)
+
+        local_confidence_low = False
+        local_conf = confidence[
+            max(0, boundary - max(3, window // 3)):
+            min(len(confidence), boundary + max(3, window // 3) + 1)
+        ]
+        local_conf = local_conf[np.isfinite(local_conf)]
+        local_confidence = float(np.median(local_conf)) if local_conf.size else None
+        if local_confidence is not None and confidence_median is not None and confidence_median > 0:
+            local_confidence_low = local_confidence < confidence_median * 0.72
+
+        strong_evidence = fallback_enabled and symmetric_ratio >= 2.35
+        fallback_evidence = (
+            (near_forced_boundary and metric_enabled and symmetric_ratio >= 1.45)
+            or (near_forced_boundary and symmetric_ratio >= 1.8)
+            or (fallback_enabled and local_confidence_low and symmetric_ratio >= 1.7)
+            or (metric_enabled and local_confidence_low and symmetric_ratio >= 1.6)
+        )
+        if not strong_evidence and not fallback_evidence:
+            continue
+
+        candidates.append({
+            "boundary": boundary,
+            "ratio": ratio,
+            "symmetric_ratio": symmetric_ratio,
+            "score": abs(math.log(max(ratio, 1e-9))),
+            "near_forced_boundary": near_forced_boundary,
+            "forced_boundary_distance": forced_distance,
+            "local_confidence_low": local_confidence_low,
+            "local_confidence": local_confidence,
+        })
+
+    # One physical reset creates a plateau of nearby candidate windows.  Keep
+    # the strongest point in each plateau, then apply resets chronologically.
+    selected: list[dict[str, Any]] = []
+    def candidate_priority(item: Mapping[str, Any]) -> tuple[float, int, int]:
+        forced_distance = item.get("forced_boundary_distance")
+        return (
+            float(item["score"]),
+            1 if item.get("near_forced_boundary") else 0,
+            -int(forced_distance) if forced_distance is not None else -10_000,
+        )
+
+    for candidate in sorted(candidates, key=candidate_priority, reverse=True):
+        if any(abs(int(candidate["boundary"]) - int(item["boundary"])) <= window for item in selected):
+            continue
+        selected.append(candidate)
+    selected.sort(key=lambda item: int(item["boundary"]))
+
+    corrected_deltas = deltas.copy()
+    for candidate in selected:
+        boundary = int(candidate["boundary"])
+        correction = 1.0 / float(candidate["ratio"])
+        corrected_deltas[boundary:] *= correction
+        diagnostics["regime_changes"].append({
+            "trajectory_index": boundary,
+            "step_ratio": round(float(candidate["ratio"]), 5),
+            "applied_scale": round(correction, 5),
+            "near_forced_boundary": bool(candidate["near_forced_boundary"]),
+            "forced_boundary_distance": candidate["forced_boundary_distance"],
+            "local_confidence_low": bool(candidate["local_confidence_low"]),
+        })
+
+    corrected = plan_points.copy()
+    if selected:
+        corrected[1:, :2] = plan_points[0, :2] + np.cumsum(corrected_deltas, axis=0)
+    output_steps = np.linalg.norm(np.diff(corrected[:, :2], axis=0), axis=1)
+    output_positive = output_steps[np.isfinite(output_steps) & (output_steps > 1e-9)]
+    diagnostics.update({
+        "quality": "corrected" if selected else "stable_or_unconfirmed",
+        "applied": bool(selected),
+        "applied_count": len(selected),
+        "window_points": window,
+        "input_step_median": round(global_median, 6),
+        "output_step_median": round(float(np.median(output_positive)), 6) if output_positive.size else 0.0,
+        "fallback_enabled": fallback_enabled,
+        "metric_scale_enabled": metric_enabled,
+        "max_segment_frames": max_segment_frames or None,
+    })
+    return corrected, diagnostics
 
 
 def _trajectory_headings(points: np.ndarray) -> tuple[np.ndarray, int]:
@@ -703,6 +965,7 @@ def build_r3_trajectory(
     camera_poses: Iterable[Mapping[str, Any]],
     pose_confidence: Any = None,
     frame_selection: Any = None,
+    run_params: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build matching 3D and floor-plan trajectories from R3 c2w poses.
 
@@ -746,7 +1009,12 @@ def build_r3_trajectory(
     confidence = _pose_confidences(valid_poses, pose_confidence)
     source_indices = _source_frame_indices(valid_poses, frame_selection)
     cleaned_3d, filter_quality = _clean_positions(raw, confidence)
-    raw_plan, plane, floor_basis = _project_to_floor(cleaned_3d, rotations)
+    projected_plan, plane, floor_basis = _project_to_floor(cleaned_3d, rotations)
+    raw_plan, scale_stability = _stabilize_scale_regimes(
+        projected_plan,
+        confidence,
+        run_params,
+    )
     turns, turn_detection = _detect_turns(
         raw_plan,
         source_indices,
@@ -773,6 +1041,7 @@ def build_r3_trajectory(
         "trajectory_quality": {
             **filter_quality,
             "projection": plane,
+            "scale_stability": scale_stability,
             "turn_detection": turn_detection,
             "heading_correction": heading_correction,
             "cleaned_distance": round(float(clean_steps.sum()), 6) if clean_steps.size else 0.0,

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { Thermometer, Route, ZoomIn, ZoomOut, RotateCcw, Maximize, Maximize2, Minimize2, X, Map as MapIcon, Footprints, Ruler, Compass } from "lucide-react";
+import { Thermometer, Route, ZoomIn, ZoomOut, RotateCcw, Maximize, Maximize2, Minimize2, X, Map as MapIcon, Footprints, Ruler, Compass, FlipHorizontal2 } from "lucide-react";
 import { correctPathWithFloorPlan } from "@/lib/pathfinding";
 import { finiteNum } from "@/lib/numbers";
 
@@ -105,6 +105,11 @@ function normalizeTrajectoryPoints(traj: unknown): TrajectoryPoint[] {
     });
   }
   return [];
+}
+
+function isR3TrajectoryMethod(method: unknown): boolean {
+  const value = String(method || "").toLowerCase();
+  return value.startsWith("r3") || value.includes("r³");
 }
 
 const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
@@ -220,6 +225,24 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
     } catch { return false; }
   });
 
+  // R3 plan space is Cartesian (X forward, Y left), while SVG Y grows down.
+  // The automatic conversion below handles that convention.  This explicit
+  // reflection is a production fail-safe for footage whose orientation
+  // metadata/physical camera roll makes absolute chirality ambiguous.
+  const [mirrorLeftRight, setMirrorLeftRight] = useState(false);
+  const r3TrajectoryIdentity = useMemo(
+    () => trajectoryData
+      .filter((item) => isR3TrajectoryMethod(item.method))
+      .map((item) => item.videoId || item.ownerName)
+      .join("|"),
+    [trajectoryData],
+  );
+  const hasR3Trajectory = r3TrajectoryIdentity.length > 0;
+
+  useEffect(() => {
+    setMirrorLeftRight(false);
+  }, [r3TrajectoryIdentity]);
+
   // Ручная подстройка угла траектории относительно стрелки направления (градусы)
   const [directionAngleOffset, setDirectionAngleOffset] = useState(() => {
     try {
@@ -285,6 +308,10 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       // Base coordinates from the first point of THIS trajectory
       const startX = validPoints[0].x;
       const startY = validPoints[0].y;
+      const isR3Plan = isR3TrajectoryMethod(data.method);
+      // Canonical R3 Y is physical-left (Cartesian Y-up). Convert it to SVG
+      // Y-down before aligning the initial X axis with the green direction.
+      const lateralToSvg = isR3Plan ? (mirrorLeftRight ? 1 : -1) : 1;
       const dataScale = finiteNum(data.mapScaleFactor, 1);
       let autoFitScale = 1;
       if (data.r3AutoFitToPlan && floorPlan && viewBox.width > 0 && viewBox.height > 0) {
@@ -314,7 +341,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         transformed = validPoints.map(point => ({
           ...point,
           x: (point.x - startX) * finalRenderScale + refX + trajOffset.x,
-          y: (point.y - startY) * finalRenderScale + refY + trajOffset.y
+          y: (point.y - startY) * finalRenderScale * lateralToSvg + refY + trajOffset.y
         }));
       } else {
         refX = viewBox.width / 2;
@@ -323,7 +350,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         transformed = validPoints.map(point => ({
           ...point,
           x: (point.x - startX) * finalRenderScale + refX + trajOffset.x,
-          y: (point.y - startY) * finalRenderScale + refY + trajOffset.y
+          y: (point.y - startY) * finalRenderScale * lateralToSvg + refY + trajOffset.y
         }));
       }
 
@@ -343,9 +370,9 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
             const p0 = validPoints[0];
             const pN = validPoints[segLen - 1];
             const dx = (pN.x - p0.x) * finalRenderScale;
-            const dy = (pN.y - p0.y) * finalRenderScale;
+            const dy = (pN.y - p0.y) * finalRenderScale * lateralToSvg;
             const segDist = Math.hypot(dx, dy);
-            const trajAngle = segDist > 1e-6 ? Math.atan2(dy, dx) : Math.atan2((validPoints[1].y - p0.y) * finalRenderScale, (validPoints[1].x - p0.x) * finalRenderScale);
+            const trajAngle = segDist > 1e-6 ? Math.atan2(dy, dx) : Math.atan2((validPoints[1].y - p0.y) * finalRenderScale * lateralToSvg, (validPoints[1].x - p0.x) * finalRenderScale);
             rotationRad = directionAngle - trajAngle;
             if (directionFlip180) rotationRad += Math.PI;
             rotationRad += (directionAngleOffset * Math.PI) / 180;
@@ -386,8 +413,21 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           typeof pos[1] === "number" ? pos[1] : finiteNum((posRec as Record<string, unknown>).y);
         if (typeof pxVal !== 'number' || typeof pyVal !== 'number' || isNaN(pxVal) || isNaN(pyVal)) return turn;
         const px = (pxVal - startX) * finalRenderScale + refX + trajOffset.x;
-        const py = (pyVal - startY) * finalRenderScale + refY + trajOffset.y;
+        const py = (pyVal - startY) * finalRenderScale * lateralToSvg + refY + trajOffset.y;
         const rotated = applyRotation(px, py);
+        if (isR3Plan && mirrorLeftRight) {
+          const mirroredType = turn.turn_type === 'left'
+            ? 'right'
+            : turn.turn_type === 'right'
+              ? 'left'
+              : turn.turn_type;
+          return {
+            ...turn,
+            position: [rotated.x, rotated.y, pos[2] ?? 0],
+            turn_type: mirroredType,
+            angle_degrees: -finiteNum(turn.angle_degrees),
+          };
+        }
         return { ...turn, position: [rotated.x, rotated.y, pos[2] ?? 0] };
       });
 
@@ -404,7 +444,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         // Трансформируем R³ camera points так же, как траекторию
         r3CameraPoints: data.r3CameraPoints ? data.r3CameraPoints.map(p => ({
           x: ((p.x - startX) * finalRenderScale + refX + trajOffset.x),
-          y: ((p.y - startY) * finalRenderScale + refY + trajOffset.y),
+          y: ((p.y - startY) * finalRenderScale * lateralToSvg + refY + trajOffset.y),
           z: p.z,
         })).map(p => {
           const r = applyRotation(p.x, p.y);
@@ -412,7 +452,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         }) : undefined,
       };
     });
-  }, [trajectoryData, floorPlan, referencePoint, directionPoint, playbackPointLimit, viewBox.width, viewBox.height, trajScale, trajOffset, compassAngle, directionFlip180, directionAngleOffset]);
+  }, [trajectoryData, floorPlan, referencePoint, directionPoint, playbackPointLimit, viewBox.width, viewBox.height, trajScale, trajOffset, compassAngle, directionFlip180, directionAngleOffset, mirrorLeftRight]);
 
   // Get transformed turn points for all trajectories
   const getAllTransformedTurnPoints = useMemo(() => {
@@ -748,6 +788,18 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           )}
           {referencePoint && directionPoint && (
             <>
+              {hasR3Trajectory && (
+                <Button
+                  variant={mirrorLeftRight ? "default" : "ghost"}
+                  size="sm"
+                  className="h-8 gap-1.5 text-[10px]"
+                  onClick={(e) => { e.stopPropagation(); setMirrorLeftRight(v => !v); }}
+                  title="Отразить траекторию относительно начального направления (поменять лево и право)"
+                >
+                  <FlipHorizontal2 className="h-3.5 w-3.5" />
+                  Лево ↔ право
+                </Button>
+              )}
               <Button
                 variant={directionFlip180 ? "default" : "ghost"}
                 size="sm"
@@ -825,6 +877,19 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
             </Button>
           </div>
         </div>
+      )}
+
+      {reviewMode && hasR3Trajectory && referencePoint && directionPoint && (
+        <Button
+          variant={mirrorLeftRight ? "default" : "outline"}
+          size="sm"
+          className="absolute left-2 top-2 z-30 h-8 gap-1.5 bg-background/90 text-[10px] shadow-lg backdrop-blur-md"
+          onClick={(e) => { e.stopPropagation(); setMirrorLeftRight(v => !v); }}
+          title="Поменять лево и право, если ориентация камеры в файле неоднозначна"
+        >
+          <FlipHorizontal2 className="h-3.5 w-3.5" />
+          Лево ↔ право
+        </Button>
       )}
 
       {/* View controls */}

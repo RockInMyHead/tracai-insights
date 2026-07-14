@@ -24,6 +24,7 @@ class R3WorkerPresetTests(unittest.TestCase):
             "R3_KEYFRAME_MAX_INTERVAL": "15",
             "R3_KEYFRAME_MAX_KEYFRAMES": "160",
             "R3_ENABLE_SEGMENT_PGO": "true",
+            "R3_ENABLE_METRIC_SCALE": "true",
         }
         with patch.dict(os.environ, stale_environment, clear=True):
             command, mode, checkpoint = _build_r3_infer_cmd(
@@ -42,6 +43,7 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--keyframe_max_interval"), "30")
         self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "100")
         self.assertIn("--disable_segment_pgo", command)
+        self.assertNotIn("--metric_scale_enabled", command)
 
     def test_custom_experimental_preset_remains_opt_in(self) -> None:
         custom_environment = {
@@ -65,6 +67,20 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--keyframe_max_interval"), "15")
         self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "160")
         self.assertNotIn("--disable_segment_pgo", command)
+
+    def test_metric_reanchor_requires_new_explicit_scale_policy(self) -> None:
+        with patch.dict(os.environ, {"R3_SCALE_POLICY": "metric_reanchor"}, clear=True):
+            command, _, _ = _build_r3_infer_cmd(
+                "/tmp/frames",
+                "/tmp/output",
+                "r3_long.safetensors",
+                "long",
+                392,
+                0,
+            )
+
+        self.assertIn("--metric_scale_enabled", command)
+        self.assertEqual(option_value(command, "--metric_bootstrap_frames"), "5")
 
 
 if __name__ == "__main__":

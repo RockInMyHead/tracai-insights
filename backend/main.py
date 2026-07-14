@@ -994,6 +994,7 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
         camera_poses,
         pose_confidence=r3_result.get("pose_confidence"),
         frame_selection=r3_result.get("frame_selection"),
+        run_params=r3_result.get("run_params"),
     )
     trajectory = trajectory_bundle["plan_trajectory"]
     raw_trajectory_3d = trajectory_bundle["raw_trajectory_3d"]
