@@ -32,6 +32,8 @@ export interface TrajectoryData {
   color: string;
   videoId?: string;
   method?: string;
+  /** Explicit map-axis contract supplied by R3 trajectory diagnostics. */
+  coordinateConvention?: string;
   mapAligned?: boolean;
   /** Точки в системе админки 800×600 с letterbox растра — перевести в натуральный viewBox */
   manualPlanSpace?: boolean;
@@ -112,6 +114,11 @@ function normalizeTrajectoryPoints(traj: unknown): TrajectoryPoint[] {
 function isR3TrajectoryMethod(method: unknown): boolean {
   const value = String(method || "").toLowerCase();
   return value.startsWith("r3") || value.includes("r³");
+}
+
+function isR3PlanTrajectory(data: Pick<TrajectoryData, "method" | "coordinateConvention">): boolean {
+  return isR3TrajectoryMethod(data.method)
+    || data.coordinateConvention === "x_forward_y_left_z_up";
 }
 
 const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, compactMode = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
@@ -234,7 +241,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
   const [mirrorLeftRight, setMirrorLeftRight] = useState(false);
   const r3TrajectoryIdentity = useMemo(
     () => trajectoryData
-      .filter((item) => isR3TrajectoryMethod(item.method))
+      .filter((item) => isR3PlanTrajectory(item))
       .map((item) => item.videoId || item.ownerName)
       .join("|"),
     [trajectoryData],
@@ -310,7 +317,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
       // Base coordinates from the first point of THIS trajectory
       const startX = validPoints[0].x;
       const startY = validPoints[0].y;
-      const isR3Plan = isR3TrajectoryMethod(data.method);
+      const isR3Plan = isR3PlanTrajectory(data);
       // Canonical R3 Y is physical-left (Cartesian Y-up). Convert it to SVG
       // Y-down before aligning the initial X axis with the green direction.
       const lateralToSvg = isR3Plan ? (mirrorLeftRight ? 1 : -1) : 1;

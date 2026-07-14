@@ -899,6 +899,37 @@ export class ApiClient {
     return resp.json();
   }
 
+  /** Rebuild only the current R3 trajectory; avoids loading the point cloud. */
+  async getR3Trajectory(videoId: string): Promise<{
+    success: boolean;
+    video_id: string;
+    method: string;
+    trajectory: number[][];
+    plan_trajectory: number[][];
+    raw_plan_trajectory?: number[][];
+    raw_trajectory_3d?: number[][];
+    turn_points?: Array<{
+      frame_index: number;
+      r3_frame_index?: number;
+      source_frame_index?: number | null;
+      trajectory_index: number;
+      angle_degrees: number;
+      position: number[];
+      turn_type: string;
+      confidence?: number | null;
+    }>;
+    source_frame_indices?: Array<number | null>;
+    trajectory_quality?: Record<string, unknown>;
+    run_params?: Record<string, unknown>;
+    fallback_summary?: Record<string, unknown>;
+  }> {
+    const resp = await agentFetch(`${this.baseUrl}/api/r3-trajectory/${videoId}`);
+    if (!resp.ok) {
+      throw new Error(`R3 trajectory fetch failed (HTTP ${resp.status})`);
+    }
+    return resp.json();
+  }
+
   /** Диагностика R³ output: файлы, pointcloud shape, confidence percentiles. */
   async getR3Diagnostics(videoId: string): Promise<{
     success: boolean;

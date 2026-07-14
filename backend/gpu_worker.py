@@ -21,9 +21,9 @@ from video_tracker.src.map_postprocessing import apply_map_postprocessing
 from video_tracker.src.stabilization import stabilize_video
 
 try:
-    from r3_trajectory import build_r3_trajectory
+    from r3_trajectory import build_r3_trajectory, summarize_fallback_edges
 except ImportError:  # pragma: no cover - supports package-style startup
-    from backend.r3_trajectory import build_r3_trajectory
+    from backend.r3_trajectory import build_r3_trajectory, summarize_fallback_edges
 
 try:
     from r3_pointcloud import PointCloudBuildCancelled, build_sampled_pointcloud
@@ -870,6 +870,44 @@ def _r3_conf_stats(conf_values):
     }
 
 
+def _load_r3_run_params(base: Path, point_count: int = 0) -> tuple[dict, dict]:
+    """Load R3 params and attach accepted fallback boundaries from its edge log."""
+    run_params: dict = {}
+    run_params_path = base / "run_params.json"
+    if run_params_path.exists():
+        try:
+            loaded = json.loads(run_params_path.read_text())
+            if isinstance(loaded, dict):
+                run_params = loaded
+        except Exception as exc:
+            run_params = {"error": str(exc)}
+
+    edges = []
+    pose_edges_path = base / "pose_edge_log.json"
+    if pose_edges_path.exists():
+        try:
+            loaded_edges = json.loads(pose_edges_path.read_text())
+            if isinstance(loaded_edges, list):
+                edges = loaded_edges
+        except Exception:
+            edges = []
+
+    try:
+        bridge_window = int(run_params.get("fallback_num_bridge_frames") or 10)
+    except (TypeError, ValueError):
+        bridge_window = 10
+    fallback_summary = summarize_fallback_edges(
+        edges,
+        point_count=point_count,
+        bridge_window=bridge_window,
+    )
+    run_params = dict(run_params)
+    run_params["fallback_boundaries"] = fallback_summary["boundaries"]
+    run_params["fallback_boundary_source"] = fallback_summary["source"]
+    run_params["fallback_events"] = fallback_summary["events"]
+    return run_params, fallback_summary
+
+
 def _load_r3_trajectory_bundle(base: Path) -> tuple[dict, list[dict]]:
     """Load R3 pose artifacts once and keep 3D/plan-space products separate."""
     import numpy as np
@@ -903,13 +941,7 @@ def _load_r3_trajectory_bundle(base: Path) -> tuple[dict, list[dict]]:
         except Exception:
             frame_selection = {}
 
-    run_params = {}
-    run_params_path = base / "run_params.json"
-    if run_params_path.exists():
-        try:
-            run_params = json.loads(run_params_path.read_text())
-        except Exception:
-            run_params = {}
+    run_params, _ = _load_r3_run_params(base, point_count=len(camera_poses))
 
     return build_r3_trajectory(
         camera_poses,
@@ -1226,16 +1258,9 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         if pts.ndim == 2 and pts.shape[1] > 7:
             pointcloud["cloud_mean_by_frame_sample"] = _r3_cloud_mean_by_frame(pts)
 
-    run_params = {}
-    run_params_path = base / "run_params.json"
-    if run_params_path.exists():
-        try:
-            run_params = json.loads(run_params_path.read_text())
-        except Exception as e:
-            run_params = {"error": str(e)}
-
     camera_sample = []
     camera_files = sorted((base / "camera").glob("*.npz"))
+    run_params, fallback_summary = _load_r3_run_params(base, point_count=len(camera_files))
     for cf in (camera_files[:3] + camera_files[-3:]):
         try:
             camera_sample.append(_inspect_camera_npz(cf))
@@ -1266,7 +1291,12 @@ def _r3_run_diagnostics(video_id: str) -> dict:
             for edge in edges if isinstance(edges, list) else []:
                 edge_type = str(edge.get("edge_type", "unknown")) if isinstance(edge, dict) else "unknown"
                 type_counts[edge_type] = type_counts.get(edge_type, 0) + 1
-            pose_edges = {"exists": True, "count": len(edges) if isinstance(edges, list) else 0, "type_counts": type_counts}
+            pose_edges = {
+                "exists": True,
+                "count": len(edges) if isinstance(edges, list) else 0,
+                "type_counts": type_counts,
+                "fallback_summary": fallback_summary,
+            }
         except Exception as e:
             pose_edges = {"exists": True, "error": str(e)}
 
@@ -1291,6 +1321,7 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         "pointcloud": pointcloud,
         "conf_stats": conf_stats,
         "run_params": run_params,
+        "fallback_summary": fallback_summary,
         "camera_sample": camera_sample,
         "camera_translation_sample": _r3_camera_translation_samples(base),
         "pose_confidence": pose_confidence,
@@ -1740,8 +1771,20 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
         )
         scale_policy = (os.getenv("R3_SCALE_POLICY") or "bridge_continuity").strip().lower()
         expected_metric_scale = scale_policy == "metric_reanchor"
+        expected_bridge_ratio = (
+            0.35
+            if release_preset
+            else float(os.getenv("R3_FALLBACK_MIN_BRIDGE_BASELINE_RATIO") or "0.35")
+        )
+        expected_bridge_lookback = (
+            40
+            if release_preset
+            else int(float(os.getenv("R3_FALLBACK_MAX_BRIDGE_LOOKBACK") or "40"))
+        )
         saved_pose_method = str(params.get("rel_pose_reconstruction_method") or "greedy").lower()
         saved_metric_scale = bool(params.get("metric_scale_enabled"))
+        saved_bridge_ratio = float(params.get("fallback_min_bridge_baseline_ratio") or 0.0)
+        saved_bridge_lookback = int(params.get("fallback_max_bridge_lookback") or 0)
         expected_max_frames = 0 if selection.get("long_video_sampling") else int(max_frames)
         basic_match = (
             int(params.get("max_frames") or 0) == expected_max_frames
@@ -1749,6 +1792,8 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
             and saved_mode == mode_l
             and saved_pose_method == expected_pose_method
             and saved_metric_scale == expected_metric_scale
+            and math.isclose(saved_bridge_ratio, expected_bridge_ratio, rel_tol=0.0, abs_tol=1e-9)
+            and saved_bridge_lookback == expected_bridge_lookback
         )
         if not basic_match:
             return False
@@ -2160,13 +2205,8 @@ async def r3_get_pointcloud_filtered(
         cameras = []
         trajectory_quality = None
         base = _r3_output_dir(video_id)
-        run_params = {}
-        run_params_path = base / "run_params.json"
-        if run_params_path.exists():
-            try:
-                run_params = json.loads(run_params_path.read_text())
-            except Exception as e:
-                run_params = {"error": str(e)}
+        camera_count = len(list((base / "camera").glob("*.npz")))
+        run_params, fallback_summary = _load_r3_run_params(base, point_count=camera_count)
         run_mode = str(run_params.get("mode") or "").lower()
         # Missing mode means the output was produced by an older wrapper that
         # cannot be trusted for the new strided+fallback+metric R3 preset.
@@ -2214,6 +2254,7 @@ async def r3_get_pointcloud_filtered(
                 "has_conf": bool(points.ndim == 2 and points.shape[1] > 6),
                 "has_frame_idx": bool(points.ndim == 2 and points.shape[1] > 7),
                 "run_params": run_params,
+                "fallback_summary": fallback_summary,
                 "stale_run": stale_run,
             },
         }
@@ -2221,6 +2262,38 @@ async def r3_get_pointcloud_filtered(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to filter point cloud: {e}")
+
+
+@app.get("/api/r3-trajectory/{video_id}")
+async def r3_get_trajectory(video_id: str):
+    """Rebuild the lightweight plan trajectory from existing R3 pose artifacts."""
+    try:
+        base = _r3_output_dir(video_id)
+        if not base.exists():
+            raise HTTPException(status_code=404, detail="R3 output not found")
+        trajectory_bundle, _ = _load_r3_trajectory_bundle(base)
+        run_params, fallback_summary = _load_r3_run_params(
+            base,
+            point_count=len(trajectory_bundle.get("plan_trajectory", [])),
+        )
+        return _sanitize_for_json({
+            "success": True,
+            "video_id": video_id,
+            "method": "r3_reconstruction",
+            "trajectory": trajectory_bundle.get("plan_trajectory", []),
+            "plan_trajectory": trajectory_bundle.get("plan_trajectory", []),
+            "raw_plan_trajectory": trajectory_bundle.get("raw_plan_trajectory", []),
+            "raw_trajectory_3d": trajectory_bundle.get("raw_trajectory_3d", []),
+            "turn_points": trajectory_bundle.get("turn_points", []),
+            "source_frame_indices": trajectory_bundle.get("source_frame_indices", []),
+            "trajectory_quality": trajectory_bundle.get("trajectory_quality", {}),
+            "run_params": run_params,
+            "fallback_summary": fallback_summary,
+        })
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load R3 trajectory: {exc}")
 
 
 @app.get("/api/r3-diagnostics/{video_id}")

@@ -25,6 +25,8 @@ class R3WorkerPresetTests(unittest.TestCase):
             "R3_KEYFRAME_MAX_KEYFRAMES": "160",
             "R3_ENABLE_SEGMENT_PGO": "true",
             "R3_ENABLE_METRIC_SCALE": "true",
+            "R3_FALLBACK_MIN_BRIDGE_BASELINE_RATIO": "0",
+            "R3_FALLBACK_MAX_BRIDGE_LOOKBACK": "10",
         }
         with patch.dict(os.environ, stale_environment, clear=True):
             command, mode, checkpoint = _build_r3_infer_cmd(
@@ -44,6 +46,8 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "100")
         self.assertIn("--disable_segment_pgo", command)
         self.assertNotIn("--metric_scale_enabled", command)
+        self.assertEqual(option_value(command, "--fallback_min_bridge_baseline_ratio"), "0.35")
+        self.assertEqual(option_value(command, "--fallback_max_bridge_lookback"), "40")
 
     def test_custom_experimental_preset_remains_opt_in(self) -> None:
         custom_environment = {
@@ -52,6 +56,8 @@ class R3WorkerPresetTests(unittest.TestCase):
             "R3_KEYFRAME_MAX_INTERVAL": "15",
             "R3_KEYFRAME_MAX_KEYFRAMES": "160",
             "R3_ENABLE_SEGMENT_PGO": "true",
+            "R3_FALLBACK_MIN_BRIDGE_BASELINE_RATIO": "0.5",
+            "R3_FALLBACK_MAX_BRIDGE_LOOKBACK": "60",
         }
         with patch.dict(os.environ, custom_environment, clear=True):
             command, _, _ = _build_r3_infer_cmd(
@@ -66,6 +72,8 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--rel_pose_reconstruction_method"), "pgo")
         self.assertEqual(option_value(command, "--keyframe_max_interval"), "15")
         self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "160")
+        self.assertEqual(option_value(command, "--fallback_min_bridge_baseline_ratio"), "0.5")
+        self.assertEqual(option_value(command, "--fallback_max_bridge_lookback"), "60")
         self.assertNotIn("--disable_segment_pgo", command)
 
     def test_metric_reanchor_requires_new_explicit_scale_policy(self) -> None:

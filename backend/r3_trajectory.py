@@ -14,6 +14,81 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
+R3_TRAJECTORY_POSTPROCESS_VERSION = 3
+
+
+def summarize_fallback_edges(
+    edges: Any,
+    point_count: int = 0,
+    bridge_window: int = 10,
+) -> dict[str, Any]:
+    """Recover accepted fallback boundaries from R3's pose-edge log.
+
+    Upstream R3 exports every accepted replay as a cluster of ``bridge``
+    edges.  Those clusters are the only trustworthy evidence that a new
+    reconstruction segment started.  A nominal ``max_segment_frames`` value
+    is not a boundary: confidence-triggered fallbacks happen at different
+    frames, and treating every multiple as one caused production scale drift.
+    """
+    bridge_frames: list[int] = []
+    bridge_edges = 0
+    for edge in edges if isinstance(edges, list) else []:
+        if not isinstance(edge, Mapping) or str(edge.get("edge_type")) != "bridge":
+            continue
+        try:
+            frame_i = int(edge.get("frame_i"))
+            frame_j = int(edge.get("frame_j"))
+        except (TypeError, ValueError):
+            continue
+        for frame in (frame_i, frame_j):
+            if frame < 0 or (point_count > 0 and frame >= point_count):
+                continue
+            bridge_frames.append(frame)
+        bridge_edges += 1
+
+    unique_frames = sorted(set(bridge_frames))
+    if not unique_frames:
+        return {
+            "source": "pose_edge_log",
+            "bridge_edge_count": bridge_edges,
+            "events": [],
+            "boundaries": [],
+        }
+
+    # Replay frames need not be consecutive when low-confidence images were
+    # skipped.  A gap of several bridge windows still cleanly separates the
+    # next accepted fallback on normal long-video presets.
+    cluster_gap = max(4, int(bridge_window) * 3)
+    clusters: list[list[int]] = [[unique_frames[0]]]
+    for frame in unique_frames[1:]:
+        if frame - clusters[-1][-1] > cluster_gap:
+            clusters.append([frame])
+        else:
+            clusters[-1].append(frame)
+
+    events: list[dict[str, Any]] = []
+    boundaries: list[int] = []
+    for cluster in clusters:
+        boundary = cluster[-1] + 1
+        if point_count > 0 and boundary >= point_count:
+            continue
+        boundaries.append(boundary)
+        events.append({
+            "boundary": boundary,
+            "bridge_start": cluster[0],
+            "bridge_end": cluster[-1],
+            "bridge_frames": len(cluster),
+        })
+
+    return {
+        "source": "pose_edge_log",
+        "bridge_edge_count": bridge_edges,
+        "cluster_gap": cluster_gap,
+        "events": events,
+        "boundaries": boundaries,
+    }
+
+
 def _finite_vector(value: Any, length: int) -> np.ndarray | None:
     try:
         vector = np.asarray(value, dtype=np.float64).reshape(-1)
@@ -214,6 +289,96 @@ def _camera_up_normal(rotations: Sequence[np.ndarray]) -> tuple[np.ndarray | Non
     return normal, coherence
 
 
+def _camera_rotation_axis_normal(
+    rotations: Sequence[np.ndarray],
+    camera_up: np.ndarray | None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Estimate gravity from the common world-space axis of camera turns.
+
+    Camera-local up is tilted whenever the operator points the camera toward
+    the floor.  During real left/right turns, however, c2w rotations share the
+    physical vertical as their world-space rotation axis.  Accumulating axis
+    outer-products removes the left/right sign while retaining that vertical.
+    """
+    diagnostics: dict[str, Any] = {
+        "available": False,
+        "reliable": False,
+        "samples": 0,
+        "dominance": None,
+        "camera_up_alignment": None,
+    }
+    count = len(rotations)
+    if count < 12:
+        return None, diagnostics
+
+    covariance = np.zeros((3, 3), dtype=np.float64)
+    samples = 0
+    spans = [span for span in (4, 8, 16, 24) if span < count]
+    min_angle = math.radians(1.5)
+    max_angle = math.radians(75.0)
+    for span in spans:
+        for index in range(count - span):
+            first = rotations[index]
+            second = rotations[index + span]
+            if (
+                first.shape != (3, 3)
+                or second.shape != (3, 3)
+                or not np.isfinite(first).all()
+                or not np.isfinite(second).all()
+            ):
+                continue
+            relative = second @ first.T
+            cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+            angle = math.acos(cosine)
+            if angle < min_angle or angle > max_angle:
+                continue
+            skew = np.array([
+                relative[2, 1] - relative[1, 2],
+                relative[0, 2] - relative[2, 0],
+                relative[1, 0] - relative[0, 1],
+            ], dtype=np.float64)
+            skew_norm = float(np.linalg.norm(skew))
+            if skew_norm <= 1e-8:
+                continue
+            axis = skew / skew_norm
+            weight = min(angle, math.radians(30.0)) ** 2
+            covariance += weight * np.outer(axis, axis)
+            samples += 1
+
+    diagnostics["samples"] = samples
+    diagnostics["spans"] = spans
+    if samples < 12:
+        return None, diagnostics
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    except np.linalg.LinAlgError:
+        return None, diagnostics
+    if not np.isfinite(eigenvalues).all() or float(eigenvalues[-1]) <= 1e-12:
+        return None, diagnostics
+
+    normal = _normalize(eigenvectors[:, -1])
+    dominance = float(eigenvalues[-1] / max(float(eigenvalues[-2]), 1e-12))
+    alignment = None
+    if camera_up is not None:
+        if float(np.dot(normal, camera_up)) < 0.0:
+            normal = -normal
+        alignment = float(np.dot(normal, camera_up))
+    else:
+        dominant = int(np.argmax(np.abs(normal)))
+        if normal[dominant] < 0.0:
+            normal = -normal
+
+    reliable = bool(dominance >= 2.0 and (alignment is None or alignment >= 0.45))
+    diagnostics.update({
+        "available": True,
+        "reliable": reliable,
+        "dominance": round(dominance, 6),
+        "camera_up_alignment": round(alignment, 6) if alignment is not None else None,
+        "normal": [round(float(value), 6) for value in normal],
+    })
+    return normal, diagnostics
+
+
 def _trajectory_plane_normal(points: np.ndarray) -> tuple[np.ndarray | None, dict[str, Any]]:
     """Estimate the floor normal from the camera-centre trajectory itself.
 
@@ -272,10 +437,14 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
     origin = points[0].copy()
     centered = points - origin
     camera_up, coherence = _camera_up_normal(rotations)
+    rotation_axis, rotation_axis_diagnostics = _camera_rotation_axis_normal(rotations, camera_up)
     pca_normal, pca_diagnostics = _trajectory_plane_normal(points)
     normal_sign_source = "camera_physical_up"
 
-    if pca_normal is not None and pca_diagnostics["eligible"]:
+    if rotation_axis is not None and rotation_axis_diagnostics["reliable"]:
+        normal = rotation_axis
+        method = "camera_rotation_axis"
+    elif pca_normal is not None and pca_diagnostics["eligible"]:
         normal = pca_normal
         method = "trajectory_plane_pca"
         if camera_up is not None:
@@ -335,6 +504,7 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
         "plan_coordinate_convention": "x_forward_y_left_z_up",
         "normal_sign_source": normal_sign_source,
         "chirality_confidence": "high" if normal_sign_source == "camera_physical_up" else "low",
+        "camera_rotation_axis": rotation_axis_diagnostics,
         "trajectory_plane": pca_diagnostics,
         "origin": [round(float(v), 6) for v in origin],
         "basis_e1": [round(float(v), 6) for v in e1],
@@ -343,184 +513,195 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
     }, (e1, e2, normal)
 
 
-def _step_window_stats(
-    steps: np.ndarray,
-    start: int,
-    end: int,
-    stationary_threshold: float,
-) -> tuple[float | None, float | None, int]:
-    values = steps[max(0, start): min(len(steps), end)]
-    values = values[np.isfinite(values) & (values > stationary_threshold)]
-    if values.size < max(4, (end - start) // 3):
-        return None, None, int(values.size)
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    return median, mad / max(median, 1e-9), int(values.size)
-
-
 def _stabilize_scale_regimes(
     plan_points: np.ndarray,
     confidence: np.ndarray,
+    source_indices: Sequence[int | None],
     run_params: Mapping[str, Any] | None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Repair persistent per-segment scale resets without normalizing walking speed.
+    """Normalize confirmed fallback scale epochs without cumulative drift.
 
-    R3 fallback may re-anchor a long run with a new metric factor.  The upstream
-    implementation warns when that factor changes by more than 2x but still
-    accepts it.  We only repair a change when stable windows exist on both
-    sides and there is strong fallback evidence (known forced boundary, a
-    confidence collapse, or an extreme ratio).  Ordinary speed changes remain
-    untouched.
+    The previous guard searched every point for a step-size change and then
+    multiplied the *entire remaining tail*.  Several detections therefore
+    compounded (2.74x × 1.78x × ... in the production run).  Here boundaries
+    must come from R3's actual bridge-edge log, motion is normalized by source
+    frame spacing, adjacent fallback segments with the same scale are grouped,
+    and every epoch is scaled independently against the first stable epoch.
     """
     diagnostics: dict[str, Any] = {
-        "method": "persistent_step_regime_guard",
+        "method": "explicit_fallback_scale_epochs",
         "applied": False,
         "applied_count": 0,
         "regime_changes": [],
+        "cumulative_scaling": False,
+        "source_delta_normalized": True,
     }
-    if len(plan_points) < 40:
+    if len(plan_points) < 24:
         diagnostics["quality"] = "too_short"
         return plan_points.copy(), diagnostics
 
     deltas = np.diff(plan_points[:, :2], axis=0)
     steps = np.linalg.norm(deltas, axis=1)
-    positive = steps[np.isfinite(steps) & (steps > 1e-9)]
-    if positive.size < 24:
+    try:
+        source = np.asarray([
+            float(value) if value is not None else np.nan for value in source_indices
+        ], dtype=np.float64)
+    except (TypeError, ValueError):
+        source = np.arange(len(plan_points), dtype=np.float64)
+    if source.size != len(plan_points):
+        source = np.arange(len(plan_points), dtype=np.float64)
+    valid_source = np.isfinite(source)
+    if not valid_source.all():
+        indices = np.arange(len(source), dtype=np.float64)
+        if valid_source.any():
+            source = np.interp(indices, indices[valid_source], source[valid_source])
+        else:
+            source = indices
+    source_deltas = np.diff(source)
+    positive_source_deltas = source_deltas[np.isfinite(source_deltas) & (source_deltas > 0)]
+    default_source_delta = float(np.median(positive_source_deltas)) if positive_source_deltas.size else 1.0
+    source_deltas = np.where(
+        np.isfinite(source_deltas) & (source_deltas > 0),
+        source_deltas,
+        default_source_delta,
+    )
+    velocities = steps / np.maximum(source_deltas, 1e-9)
+    positive = velocities[np.isfinite(velocities) & (velocities > 1e-9)]
+    if positive.size < 16:
         diagnostics["quality"] = "insufficient_motion"
         return plan_points.copy(), diagnostics
 
-    global_median = float(np.median(positive))
-    stationary_threshold = max(global_median * 0.06, 1e-9)
-    window = max(8, min(24, len(steps) // 10))
-    if len(steps) < window * 4 + 1:
-        diagnostics["quality"] = "insufficient_context"
-        diagnostics["window_points"] = window
-        return plan_points.copy(), diagnostics
-
     params = run_params if isinstance(run_params, Mapping) else {}
-    try:
-        max_segment_frames = max(0, int(params.get("max_segment_frames") or 0))
-    except (TypeError, ValueError):
-        max_segment_frames = 0
     fallback_enabled = bool(params.get("online_fallback_enabled"))
     metric_enabled = bool(params.get("metric_scale_enabled"))
-
-    finite_confidence = confidence[np.isfinite(confidence)]
-    confidence_median = float(np.median(finite_confidence)) if finite_confidence.size else None
-    candidates: list[dict[str, Any]] = []
-    for boundary in range(window * 2, len(steps) - window * 2 + 1):
-        before_far, before_far_cv, _ = _step_window_stats(
-            steps, boundary - 2 * window, boundary - window, stationary_threshold
-        )
-        before, before_cv, _ = _step_window_stats(
-            steps, boundary - window, boundary, stationary_threshold
-        )
-        after, after_cv, _ = _step_window_stats(
-            steps, boundary, boundary + window, stationary_threshold
-        )
-        after_far, after_far_cv, _ = _step_window_stats(
-            steps, boundary + window, boundary + 2 * window, stationary_threshold
-        )
-        if None in (before_far, before, after, after_far):
+    raw_boundaries = params.get("fallback_boundaries")
+    if not isinstance(raw_boundaries, (list, tuple)):
+        raw_boundaries = []
+    boundaries: list[int] = []
+    for value in raw_boundaries:
+        try:
+            boundary = int(value)
+        except (TypeError, ValueError):
             continue
-        assert before_far is not None and before is not None and after is not None and after_far is not None
-        assert before_far_cv is not None and before_cv is not None and after_cv is not None and after_far_cv is not None
-        if max(before_far_cv, before_cv, after_cv, after_far_cv) > 0.55:
-            continue
-        pre_stability = max(before_far, before) / max(min(before_far, before), 1e-9)
-        post_stability = max(after, after_far) / max(min(after, after_far), 1e-9)
-        if pre_stability > 1.35 or post_stability > 1.35:
-            continue
+        if 8 <= boundary <= len(plan_points) - 8:
+            boundaries.append(boundary)
+    boundaries = sorted(set(boundaries))
+    diagnostics["fallback_boundaries"] = boundaries
+    diagnostics["fallback_boundary_source"] = params.get("fallback_boundary_source")
+    if not fallback_enabled or not boundaries:
+        diagnostics.update({
+            "quality": "no_explicit_fallback_boundaries",
+            "input_step_median": round(float(np.median(positive)), 6),
+            "output_step_median": round(float(np.median(positive)), 6),
+            "fallback_enabled": fallback_enabled,
+            "metric_scale_enabled": metric_enabled,
+        })
+        return plan_points.copy(), diagnostics
 
-        ratio = after / max(before, 1e-9)
-        symmetric_ratio = max(ratio, 1.0 / max(ratio, 1e-9))
-        if symmetric_ratio < 1.45:
-            continue
-
-        near_forced_boundary = False
-        forced_distance: int | None = None
-        if fallback_enabled and max_segment_frames > 0:
-            nearest = int(round(boundary / max_segment_frames)) * max_segment_frames
-            forced_distance = abs(boundary - nearest)
-            near_forced_boundary = nearest > 0 and forced_distance <= max(window, 12)
-
-        local_confidence_low = False
-        local_conf = confidence[
-            max(0, boundary - max(3, window // 3)):
-            min(len(confidence), boundary + max(3, window // 3) + 1)
-        ]
-        local_conf = local_conf[np.isfinite(local_conf)]
-        local_confidence = float(np.median(local_conf)) if local_conf.size else None
-        if local_confidence is not None and confidence_median is not None and confidence_median > 0:
-            local_confidence_low = local_confidence < confidence_median * 0.72
-
-        strong_evidence = fallback_enabled and symmetric_ratio >= 2.35
-        fallback_evidence = (
-            (near_forced_boundary and metric_enabled and symmetric_ratio >= 1.45)
-            or (near_forced_boundary and symmetric_ratio >= 1.8)
-            or (fallback_enabled and local_confidence_low and symmetric_ratio >= 1.7)
-            or (metric_enabled and local_confidence_low and symmetric_ratio >= 1.6)
-        )
-        if not strong_evidence and not fallback_evidence:
-            continue
-
-        candidates.append({
-            "boundary": boundary,
-            "ratio": ratio,
-            "symmetric_ratio": symmetric_ratio,
-            "score": abs(math.log(max(ratio, 1e-9))),
-            "near_forced_boundary": near_forced_boundary,
-            "forced_boundary_distance": forced_distance,
-            "local_confidence_low": local_confidence_low,
-            "local_confidence": local_confidence,
+    stationary_threshold = max(float(np.median(positive)) * 0.05, 1e-9)
+    segment_limits = [0, *boundaries, len(plan_points)]
+    segments: list[dict[str, Any]] = []
+    segment_velocity_values: list[np.ndarray] = []
+    for start, end in zip(segment_limits, segment_limits[1:]):
+        values = velocities[start: max(start, end - 1)]
+        values = values[np.isfinite(values) & (values > stationary_threshold)]
+        segment_velocity_values.append(values)
+        median = float(np.median(values)) if values.size >= 8 else None
+        segments.append({
+            "start": start,
+            "end": end,
+            "motion_samples": int(values.size),
+            "median_velocity": median,
         })
 
-    # One physical reset creates a plateau of nearby candidate windows.  Keep
-    # the strongest point in each plateau, then apply resets chronologically.
-    selected: list[dict[str, Any]] = []
-    def candidate_priority(item: Mapping[str, Any]) -> tuple[float, int, int]:
-        forced_distance = item.get("forced_boundary_distance")
-        return (
-            float(item["score"]),
-            1 if item.get("near_forced_boundary") else 0,
-            -int(forced_distance) if forced_distance is not None else -10_000,
-        )
+    valid_segments = [segment for segment in segments if segment["median_velocity"] is not None]
+    if not valid_segments:
+        diagnostics["quality"] = "insufficient_segment_motion"
+        diagnostics["segments"] = segments
+        return plan_points.copy(), diagnostics
 
-    for candidate in sorted(candidates, key=candidate_priority, reverse=True):
-        if any(abs(int(candidate["boundary"]) - int(item["boundary"])) <= window for item in selected):
+    # Merge adjacent fallback segments whose robust motion scale agrees.  A
+    # long production run can contain many bridge resets inside one unchanged
+    # scale epoch; applying a new multiplier at each reset is the old bug.
+    regimes: list[dict[str, Any]] = []
+    merge_ratio = 1.45
+    for segment_index, segment in enumerate(segments):
+        median = segment["median_velocity"]
+        if median is None:
+            if regimes:
+                regimes[-1]["segment_indices"].append(segment_index)
+            else:
+                regimes.append({"segment_indices": [segment_index], "valid_values": []})
             continue
-        selected.append(candidate)
-    selected.sort(key=lambda item: int(item["boundary"]))
+        if regimes and regimes[-1]["valid_values"]:
+            previous_values = np.concatenate(regimes[-1]["valid_values"])
+            previous = float(np.median(previous_values))
+            ratio = max(float(median) / max(previous, 1e-9), previous / max(float(median), 1e-9))
+        else:
+            ratio = 1.0
+        if not regimes or ratio > merge_ratio:
+            regimes.append({
+                "segment_indices": [segment_index],
+                "valid_values": [segment_velocity_values[segment_index]],
+            })
+        else:
+            regimes[-1]["segment_indices"].append(segment_index)
+            regimes[-1]["valid_values"].append(segment_velocity_values[segment_index])
+
+    regimes = [regime for regime in regimes if regime["segment_indices"]]
+    for regime in regimes:
+        value_groups = regime.pop("valid_values")
+        regime_values = np.concatenate(value_groups) if value_groups else np.asarray([], dtype=np.float64)
+        regime["median_velocity"] = float(np.median(regime_values)) if regime_values.size else None
+        regime["start"] = segments[regime["segment_indices"][0]]["start"]
+        regime["end"] = segments[regime["segment_indices"][-1]]["end"]
+
+    anchor = next((regime for regime in regimes if regime["median_velocity"] is not None), regimes[0])
+    reference_velocity = float(anchor["median_velocity"] or np.median(positive))
+    segment_factors = np.ones(len(segments), dtype=np.float64)
+    for regime in regimes:
+        median = regime["median_velocity"]
+        factor = 1.0
+        raw_ratio = None
+        if median is not None and median > 1e-9:
+            raw_ratio = float(median) / max(reference_velocity, 1e-9)
+            symmetric_ratio = max(raw_ratio, 1.0 / max(raw_ratio, 1e-9))
+            if symmetric_ratio >= 1.55:
+                factor = float(np.clip(1.0 / raw_ratio, 1.0 / 3.0, 3.0))
+        regime["applied_scale"] = factor
+        regime["raw_velocity_ratio"] = raw_ratio
+        for segment_index in regime["segment_indices"]:
+            segment_factors[segment_index] = factor
+        if abs(factor - 1.0) > 1e-6:
+            diagnostics["regime_changes"].append({
+                "trajectory_index": int(regime["start"]),
+                "end_index": int(regime["end"]),
+                "raw_velocity_ratio": round(float(raw_ratio), 5) if raw_ratio is not None else None,
+                "applied_scale": round(factor, 5),
+            })
 
     corrected_deltas = deltas.copy()
-    for candidate in selected:
-        boundary = int(candidate["boundary"])
-        correction = 1.0 / float(candidate["ratio"])
-        corrected_deltas[boundary:] *= correction
-        diagnostics["regime_changes"].append({
-            "trajectory_index": boundary,
-            "step_ratio": round(float(candidate["ratio"]), 5),
-            "applied_scale": round(correction, 5),
-            "near_forced_boundary": bool(candidate["near_forced_boundary"]),
-            "forced_boundary_distance": candidate["forced_boundary_distance"],
-            "local_confidence_low": bool(candidate["local_confidence_low"]),
-        })
+    for segment_index, (start, end) in enumerate(zip(segment_limits, segment_limits[1:])):
+        corrected_deltas[start: max(start, end - 1)] *= segment_factors[segment_index]
 
     corrected = plan_points.copy()
-    if selected:
+    if diagnostics["regime_changes"]:
         corrected[1:, :2] = plan_points[0, :2] + np.cumsum(corrected_deltas, axis=0)
     output_steps = np.linalg.norm(np.diff(corrected[:, :2], axis=0), axis=1)
-    output_positive = output_steps[np.isfinite(output_steps) & (output_steps > 1e-9)]
+    output_velocities = output_steps / np.maximum(source_deltas, 1e-9)
+    output_positive = output_velocities[np.isfinite(output_velocities) & (output_velocities > 1e-9)]
+    applied_count = len(diagnostics["regime_changes"])
     diagnostics.update({
-        "quality": "corrected" if selected else "stable_or_unconfirmed",
-        "applied": bool(selected),
-        "applied_count": len(selected),
-        "window_points": window,
-        "input_step_median": round(global_median, 6),
+        "quality": "corrected" if applied_count else "stable_epochs",
+        "applied": bool(applied_count),
+        "applied_count": applied_count,
+        "reference_velocity_per_source_frame": round(reference_velocity, 6),
+        "input_step_median": round(float(np.median(positive)), 6),
         "output_step_median": round(float(np.median(output_positive)), 6) if output_positive.size else 0.0,
         "fallback_enabled": fallback_enabled,
         "metric_scale_enabled": metric_enabled,
-        "max_segment_frames": max_segment_frames or None,
+        "segments": segments,
+        "regimes": regimes,
     })
     return corrected, diagnostics
 
@@ -1013,6 +1194,7 @@ def build_r3_trajectory(
     raw_plan, scale_stability = _stabilize_scale_regimes(
         projected_plan,
         confidence,
+        source_indices,
         run_params,
     )
     turns, turn_detection = _detect_turns(
@@ -1039,6 +1221,7 @@ def build_r3_trajectory(
         "source_frame_indices": source_indices,
         "pose_confidence": [round(float(v), 6) if np.isfinite(v) else None for v in confidence],
         "trajectory_quality": {
+            "postprocess_version": R3_TRAJECTORY_POSTPROCESS_VERSION,
             **filter_quality,
             "projection": plane,
             "scale_stability": scale_stability,

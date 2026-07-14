@@ -11,7 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from r3_trajectory import build_r3_trajectory
+from r3_trajectory import build_r3_trajectory, summarize_fallback_edges
 
 
 def make_pose(frame: int, x: float, y: float, z: float, rotation: list[list[float]] | None = None) -> dict:
@@ -271,6 +271,29 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertTrue(projection["trajectory_plane"]["eligible"])
         self.assertAlmostEqual(after / before, 1.0, delta=0.03)
 
+    def test_camera_turn_axis_recovers_gravity_from_downward_camera(self) -> None:
+        # A production camera is pointed steeply at the floor, so its local
+        # up vector is not gravity. Gradual yaw still has one common world
+        # rotation axis and recovers the physical floor normal.
+        poses = []
+        for index in range(100):
+            angle = (math.pi / 2.0) * index / 99.0
+            poses.append(make_pose(
+                index,
+                40.0 * math.sin(angle),
+                0.0,
+                40.0 * (1.0 - math.cos(angle)),
+                rotation_for_pitched_heading(math.cos(angle), math.sin(angle), 55.0),
+            ))
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+
+        projection = result["trajectory_quality"]["projection"]
+        self.assertEqual(projection["method"], "camera_rotation_axis")
+        self.assertTrue(projection["camera_rotation_axis"]["reliable"])
+        normal = np.asarray(projection["normal"], dtype=np.float64)
+        self.assertGreater(float(np.dot(normal, np.array([0.0, -1.0, 0.0]))), 0.99)
+
     def test_repairs_persistent_scale_reset_at_forced_fallback(self) -> None:
         poses = []
         z = 0.0
@@ -288,7 +311,8 @@ class R3TrajectoryTests(unittest.TestCase):
             run_params={
                 "online_fallback_enabled": True,
                 "metric_scale_enabled": True,
-                "max_segment_frames": 60,
+                "fallback_boundaries": [61],
+                "fallback_boundary_source": "pose_edge_log",
             },
         )
 
@@ -297,8 +321,59 @@ class R3TrajectoryTests(unittest.TestCase):
         scale = result["trajectory_quality"]["scale_stability"]
         self.assertTrue(scale["applied"])
         self.assertEqual(scale["applied_count"], 1)
-        self.assertAlmostEqual(scale["regime_changes"][0]["step_ratio"], 3.0, delta=0.05)
-        self.assertAlmostEqual(distance, 140.0, delta=3.0)
+        self.assertAlmostEqual(scale["regime_changes"][0]["raw_velocity_ratio"], 3.0, delta=0.05)
+        self.assertAlmostEqual(distance, 142.0, delta=3.0)
+
+    def test_repeated_fallbacks_do_not_compound_one_scale_epoch(self) -> None:
+        poses = []
+        z = 0.0
+        poses.append(make_pose(0, 0.0, 0.0, z))
+        for _ in range(50):
+            z += 1.0
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+        for _ in range(160):
+            z += 0.4
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+
+        result = build_r3_trajectory(
+            poses,
+            [2.0] * len(poses),
+            {"source_indices": [index * 5 for index in range(len(poses))]},
+            run_params={
+                "online_fallback_enabled": True,
+                "fallback_boundaries": [51, 91, 131, 171],
+                "fallback_boundary_source": "pose_edge_log",
+            },
+        )
+
+        scale = result["trajectory_quality"]["scale_stability"]
+        distance = float(np.linalg.norm(
+            np.diff(np.asarray(result["plan_trajectory"])[:, :2], axis=0),
+            axis=1,
+        ).sum())
+        self.assertTrue(scale["applied"])
+        self.assertEqual(scale["applied_count"], 1)
+        self.assertFalse(scale["cumulative_scaling"])
+        self.assertEqual(len(scale["regimes"]), 2)
+        self.assertAlmostEqual(scale["regime_changes"][0]["applied_scale"], 2.5, delta=0.05)
+        self.assertAlmostEqual(distance, 208.0, delta=4.0)
+
+    def test_pose_edge_log_yields_only_explicit_fallback_boundaries(self) -> None:
+        summary = summarize_fallback_edges(
+            [
+                {"frame_i": 0, "frame_j": 1, "edge_type": "normal"},
+                {"frame_i": 40, "frame_j": 45, "edge_type": "bridge"},
+                {"frame_i": 45, "frame_j": 49, "edge_type": "bridge"},
+                {"frame_i": 180, "frame_j": 190, "edge_type": "bridge"},
+                {"frame_i": 190, "frame_j": 195, "edge_type": "bridge"},
+            ],
+            point_count=220,
+            bridge_window=10,
+        )
+
+        self.assertEqual(summary["bridge_edge_count"], 4)
+        self.assertEqual(summary["boundaries"], [50, 196])
+        self.assertEqual([event["bridge_end"] for event in summary["events"]], [49, 195])
 
     def test_does_not_normalize_unconfirmed_walking_speed_change(self) -> None:
         poses = []

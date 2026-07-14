@@ -54,10 +54,53 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
         toast.error("Не удалось загрузить анализ видео");
         return;
       }
-      const data = result.data as { trajectory?: unknown; map_trajectory?: unknown; turn_points?: unknown; map_turn_points?: unknown; processing_stats?: unknown };
-      const trajectory = data.map_trajectory ?? data.trajectory;
-      const turnPoints = data.map_turn_points ?? data.turn_points ?? [];
-      const stats = data.processing_stats;
+      const data = result.data as {
+        method?: unknown;
+        trajectory?: unknown;
+        map_trajectory?: unknown;
+        plan_trajectory?: unknown;
+        turn_points?: unknown;
+        map_turn_points?: unknown;
+        processing_stats?: unknown;
+      };
+      const method = String(data.method || "");
+      let trajectory = data.map_trajectory ?? data.plan_trajectory ?? data.trajectory;
+      let turnPoints = data.map_turn_points ?? data.turn_points ?? [];
+      let trajectoryQuality: Record<string, unknown> | undefined;
+
+      // Saved analysis JSON can outlive trajectory post-processing fixes. For
+      // R3, rebuild the lightweight plan from the original poses on every load.
+      if (method.toLowerCase().startsWith("r3")) {
+        try {
+          const current = await apiClient.getR3Trajectory(video.video_id);
+          if (current.success && Array.isArray(current.plan_trajectory) && current.plan_trajectory.length > 0) {
+            trajectory = current.plan_trajectory;
+            turnPoints = current.turn_points ?? turnPoints;
+            trajectoryQuality = current.trajectory_quality;
+          }
+        } catch (error) {
+          console.warn("Current R3 trajectory is unavailable; using saved analysis", error);
+        }
+      }
+
+      const processingStats =
+        data.processing_stats && typeof data.processing_stats === "object"
+          ? data.processing_stats as Record<string, unknown>
+          : {};
+      const projection =
+        trajectoryQuality?.projection && typeof trajectoryQuality.projection === "object"
+          ? trajectoryQuality.projection as Record<string, unknown>
+          : undefined;
+      const stats: Record<string, unknown> = {
+        ...processingStats,
+        method,
+        ...(trajectoryQuality ? {
+          trajectory_quality: trajectoryQuality,
+          r3_trajectory_quality: trajectoryQuality,
+        } : {}),
+        plan_coordinate_convention:
+          projection?.plan_coordinate_convention ?? processingStats.plan_coordinate_convention,
+      };
 
       if (!trajectory || !Array.isArray(trajectory) || trajectory.length === 0) {
         toast.error("Траектория пуста или отсутствует");
@@ -65,10 +108,11 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
       }
 
       if (onAnalysisLoaded) {
+        onVideoSelected?.(video);
         onAnalysisLoaded(
           trajectory as number[][],
           Array.isArray(turnPoints) ? (turnPoints as Record<string, unknown>[]) : [],
-          stats as Record<string, unknown> | undefined
+          stats
         );
         toast.success(`Анализ "${video.filename}" загружен`);
       }

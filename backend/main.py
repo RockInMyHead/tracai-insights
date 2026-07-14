@@ -3809,6 +3809,28 @@ async def r3_diagnostics_proxy(video_id: str):
         return JSONResponse({"detail": str(e)}, status_code=502)
 
 
+@app.get("/api/r3-trajectory/{video_id}")
+async def r3_trajectory_proxy(video_id: str):
+    """Proxy the current lightweight R3 trajectory post-processing result."""
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-trajectory/{video_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(gpu_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return JSONResponse({"detail": text[:500]}, status_code=resp.status)
+                try:
+                    return JSONResponse(json.loads(text))
+                except json.JSONDecodeError:
+                    return JSONResponse(
+                        {"detail": "GPU Worker returned invalid trajectory JSON"},
+                        status_code=502,
+                    )
+    except Exception as e:
+        logger.error(f"[{video_id}] R3 trajectory proxy error: {e}", exc_info=True)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
 async def _proxy_lingbot_json(path: str, timeout_seconds: int = 60) -> JSONResponse:
     url = f"{LINGBOT_WORKER_URL}{path}"
     try:

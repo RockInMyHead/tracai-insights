@@ -365,6 +365,7 @@ const TrajectoryAnalysisPage = () => {
       color: string;
       videoId?: string;
       method?: string;
+      coordinateConvention?: string;
       mapAligned?: boolean;
       manualPlanSpace?: boolean;
       r3AutoFitToPlan?: boolean;
@@ -483,15 +484,37 @@ const TrajectoryAnalysisPage = () => {
     };
     const converted = convertTrajectory(newTrajectory);
     const manualOverride = Boolean(newStats?.manual_override);
+    const method = String(newStats?.method || "");
+    const quality = (
+      newStats?.r3_trajectory_quality && typeof newStats.r3_trajectory_quality === "object"
+        ? newStats.r3_trajectory_quality
+        : newStats?.trajectory_quality
+    ) as Record<string, unknown> | undefined;
+    const projection = (
+      quality?.projection && typeof quality.projection === "object"
+        ? quality.projection
+        : undefined
+    ) as Record<string, unknown> | undefined;
+    const coordinateConvention = String(
+      newStats?.plan_coordinate_convention
+        || projection?.plan_coordinate_convention
+        || "",
+    );
+    const mapAligned = Boolean(newStats?.map_matching_applied) || manualOverride;
+    const isR3 = method.toLowerCase().startsWith("r3")
+      || coordinateConvention === "x_forward_y_left_z_up";
     const trajectoriesData = [{
       trajectory: converted,
       turnPoints: newTurnPoints || [],
       ownerName: 'Библиотека',
       color: '#3b82f6',
       videoId: selectedVideo?.video_id,
-      method: String(newStats?.method || ""),
-      mapAligned: Boolean(newStats?.map_matching_applied) || manualOverride,
+      method,
+      coordinateConvention: coordinateConvention || undefined,
+      mapAligned,
       manualPlanSpace: manualOverride,
+      mapScaleFactor: isR3 ? 1 : finiteNum(newStats?.scale_factor, 1),
+      r3AutoFitToPlan: isR3 && !mapAligned,
     }];
     setTrajectory(trajectoriesData);
     setTurnPoints(newTurnPoints || []);
