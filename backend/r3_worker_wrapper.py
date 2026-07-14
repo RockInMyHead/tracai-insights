@@ -300,9 +300,19 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         if release_preset or not env_enabled("R3_ENABLE_SEGMENT_PGO", False):
             cmd.append("--disable_segment_pgo")
 
-    # DA3 metric model is cached on the 3090 host; keep an env kill-switch for
-    # emergency rollback without changing code.
-    if mode in {"long", "strided"} and env_enabled("R3_ENABLE_METRIC_SCALE", True):
+    # A floor-plan overlay needs continuity, not a fresh absolute metric guess
+    # after every fallback.  Upstream accepts even a >2x metric re-anchor; on a
+    # long indoor route that makes later corridors visibly expand/shrink.  The
+    # bridge-depth fallback already maps every new segment into the previous
+    # scale, so keep that continuity policy by default.  Metric re-anchoring is
+    # still available as an explicit experiment with the new policy variable;
+    # this intentionally neutralizes stale R3_ENABLE_METRIC_SCALE=true values.
+    scale_policy = env_choice(
+        "R3_SCALE_POLICY",
+        "bridge_continuity",
+        {"bridge_continuity", "metric_reanchor"},
+    )
+    if mode in {"long", "strided"} and scale_policy == "metric_reanchor":
         cmd += [
             "--metric_scale_enabled",
             "--metric_bootstrap_frames", "5",
@@ -945,6 +955,11 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "wrapper_mode": run_params.get("wrapper_mode"),
             "mode": run_params.get("mode"),
             "inference_time_s": run_params.get("inference_time_s"),
+            "online_fallback_enabled": run_params.get("online_fallback_enabled", False),
+            "max_segment_frames": run_params.get("max_segment_frames"),
+            "metric_scale_enabled": run_params.get("metric_scale_enabled", False),
+            "metric_bootstrap_frames": run_params.get("metric_bootstrap_frames"),
+            "depth_scale_mode": run_params.get("depth_scale_mode"),
             "segmented_long": run_params.get("segmented_long", False),
             "segment_count": run_params.get("segment_count"),
             "segment_frames": run_params.get("segment_frames"),

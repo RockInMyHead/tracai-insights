@@ -34,12 +34,57 @@ def make_pose(frame: int, x: float, y: float, z: float, rotation: list[list[floa
 def rotation_for_forward(x: float, y: float, z: float) -> list[list[float]]:
     forward = np.array([x, y, z], dtype=np.float64)
     forward /= np.linalg.norm(forward)
-    up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    right = np.cross(up, forward)
-    return np.column_stack((right, up, forward)).tolist()
+    physical_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    right = np.cross(forward, physical_up)
+    right /= np.linalg.norm(right)
+    camera_down = np.cross(forward, right)
+    camera_down /= np.linalg.norm(camera_down)
+    return np.column_stack((right, camera_down, forward)).tolist()
+
+
+def rotation_for_pitched_heading(x: float, z: float, pitch_degrees: float) -> list[list[float]]:
+    horizontal = np.array([x, 0.0, z], dtype=np.float64)
+    horizontal /= np.linalg.norm(horizontal)
+    pitch = math.radians(pitch_degrees)
+    camera_down_world = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    forward = math.cos(pitch) * horizontal + math.sin(pitch) * camera_down_world
+    forward /= np.linalg.norm(forward)
+    physical_up = -camera_down_world
+    right = np.cross(forward, physical_up)
+    right /= np.linalg.norm(right)
+    camera_down = np.cross(forward, right)
+    camera_down /= np.linalg.norm(camera_down)
+    return np.column_stack((right, camera_down, forward)).tolist()
 
 
 class R3TrajectoryTests(unittest.TestCase):
+    def test_opencv_left_turn_has_canonical_left_handedness(self) -> None:
+        # R3 exports OpenCV c2w: local +Y is camera-down.  With a +Z initial
+        # heading, a physical left turn goes toward -X and must become +Y in
+        # canonical plan space.
+        poses = [
+            make_pose(i, 0.0, 0.0, float(i), rotation_for_forward(0.0, 0.0, 1.0))
+            for i in range(18)
+        ]
+        poses.extend(
+            make_pose(
+                len(poses),
+                -float(index),
+                0.0,
+                17.0,
+                rotation_for_forward(-1.0, 0.0, 0.0),
+            )
+            for index in range(1, 19)
+        )
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+
+        self.assertEqual(result["trajectory_quality"]["projection"]["plan_coordinate_convention"], "x_forward_y_left_z_up")
+        self.assertGreater(result["plan_trajectory"][-1][1], 15.0)
+        self.assertEqual(len(result["turn_points"]), 1)
+        self.assertEqual(result["turn_points"][0]["turn_type"], "left")
+        self.assertAlmostEqual(result["turn_points"][0]["angle_degrees"], 90.0, delta=2.0)
+
     def test_projects_floor_path_and_maps_turn_to_source_frame(self) -> None:
         poses = [make_pose(i, float(i), 0.0, 0.0) for i in range(12)]
         poses.extend(make_pose(i + 12, 11.0, 0.0, float(i + 1)) for i in range(11))
@@ -188,6 +233,93 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertLess(corrected_closure_error, 12.0)
         correction = result["trajectory_quality"]["heading_correction"]
         self.assertEqual(correction["applied_count"], 4)
+
+    def test_trajectory_plane_prevents_pitch_dependent_scale(self) -> None:
+        # A downward-looking camera makes camera-local up tilt backward.  Using
+        # that vector as the floor normal compresses the long first leg and
+        # makes the post-turn leg look larger.  A planar L-route has enough 2D
+        # support to recover the true floor with trajectory PCA.
+        poses = [
+            make_pose(
+                i,
+                0.0,
+                0.0,
+                float(i),
+                rotation_for_pitched_heading(0.0, 1.0, 55.0),
+            )
+            for i in range(70)
+        ]
+        poses.extend(
+            make_pose(
+                len(poses),
+                -float(index),
+                0.0,
+                69.0,
+                rotation_for_pitched_heading(-1.0, 0.0, 55.0),
+            )
+            for index in range(1, 31)
+        )
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+        plan = np.asarray(result["raw_plan_trajectory"], dtype=np.float64)
+        steps = np.linalg.norm(np.diff(plan[:, :2], axis=0), axis=1)
+        before = float(np.median(steps[10:60]))
+        after = float(np.median(steps[75:95]))
+
+        projection = result["trajectory_quality"]["projection"]
+        self.assertEqual(projection["method"], "trajectory_plane_pca")
+        self.assertTrue(projection["trajectory_plane"]["eligible"])
+        self.assertAlmostEqual(after / before, 1.0, delta=0.03)
+
+    def test_repairs_persistent_scale_reset_at_forced_fallback(self) -> None:
+        poses = []
+        z = 0.0
+        poses.append(make_pose(0, 0.0, 0.0, z))
+        for _ in range(60):
+            z += 1.0
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+        for _ in range(80):
+            z += 3.0
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+
+        result = build_r3_trajectory(
+            poses,
+            [2.0] * len(poses),
+            run_params={
+                "online_fallback_enabled": True,
+                "metric_scale_enabled": True,
+                "max_segment_frames": 60,
+            },
+        )
+
+        plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
+        distance = float(np.linalg.norm(np.diff(plan[:, :2], axis=0), axis=1).sum())
+        scale = result["trajectory_quality"]["scale_stability"]
+        self.assertTrue(scale["applied"])
+        self.assertEqual(scale["applied_count"], 1)
+        self.assertAlmostEqual(scale["regime_changes"][0]["step_ratio"], 3.0, delta=0.05)
+        self.assertAlmostEqual(distance, 140.0, delta=3.0)
+
+    def test_does_not_normalize_unconfirmed_walking_speed_change(self) -> None:
+        poses = []
+        z = 0.0
+        poses.append(make_pose(0, 0.0, 0.0, z))
+        for _ in range(70):
+            z += 1.0
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+        for _ in range(70):
+            z += 2.0
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+
+        scale = result["trajectory_quality"]["scale_stability"]
+        distance = float(np.linalg.norm(
+            np.diff(np.asarray(result["plan_trajectory"])[:, :2], axis=0),
+            axis=1,
+        ).sum())
+        self.assertFalse(scale["applied"])
+        self.assertAlmostEqual(distance, 210.0, delta=2.0)
 
 
 if __name__ == "__main__":
