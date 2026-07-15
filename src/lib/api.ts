@@ -75,6 +75,7 @@ export interface VideoAnalysisResult {
     r3_pose_confidence?: Array<number | null>;  // Уверенность каждой позиции
     r3_pose_graph?: Record<string, unknown>;
     r3_pose_graph_candidate?: Record<string, unknown>;
+    r3_scale_aware_candidate?: Record<string, unknown>;
     total_processing_time: number;
     video_info: {
       width: number;
@@ -87,7 +88,7 @@ export interface VideoAnalysisResult {
   message: string;
 }
 
-export type R3TrajectorySource = "raw" | "robust_candidate";
+export type R3TrajectorySource = "raw" | "robust_candidate" | "scale_aware_candidate";
 
 export interface TrackingOptions {
   detect_interval?: number;
@@ -940,6 +941,7 @@ export class ApiClient {
     fallback_summary?: Record<string, unknown>;
     pose_graph?: Record<string, unknown>;
     pose_graph_candidate?: Record<string, unknown>;
+    scale_aware_candidate?: Record<string, unknown>;
   }> {
     const query = new URLSearchParams({ trajectory_source: trajectorySource });
     const resp = await agentFetch(

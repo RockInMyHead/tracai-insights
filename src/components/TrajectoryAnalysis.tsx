@@ -105,9 +105,11 @@ const mergeR3TrajectoryResponse = (
 
   return {
     ...analysisData,
-    method: selectedSource === "robust_candidate"
-      ? "r3_reconstruction_robust_candidate"
-      : "r3_reconstruction",
+    method: selectedSource === "scale_aware_candidate"
+      ? "r3_reconstruction_scale_aware"
+      : selectedSource === "robust_candidate"
+        ? "r3_reconstruction_robust_candidate"
+        : "r3_reconstruction",
     trajectory: planTrajectory,
     plan_trajectory: planTrajectory,
     raw_trajectory_3d: mergedRawTrajectory,
@@ -116,6 +118,7 @@ const mergeR3TrajectoryResponse = (
     r3_source_timestamps_seconds: response.source_timestamps_seconds ?? [],
     r3_pose_graph: response.pose_graph,
     r3_pose_graph_candidate: response.pose_graph_candidate,
+    r3_scale_aware_candidate: response.scale_aware_candidate,
     turn_points: Array.isArray(response.turn_points)
       ? response.turn_points
       : analysisData.turn_points,
@@ -201,7 +204,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const [turnVoteThreshold, setTurnVoteThreshold] = useState<number>(3);
   const [useMlRoi, setUseMlRoi] = useState<boolean>(true);
   const [analysisMethod, setAnalysisMethod] = useState<'slam' | 'r3' | 'lingbot'>('slam');
-  const [r3TrajectorySource, setR3TrajectorySource] = useState<R3TrajectorySource>('robust_candidate');
+  const [r3TrajectorySource, setR3TrajectorySource] = useState<R3TrajectorySource>('scale_aware_candidate');
   const [isSwitchingR3Trajectory, setIsSwitchingR3Trajectory] = useState(false);
   const [liveViewVideoId, setLiveViewVideoId] = useState<string | null>(null);
   const [showLiveView, setShowLiveView] = useState(false);
@@ -891,13 +894,15 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       ));
       if (fallback) {
         toast.warning(
-          `Robust-кандидат не применён: ${fallback.response.trajectory_source_fallback_reason || "quality gate"}. Показана исходная R³.`,
+          `Кандидат не применён: ${fallback.response.trajectory_source_fallback_reason || "quality gate"}. Показан безопасный fallback.`,
         );
       } else {
         toast.success(
-          source === "robust_candidate"
-            ? "Показана robust-траектория из полного pose graph"
-            : "Показана исходная траектория R³",
+          source === "scale_aware_candidate"
+            ? "Показана scale-aware траектория с привязкой масштаба к полу"
+            : source === "robust_candidate"
+              ? "Показана robust-траектория из полного pose graph"
+              : "Показана исходная траектория R³",
         );
       }
     } catch (error) {
@@ -1368,7 +1373,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               <p className="text-xs text-muted-foreground">
                 Использует Depth Anything 3 и сохраняет исходную реконструкцию для сравнения.
               </p>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 <Button
                   type="button"
                   size="sm"
@@ -1390,15 +1395,28 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
                   ) : null}
                   Robust graph
                 </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={r3TrajectorySource === 'scale_aware_candidate' ? 'default' : 'outline'}
+                  onClick={() => handleR3TrajectorySourceChange('scale_aware_candidate')}
+                  disabled={isAnalyzing || isSwitchingR3Trajectory}
+                >
+                  Scale-aware
+                </Button>
               </div>
               <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
                 <span>
-                  Robust graph использует все относительные позы и автоматически откатывается
-                  к исходной R³, если quality gate не пройден.
+                  Scale-aware выравнивает локальный масштаб по устойчивой высоте камеры над
+                  плоскостью пола и откатывается к robust/raw при провале quality gate.
                 </span>
                 {activeR3TrajectorySource && (
-                  <Badge variant={activeR3TrajectorySource === 'robust_candidate' ? 'default' : 'secondary'}>
-                    Сейчас: {activeR3TrajectorySource === 'robust_candidate' ? 'robust' : 'исходная'}
+                  <Badge variant={activeR3TrajectorySource !== 'raw' ? 'default' : 'secondary'}>
+                    Сейчас: {activeR3TrajectorySource === 'scale_aware_candidate'
+                      ? 'scale-aware'
+                      : activeR3TrajectorySource === 'robust_candidate'
+                        ? 'robust'
+                        : 'исходная'}
                   </Badge>
                 )}
                 {activeR3FallbackReason && (

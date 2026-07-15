@@ -202,7 +202,7 @@ VIDEO_PREVIEWS_DIR.mkdir(exist_ok=True)
 MANUAL_TRAJECTORIES_PATH.parent.mkdir(exist_ok=True, parents=True)
 
 # Database initialization
-DB_PATH = Path("backend/data/database.db")
+DB_PATH = Path(__file__).parent / "data" / "database.db"
 DB_PATH.parent.mkdir(exist_ok=True, parents=True)
 
 _video_preview_lock = threading.Lock()
@@ -1040,6 +1040,7 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
         "r3_pose_confidence": confidence or None,
         "r3_pose_graph": r3_result.get("pose_graph"),
         "r3_pose_graph_candidate": r3_result.get("pose_graph_candidate"),
+        "r3_scale_aware_candidate": r3_result.get("scale_aware_candidate"),
         "pointcloud_status": r3_result.get("pointcloud_status"),
         "r3_projection": trajectory_bundle["trajectory_quality"].get("projection", {}).get("method", "robust_floor_plane"),
         "processing_stats": {

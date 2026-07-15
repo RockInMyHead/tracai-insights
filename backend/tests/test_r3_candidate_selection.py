@@ -13,6 +13,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from r3_pose_graph_optimizer import save_pose_graph_candidate
+from r3_scale_aware import build_scale_aware_candidate, save_scale_aware_candidate
 from r3_trajectory_sources import select_r3_trajectory_camera_poses
 
 
@@ -55,6 +56,64 @@ def write_candidate(
 
 
 class R3CandidateSelectionTests(unittest.TestCase):
+    def test_accepted_scale_candidate_is_selected_without_touching_raw(self) -> None:
+        raw = line_poses(40, 1.0)
+        local_scale = np.ones(40)
+        local_scale[20:] = 1.8
+        raw[1:, 0, 3] = np.cumsum(local_scale[1:])
+        observations = [
+            {
+                "trajectory_index": index,
+                "height": 1.6 * local_scale[index],
+                "inlier_fraction": 0.6,
+                "normal_alignment": 0.98,
+                "residual_ratio": 0.01,
+            }
+            for index in range(0, len(raw), 2)
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            write_camera_artifacts(base, raw)
+            save_scale_aware_candidate(base, build_scale_aware_candidate(raw, observations))
+            selected, selection = select_r3_trajectory_camera_poses(
+                base,
+                [{"frame": index, "pose": pose.tolist()} for index, pose in enumerate(raw)],
+                "scale_aware_candidate",
+            )
+            persisted_raw = np.load(base / "camera" / "000039.npz")["pose"]
+
+        self.assertEqual(selection["selected"], "scale_aware_candidate")
+        self.assertIsNone(selection["fallback_reason"])
+        self.assertNotAlmostEqual(selected[-1]["pose"][0][3], raw[-1, 0, 3])
+        np.testing.assert_allclose(persisted_raw, raw[-1])
+
+    def test_rejected_scale_candidate_falls_back_to_robust(self) -> None:
+        raw = line_poses(20, 1.2)
+        robust = line_poses(20, 1.0)
+        rejected = {
+            "c2w": robust,
+            "diagnostics": {
+                "schema_version": 1,
+                "accepted": False,
+                "rejection_reasons": ["insufficient_floor_observations"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            write_camera_artifacts(base, raw)
+            write_candidate(base, robust)
+            save_scale_aware_candidate(base, rejected)
+            selected, selection = select_r3_trajectory_camera_poses(
+                base,
+                [{"frame": index, "pose": pose.tolist()} for index, pose in enumerate(raw)],
+                "scale_aware_candidate",
+            )
+
+        self.assertEqual(selection["selected"], "robust_candidate")
+        self.assertEqual(selection["fallback_reason"], "scale_candidate_rejected")
+        self.assertAlmostEqual(selected[-1]["pose"][0][3], 19.0)
+
     def test_accepted_current_candidate_is_selected_without_touching_raw(self) -> None:
         raw = line_poses(8, 1.2)
         candidate = line_poses(8, 1.0)

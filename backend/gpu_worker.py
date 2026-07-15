@@ -50,6 +50,11 @@ try:
 except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_trajectory_sources import select_r3_trajectory_camera_poses
 
+try:
+    from r3_scale_aware import load_scale_aware_candidate_summary
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_scale_aware import load_scale_aware_candidate_summary
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("gpu_worker")
 
@@ -2291,6 +2296,7 @@ async def r3_get_pointcloud_filtered(
             point_count=camera_count,
         )
         pose_graph_candidate = load_pose_graph_candidate_summary(base)
+        scale_aware_candidate = load_scale_aware_candidate_summary(base)
         run_mode = str(run_params.get("mode") or "").lower()
         # Missing mode means the output was produced by an older wrapper that
         # cannot be trusted for the new strided+fallback+metric R3 preset.
@@ -2375,6 +2381,7 @@ async def r3_get_trajectory(
             point_count=len(trajectory_bundle.get("plan_trajectory", [])),
         )
         pose_graph_candidate = load_pose_graph_candidate_summary(base)
+        scale_aware_candidate = load_scale_aware_candidate_summary(base)
         return _sanitize_for_json({
             "success": True,
             "video_id": video_id,
@@ -2401,6 +2408,7 @@ async def r3_get_trajectory(
             "fallback_summary": fallback_summary,
             "pose_graph": pose_graph_summary,
             "pose_graph_candidate": pose_graph_candidate,
+            "scale_aware_candidate": scale_aware_candidate,
         })
     except HTTPException:
         raise

@@ -35,13 +35,30 @@ except ImportError:  # pragma: no cover - package-style startup
 
 try:
     from r3_pose_graph_optimizer import (
+        load_pose_graph_candidate_c2w,
         load_pose_graph_candidate_summary,
         run_pose_graph_shadow,
     )
 except ImportError:  # pragma: no cover - package-style startup
     from backend.r3_pose_graph_optimizer import (
+        load_pose_graph_candidate_c2w,
         load_pose_graph_candidate_summary,
         run_pose_graph_shadow,
+    )
+
+try:
+    from r3_scale_aware import (
+        build_scale_aware_candidate,
+        estimate_floor_height_observations,
+        load_scale_aware_candidate_summary,
+        save_scale_aware_candidate,
+    )
+except ImportError:  # pragma: no cover - package-style startup
+    from backend.r3_scale_aware import (
+        build_scale_aware_candidate,
+        estimate_floor_height_observations,
+        load_scale_aware_candidate_summary,
+        save_scale_aware_candidate,
     )
 
 R3_DIR = Path("/home/artem/trackai/R3")
@@ -1289,6 +1306,46 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "error": f"unsupported optimizer mode: {optimizer_mode}",
         }
 
+    scale_aware_mode = (os.getenv("R3_SCALE_AWARE_MODE") or "shadow").strip().lower()
+    scale_aware_candidate = load_scale_aware_candidate_summary(r3_output)
+    floor_scale_diagnostics: dict = {"available": False, "reason": "disabled"}
+    if scale_aware_mode == "shadow" and len(poses) >= 2 and (r3_output / "depth").exists():
+        raw_c2w = np.asarray([pose["pose"] for pose in poses], dtype=np.float64)
+        robust_c2w = load_pose_graph_candidate_c2w(
+            r3_output,
+            expected_count=len(poses),
+            accepted_only=True,
+        )
+        scale_base = robust_c2w if robust_c2w is not None else raw_c2w
+        emit("r3_scale_aware_start", {
+            "mode": "shadow",
+            "poses": len(poses),
+            "base": "robust_candidate" if robust_c2w is not None else "raw",
+        })
+        observations, floor_scale_diagnostics = estimate_floor_height_observations(
+            r3_output,
+            scale_base,
+            maximum_frames=max(24, int(os.getenv("R3_FLOOR_SCALE_MAX_FRAMES") or "180")),
+        )
+        scale_result = build_scale_aware_candidate(scale_base, observations)
+        scale_result["diagnostics"].update({
+            "base_source": "robust_candidate" if robust_c2w is not None else "raw",
+            "floor_estimation": floor_scale_diagnostics,
+        })
+        scale_aware_candidate = save_scale_aware_candidate(r3_output, scale_result)
+        emit("r3_scale_aware_complete", {
+            "accepted": scale_aware_candidate.get("accepted", False),
+            "observations": scale_aware_candidate.get("observation_count", 0),
+            "scale_range": scale_aware_candidate.get("scale_range"),
+            "rejection_reasons": scale_aware_candidate.get("rejection_reasons", []),
+        })
+    elif scale_aware_mode not in {"off", "shadow"}:
+        scale_aware_candidate = {
+            "available": False,
+            "accepted": False,
+            "error": f"unsupported scale-aware mode: {scale_aware_mode}",
+        }
+
     result = {
         "success": True,
         "num_frames": len(poses),
@@ -1316,6 +1373,9 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "pose_graph_optimizer_mode": optimizer_mode,
             "pose_graph_candidate_accepted": pose_graph_candidate.get("accepted", False),
             "pose_graph_optimizer_seconds": pose_graph_candidate.get("runtime_seconds"),
+            "scale_aware_mode": scale_aware_mode,
+            "scale_aware_candidate_accepted": scale_aware_candidate.get("accepted", False),
+            "scale_aware_observations": scale_aware_candidate.get("observation_count", 0),
         },
         "camera_poses": sanitize_json(poses),
         "num_poses_total": len(poses),
@@ -1324,6 +1384,8 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
         "frame_selection": sanitize_json(frame_selection),
         "pose_graph": sanitize_json(pose_graph_summary),
         "pose_graph_candidate": sanitize_json(pose_graph_candidate),
+        "scale_aware_candidate": sanitize_json(scale_aware_candidate),
+        "floor_scale_diagnostics": sanitize_json(floor_scale_diagnostics),
     }
 
     # Generate point cloud from depth maps
