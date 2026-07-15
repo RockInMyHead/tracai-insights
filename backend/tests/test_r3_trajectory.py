@@ -274,7 +274,7 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(correction["applied_count"], 0)
         self.assertEqual(correction["suppressed_count"], 4)
         self.assertEqual(len(correction["observations"]), 4)
-        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 4)
+        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 5)
 
     def test_trajectory_plane_prevents_pitch_dependent_scale(self) -> None:
         # A downward-looking camera makes camera-local up tilt backward.  Using
@@ -474,6 +474,59 @@ class R3TrajectoryTests(unittest.TestCase):
         ).sum())
         self.assertFalse(scale["applied"])
         self.assertAlmostEqual(distance, 210.0, delta=2.0)
+
+    def test_guarded_straightening_removes_lateral_drift_between_turns(self) -> None:
+        poses = []
+        for index in range(41):
+            lateral = 0.7 * math.sin(math.pi * index / 40.0)
+            poses.append(make_pose(len(poses), float(index), 0.0, lateral))
+        for index in range(1, 36):
+            lateral = 0.6 * math.sin(math.pi * index / 35.0)
+            poses.append(make_pose(len(poses), 40.0 + lateral, 0.0, float(index)))
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+        raw = np.asarray(result["raw_plan_trajectory"], dtype=np.float64)
+        plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
+        diagnostics = result["trajectory_quality"]["structural_regularization"]
+
+        self.assertTrue(diagnostics["applied"])
+        self.assertGreaterEqual(diagnostics["accepted_runs"], 2)
+        raw_singular = np.linalg.svd(raw[6:35, :2] - raw[6:35, :2].mean(axis=0), compute_uv=False)
+        plan_singular = np.linalg.svd(plan[6:35, :2] - plan[6:35, :2].mean(axis=0), compute_uv=False)
+        self.assertLess(float(plan_singular[-1]), float(raw_singular[-1]) * 0.45)
+        self.assertEqual(len(result["turn_points"]), 1)
+        self.assertAlmostEqual(abs(result["turn_points"][0]["angle_degrees"]), 90.0, delta=3.0)
+        self.assertAlmostEqual(diagnostics["distance_ratio"], 1.0, delta=0.02)
+
+    def test_guarded_straightening_preserves_true_diagonal_and_endpoints(self) -> None:
+        poses = [make_pose(i, float(i), 0.0, float(i) * 0.65) for i in range(40)]
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+        raw = np.asarray(result["raw_plan_trajectory"], dtype=np.float64)
+        plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
+        diagnostics = result["trajectory_quality"]["structural_regularization"]
+
+        self.assertFalse(diagnostics["axis_snapping"])
+        self.assertTrue(np.array_equal(plan, raw))
+        self.assertTrue(np.array_equal(plan[[0, -1]], raw[[0, -1]]))
+
+    def test_guarded_straightening_does_not_flatten_genuine_gentle_curve(self) -> None:
+        poses = []
+        for index in range(60):
+            angle = math.radians(22.0) * index / 59.0
+            poses.append(make_pose(
+                index,
+                80.0 * math.sin(angle),
+                0.0,
+                80.0 * (1.0 - math.cos(angle)),
+            ))
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+        diagnostics = result["trajectory_quality"]["structural_regularization"]
+
+        self.assertFalse(diagnostics["applied"])
+        self.assertEqual(diagnostics["runs"][0]["reason"], "not_confidently_straight")
+        self.assertGreater(diagnostics["runs"][0]["heading_spread_degrees"], 15.0)
 
 
 if __name__ == "__main__":

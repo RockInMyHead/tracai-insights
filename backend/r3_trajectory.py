@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-R3_TRAJECTORY_POSTPROCESS_VERSION = 4
+R3_TRAJECTORY_POSTPROCESS_VERSION = 5
 
 
 def summarize_fallback_edges(
@@ -1161,6 +1161,168 @@ def _summarize_camera_turn_disagreements(
     }
 
 
+def _robust_line_fit(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Fit a 2D line with a small Huber IRLS loop.
+
+    The fit is rotation invariant: a genuine diagonal corridor stays diagonal.
+    It is deliberately based only on reconstructed positions; camera yaw is
+    never allowed to rewrite trajectory geometry.
+    """
+    if len(points) < 3 or not np.isfinite(points).all():
+        return None
+    weights = np.ones(len(points), dtype=np.float64)
+    origin = np.median(points, axis=0)
+    direction = np.array([1.0, 0.0], dtype=np.float64)
+    for _ in range(5):
+        weight_sum = float(weights.sum())
+        if weight_sum <= 1e-9:
+            return None
+        origin = np.sum(points * weights[:, None], axis=0) / weight_sum
+        centered = points - origin
+        covariance = (centered * weights[:, None]).T @ centered / weight_sum
+        try:
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        except np.linalg.LinAlgError:
+            return None
+        direction = eigenvectors[:, int(np.argmax(eigenvalues))]
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        residuals = centered @ normal
+        scale = 1.4826 * float(np.median(np.abs(residuals - np.median(residuals))))
+        scale = max(scale, 1e-9)
+        normalized = np.abs(residuals) / (1.5 * scale)
+        weights = np.where(normalized <= 1.0, 1.0, 1.0 / np.maximum(normalized, 1e-9))
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    return origin, direction, normal
+
+
+def _regularize_straight_runs(
+    plan_points: np.ndarray,
+    turns: Sequence[Mapping[str, Any]],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Remove low-frequency lateral drift only on strongly straight runs.
+
+    Turn approach/exit windows are protected.  Each remaining run is tested
+    independently using path efficiency, heading concentration and robust
+    lateral residual.  Corrections taper to zero at both run boundaries so
+    turns and endpoints remain observations rather than invented constraints.
+    """
+    diagnostics: dict[str, Any] = {
+        "method": "guarded_piecewise_robust_lines",
+        "applied": False,
+        "accepted_runs": 0,
+        "rejected_runs": 0,
+        "runs": [],
+        "geometry_source": "position_only",
+        "axis_snapping": False,
+    }
+    count = len(plan_points)
+    if count < 18:
+        diagnostics["quality"] = "too_short"
+        return plan_points.copy(), diagnostics
+
+    protected = sorted(
+        (
+            max(0, int(turn.get("approach_index", turn.get("trajectory_index", 0)))),
+            min(count - 1, int(turn.get("exit_index", turn.get("trajectory_index", 0)))),
+        )
+        for turn in turns
+    )
+    runs: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in protected:
+        if start - cursor >= 11:
+            runs.append((cursor, start))
+        cursor = max(cursor, end)
+    if count - 1 - cursor >= 11:
+        runs.append((cursor, count - 1))
+    if not protected:
+        runs = [(0, count - 1)]
+
+    corrected = plan_points.copy()
+    median_step = float(np.median(
+        np.linalg.norm(np.diff(plan_points[:, :2], axis=0), axis=1)
+    ))
+    median_step = max(median_step, 1e-9)
+
+    for start, end in runs:
+        xy = plan_points[start:end + 1, :2]
+        steps = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+        path_length = float(steps.sum())
+        displacement = float(np.linalg.norm(xy[-1] - xy[0]))
+        efficiency = displacement / max(path_length, 1e-9)
+        fit = _robust_line_fit(xy)
+        record: dict[str, Any] = {
+            "start": start,
+            "end": end,
+            "points": end - start + 1,
+            "path_efficiency": round(efficiency, 6),
+            "applied": False,
+        }
+        if fit is None or path_length <= median_step * 10.0:
+            record["reason"] = "insufficient_support"
+            diagnostics["rejected_runs"] += 1
+            diagnostics["runs"].append(record)
+            continue
+        origin, _, normal = fit
+        lateral = (xy - origin) @ normal
+        lateral_rmse = float(math.sqrt(float(np.mean(lateral ** 2))))
+        normalized_rmse = lateral_rmse / max(displacement, median_step)
+        headings = np.arctan2(np.diff(xy[:, 1]), np.diff(xy[:, 0]))
+        valid_heading = steps > median_step * 0.08
+        if valid_heading.any():
+            valid_values = np.unwrap(headings[valid_heading])
+            concentration = float(abs(np.mean(np.exp(1j * valid_values))))
+            heading_spread = math.degrees(float(
+                np.percentile(valid_values, 90) - np.percentile(valid_values, 10)
+            ))
+        else:
+            concentration = 0.0
+            heading_spread = 180.0
+        record.update({
+            "heading_concentration": round(concentration, 6),
+            "heading_spread_degrees": round(heading_spread, 6),
+            "lateral_rmse": round(lateral_rmse, 6),
+            "normalized_lateral_rmse": round(normalized_rmse, 6),
+        })
+        eligible = (
+            efficiency >= 0.94
+            and concentration >= 0.90
+            and heading_spread <= 15.0
+            and normalized_rmse <= 0.035
+            and lateral_rmse >= median_step * 0.12
+        )
+        if not eligible:
+            record["reason"] = "not_confidently_straight"
+            diagnostics["rejected_runs"] += 1
+            diagnostics["runs"].append(record)
+            continue
+
+        # Keep the measured endpoints and turn boundaries fixed.  The raised
+        # cosine reaches full correction after 12.5% of the run.
+        sample = np.linspace(0.0, 1.0, len(xy))
+        edge_fraction = min(0.125, 4.0 / max(len(xy) - 1, 1))
+        ramp_in = np.clip(sample / max(edge_fraction, 1e-9), 0.0, 1.0)
+        ramp_out = np.clip((1.0 - sample) / max(edge_fraction, 1e-9), 0.0, 1.0)
+        blend = np.sin(0.5 * math.pi * np.minimum(ramp_in, ramp_out)) ** 2
+        proposed = xy - (lateral * blend)[:, None] * normal[None, :]
+        maximum_shift = float(np.max(np.linalg.norm(proposed - xy, axis=1)))
+        if maximum_shift > max(median_step * 4.0, displacement * 0.045):
+            record["reason"] = "correction_too_large"
+            record["maximum_shift"] = round(maximum_shift, 6)
+            diagnostics["rejected_runs"] += 1
+            diagnostics["runs"].append(record)
+            continue
+        corrected[start:end + 1, :2] = proposed
+        record["applied"] = True
+        record["maximum_shift"] = round(maximum_shift, 6)
+        diagnostics["accepted_runs"] += 1
+        diagnostics["runs"].append(record)
+
+    diagnostics["applied"] = diagnostics["accepted_runs"] > 0
+    diagnostics["quality"] = "regularized" if diagnostics["applied"] else "unchanged"
+    return corrected, diagnostics
+
+
 def _source_frame_indices(camera_poses: Sequence[Mapping[str, Any]], frame_selection: Any) -> list[int | None]:
     source_indices: list[Any] = []
     if isinstance(frame_selection, Mapping):
@@ -1274,7 +1436,40 @@ def build_r3_trajectory(
         rotations=rotations,
         floor_basis=floor_basis,
     )
-    plan, heading_correction = _summarize_camera_turn_disagreements(raw_plan, turns)
+    position_plan, structural_regularization = _regularize_straight_runs(raw_plan, turns)
+    regularized_turns, regularized_turn_detection = _detect_turns(
+        position_plan,
+        source_indices,
+        confidence,
+        source_timestamps=source_timestamps,
+        rotations=rotations,
+        floor_basis=floor_basis,
+    )
+    raw_signature = [turn.get("turn_type") for turn in turns]
+    regularized_signature = [turn.get("turn_type") for turn in regularized_turns]
+    raw_distance = float(np.linalg.norm(np.diff(raw_plan[:, :2], axis=0), axis=1).sum())
+    regularized_distance = float(
+        np.linalg.norm(np.diff(position_plan[:, :2], axis=0), axis=1).sum()
+    )
+    distance_ratio = regularized_distance / max(raw_distance, 1e-9)
+    structural_regularization["distance_ratio"] = round(distance_ratio, 6)
+    if structural_regularization["applied"] and (
+        raw_signature != regularized_signature or not 0.97 <= distance_ratio <= 1.01
+    ):
+        position_plan = raw_plan.copy()
+        structural_regularization.update({
+            "applied": False,
+            "quality": "rejected_global_gate",
+            "fallback_reason": (
+                "turn_signature_changed"
+                if raw_signature != regularized_signature
+                else "path_length_changed"
+            ),
+        })
+    else:
+        turns = regularized_turns
+        turn_detection = regularized_turn_detection
+    plan, heading_correction = _summarize_camera_turn_disagreements(position_plan, turns)
     for turn in turns:
         index = int(turn.get("trajectory_index", -1))
         if 0 <= index < len(plan):
@@ -1296,11 +1491,12 @@ def build_r3_trajectory(
             **filter_quality,
             "projection": plane,
             "scale_stability": scale_stability,
+            "structural_regularization": structural_regularization,
             "turn_detection": turn_detection,
             "geometry_contract": {
-                "plan_source": "r3_translation_floor_projection",
+                "plan_source": "r3_translation_guarded_piecewise_lines",
                 "camera_orientation_mutates_plan": False,
-                "plan_matches_raw_plan": True,
+                "plan_matches_raw_plan": bool(np.array_equal(plan, raw_plan)),
             },
             "camera_turn_evidence": heading_correction,
             # Backward-compatible diagnostics key.  No correction is applied
