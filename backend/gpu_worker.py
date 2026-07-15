@@ -40,6 +40,11 @@ try:
 except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_pose_graph_optimizer import load_pose_graph_candidate_summary
 
+try:
+    from r3_trajectory_sources import select_r3_trajectory_camera_poses
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_trajectory_sources import select_r3_trajectory_camera_poses
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("gpu_worker")
 
@@ -927,7 +932,10 @@ def _load_r3_run_params(base: Path, point_count: int = 0) -> tuple[dict, dict]:
     return run_params, fallback_summary
 
 
-def _load_r3_trajectory_bundle(base: Path) -> tuple[dict, list[dict]]:
+def _load_r3_trajectory_bundle(
+    base: Path,
+    trajectory_source: str = "raw",
+) -> tuple[dict, list[dict]]:
     """Load R3 pose artifacts once and keep 3D/plan-space products separate."""
     import numpy as np
 
@@ -962,12 +970,22 @@ def _load_r3_trajectory_bundle(base: Path) -> tuple[dict, list[dict]]:
 
     run_params, _ = _load_r3_run_params(base, point_count=len(camera_poses))
 
-    return build_r3_trajectory(
+    selected_camera_poses, source_selection = select_r3_trajectory_camera_poses(
+        base,
         camera_poses,
+        trajectory_source,
+    )
+    bundle = build_r3_trajectory(
+        selected_camera_poses,
         pose_confidence,
         frame_selection,
         run_params,
-    ), camera_poses
+    )
+    bundle["trajectory_source_requested"] = source_selection["requested"]
+    bundle["trajectory_source"] = source_selection["selected"]
+    bundle["trajectory_source_fallback_reason"] = source_selection["fallback_reason"]
+    bundle["trajectory_source_selection"] = source_selection
+    return bundle, selected_camera_poses
 
 
 def _clean_r3_trajectory_points(raw_points):
@@ -2303,13 +2321,19 @@ async def r3_get_pointcloud_filtered(
 
 
 @app.get("/api/r3-trajectory/{video_id}")
-async def r3_get_trajectory(video_id: str):
+async def r3_get_trajectory(
+    video_id: str,
+    trajectory_source: str = Query("raw"),
+):
     """Rebuild the lightweight plan trajectory from existing R3 pose artifacts."""
     try:
         base = _r3_output_dir(video_id)
         if not base.exists():
             raise HTTPException(status_code=404, detail="R3 output not found")
-        trajectory_bundle, _ = _load_r3_trajectory_bundle(base)
+        trajectory_bundle, _ = _load_r3_trajectory_bundle(
+            base,
+            trajectory_source=trajectory_source,
+        )
         run_params, fallback_summary = _load_r3_run_params(
             base,
             point_count=len(trajectory_bundle.get("plan_trajectory", [])),
@@ -2331,6 +2355,16 @@ async def r3_get_trajectory(video_id: str):
             "source_frame_indices": trajectory_bundle.get("source_frame_indices", []),
             "source_timestamps_seconds": trajectory_bundle.get("source_timestamps_seconds", []),
             "trajectory_quality": trajectory_bundle.get("trajectory_quality", {}),
+            "trajectory_source_requested": trajectory_bundle.get(
+                "trajectory_source_requested", "raw"
+            ),
+            "trajectory_source": trajectory_bundle.get("trajectory_source", "raw"),
+            "trajectory_source_fallback_reason": trajectory_bundle.get(
+                "trajectory_source_fallback_reason"
+            ),
+            "trajectory_source_selection": trajectory_bundle.get(
+                "trajectory_source_selection", {}
+            ),
             "run_params": run_params,
             "fallback_summary": fallback_summary,
             "pose_graph": pose_graph_summary,

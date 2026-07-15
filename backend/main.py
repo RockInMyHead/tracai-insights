@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -3813,12 +3813,19 @@ async def r3_diagnostics_proxy(video_id: str):
 
 
 @app.get("/api/r3-trajectory/{video_id}")
-async def r3_trajectory_proxy(video_id: str):
+async def r3_trajectory_proxy(
+    video_id: str,
+    trajectory_source: str = Query("raw"),
+):
     """Proxy the current lightweight R3 trajectory post-processing result."""
     gpu_url = f"{GPU_WORKER_URL}/api/r3-trajectory/{video_id}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(gpu_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            async with session.get(
+                gpu_url,
+                params={"trajectory_source": trajectory_source},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
                 text = await resp.text()
                 if resp.status != 200:
                     return JSONResponse({"detail": text[:500]}, status_code=resp.status)

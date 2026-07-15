@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Video, MapPin, Activity, Clock, Navigation, Loader2, User, X, Plus, FolderOpen, Eye } from "lucide-react";
 import { toast } from "sonner";
-import { apiClient, VideoAnalysisResult, VideoListItem } from "@/lib/api";
+import { apiClient, R3TrajectorySource, VideoAnalysisResult, VideoListItem } from "@/lib/api";
 import { finiteNum } from "@/lib/numbers";
 import RealTimeR3Visualization from "./RealTimeR3Visualization";
 
@@ -79,6 +79,98 @@ interface TrajectoryData {
   r3AutoFitToPlan?: boolean;
 }
 
+type R3TrajectoryResponse = Awaited<ReturnType<typeof apiClient.getR3Trajectory>>;
+
+const mergeR3TrajectoryResponse = (
+  analysisData: AnalysisData,
+  response: R3TrajectoryResponse,
+  rawTrajectory3d?: number[][],
+  extraStats: Record<string, unknown> = {},
+): AnalysisData => {
+  const planTrajectory = Array.isArray(response.plan_trajectory ?? response.trajectory)
+    ? (response.plan_trajectory ?? response.trajectory).filter(
+        (point) => Array.isArray(point) && point.length >= 2,
+      )
+    : [];
+  if (!response.success || planTrajectory.length < 2) return analysisData;
+
+  const selectedSource = response.trajectory_source ?? "raw";
+  const trajectoryQuality = response.trajectory_quality ?? {};
+  const cleanedDistance = trajectoryQuality.cleaned_distance;
+  const currentStats =
+    (analysisData.processing_stats as Record<string, unknown> | undefined) || {};
+  const mergedRawTrajectory = Array.isArray(rawTrajectory3d) && rawTrajectory3d.length >= 2
+    ? rawTrajectory3d
+    : analysisData.raw_trajectory_3d;
+
+  return {
+    ...analysisData,
+    method: selectedSource === "robust_candidate"
+      ? "r3_reconstruction_robust_candidate"
+      : "r3_reconstruction",
+    trajectory: planTrajectory,
+    plan_trajectory: planTrajectory,
+    raw_trajectory_3d: mergedRawTrajectory,
+    r3_camera_points: mergedRawTrajectory,
+    r3_source_frame_indices: response.source_frame_indices ?? [],
+    r3_source_timestamps_seconds: response.source_timestamps_seconds ?? [],
+    r3_pose_graph: response.pose_graph,
+    r3_pose_graph_candidate: response.pose_graph_candidate,
+    turn_points: Array.isArray(response.turn_points)
+      ? response.turn_points
+      : analysisData.turn_points,
+    trajectory_points: planTrajectory.length,
+    processing_stats: {
+      ...currentStats,
+      ...extraStats,
+      estimated_distance:
+        typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
+          ? cleanedDistance
+          : currentStats.estimated_distance,
+      turns_detected: Array.isArray(response.turn_points)
+        ? response.turn_points.length
+        : currentStats.turns_detected,
+      r3_trajectory_quality: trajectoryQuality,
+      r3_trajectory_source: selectedSource,
+      r3_trajectory_source_requested: response.trajectory_source_requested ?? selectedSource,
+      r3_trajectory_source_fallback_reason:
+        response.trajectory_source_fallback_reason ?? null,
+      r3_trajectory_source_selection: response.trajectory_source_selection ?? {},
+    },
+  } as AnalysisData;
+};
+
+const trajectoryDataFromVideo = (video: VideoWithOwner): TrajectoryData => {
+  const result = video.analysisResult as AnalysisData;
+  const stats = result.processing_stats as Record<string, unknown> | undefined;
+  const manualOverride = Boolean(stats?.manual_override);
+  const method = String(result.method || "");
+  const isR3 = method.startsWith("r3");
+  const isLingBot = method === "lingbot_map";
+  const hasMapTrajectory = Boolean(result.map_trajectory);
+  const isAlreadyInPlanSpace = (hasMapTrajectory && !isLingBot) || manualOverride;
+  const r3Quality = stats?.r3_trajectory_quality as Record<string, unknown> | undefined;
+  const r3Projection = r3Quality?.projection as Record<string, unknown> | undefined;
+  return {
+    trajectory: convertTrajectory(
+      result.map_trajectory || result.plan_trajectory || result.trajectory,
+    ),
+    turnPoints: result.map_turn_points || result.turn_points || [],
+    ownerName: video.ownerName,
+    color: video.color,
+    videoId: video.video_id,
+    method: result.method,
+    coordinateConvention: String(r3Projection?.plan_coordinate_convention || "") || undefined,
+    mapAligned: isAlreadyInPlanSpace,
+    manualPlanSpace: manualOverride,
+    r3CameraPoints: isR3 && Array.isArray(result.plan_trajectory || result.trajectory)
+      ? (result.plan_trajectory || result.trajectory)
+      : undefined,
+    mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(stats?.scale_factor, 1),
+    r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace,
+  };
+};
+
 interface TrajectoryAnalysisProps {
   onTrajectoryAnalyzed?: (
     trajectory: number[][] | { x: number; y: number; z?: number }[],
@@ -109,6 +201,8 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const [turnVoteThreshold, setTurnVoteThreshold] = useState<number>(3);
   const [useMlRoi, setUseMlRoi] = useState<boolean>(true);
   const [analysisMethod, setAnalysisMethod] = useState<'slam' | 'r3' | 'lingbot'>('slam');
+  const [r3TrajectorySource, setR3TrajectorySource] = useState<R3TrajectorySource>('robust_candidate');
+  const [isSwitchingR3Trajectory, setIsSwitchingR3Trajectory] = useState(false);
   const [liveViewVideoId, setLiveViewVideoId] = useState<string | null>(null);
   const [showLiveView, setShowLiveView] = useState(false);
   const [floorPlan, setFloorPlan] = useState<string | null>(null);
@@ -139,6 +233,15 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const analysisResult = firstAnalyzedVideo ? {
     data: firstAnalyzedVideo.analysisResult
   } : null;
+  const activeAnalysisStats = (
+    analysisResult?.data?.processing_stats || {}
+  ) as Record<string, unknown>;
+  const activeR3TrajectorySource = String(
+    activeAnalysisStats.r3_trajectory_source || "",
+  );
+  const activeR3FallbackReason = String(
+    activeAnalysisStats.r3_trajectory_source_fallback_reason || "",
+  );
 
   // Загрузка плана из localStorage при инициализации
   useEffect(() => {
@@ -624,49 +727,32 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           if (analysisMethod === "r3" && uploadedVideoId && analysisData) {
             try {
               setCurrentStep(`[${video.ownerName}] Перенос R³ траектории на план...`);
-              const filtered = await apiClient.getR3PointCloudFiltered(uploadedVideoId, {
-                maxPoints: 100000,
-                minConf: 1.4,
-                samplingStrategy: "per_frame_uniform",
-                includeTrajectory: true,
-                includeCameras: false,
-              });
-              const planTrajectory = Array.isArray(filtered.plan_trajectory ?? filtered.trajectory)
-                ? (filtered.plan_trajectory ?? filtered.trajectory ?? []).filter((p) => Array.isArray(p) && p.length >= 2)
-                : [];
+              const [filtered, selectedTrajectory] = await Promise.all([
+                apiClient.getR3PointCloudFiltered(uploadedVideoId, {
+                  maxPoints: 100000,
+                  minConf: 1.4,
+                  samplingStrategy: "per_frame_uniform",
+                  includeTrajectory: true,
+                  includeCameras: false,
+                }),
+                apiClient.getR3Trajectory(uploadedVideoId, r3TrajectorySource),
+              ]);
               const rawTrajectory3d = Array.isArray(filtered.raw_trajectory_3d)
                 ? filtered.raw_trajectory_3d.filter((p) => Array.isArray(p) && p.length >= 3)
                 : [];
-              const refinedTurns = Array.isArray(filtered.turn_points) ? filtered.turn_points : [];
-              if (filtered.success && planTrajectory.length >= 2) {
+              if (filtered.success && selectedTrajectory.success) {
                 const filteredStats = filtered.stats || {};
-                const cleanedDistance = filteredStats.trajectory_quality?.cleaned_distance;
-                const currentStats =
-                  (analysisData.processing_stats as Record<string, unknown> | undefined) || {};
-                analysisData = {
-                  ...analysisData,
-                  // The map must consume plan-space coordinates.  Raw c2w
-                  // translations belong only to the 3D viewer.
-                  trajectory: planTrajectory,
-                  plan_trajectory: planTrajectory,
-                  raw_trajectory_3d: rawTrajectory3d,
-                  r3_camera_points: rawTrajectory3d,
-                  r3_source_frame_indices: filtered.source_frame_indices ?? [],
-                  r3_source_timestamps_seconds: filtered.source_timestamps_seconds ?? [],
-                  turn_points: refinedTurns.length > 0 ? refinedTurns : analysisData.turn_points,
-                  estimated_distance:
-                    typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
-                      ? cleanedDistance
-                      : analysisData.estimated_distance,
-                  processing_stats: {
-                    ...currentStats,
+                analysisData = mergeR3TrajectoryResponse(
+                  analysisData,
+                  selectedTrajectory,
+                  rawTrajectory3d,
+                  {
                     r3_filtered_trajectory: true,
                     r3_source_points: filteredStats.source_points,
                     r3_filtered_points: filteredStats.filtered_points,
                     r3_returned_points: filteredStats.returned_points,
-                    r3_trajectory_quality: filteredStats.trajectory_quality,
                   },
-                } as AnalysisData;
+                );
               }
             } catch (err) {
               console.warn("Failed to fetch filtered R3 trajectory for plan:", err);
@@ -725,41 +811,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       const finalAnalyzedVideos = finalizedVideos.filter(v => v.analysisResult);
 
       if (finalAnalyzedVideos.length > 0 && onTrajectoryAnalyzed) {
-        const trajectoriesData = finalAnalyzedVideos.map((video) => {
-          const ps = video.analysisResult.processing_stats as Record<string, unknown> | undefined;
-          const manualOverride = Boolean(ps?.manual_override);
-          const method = String(video.analysisResult.method || "");
-          const isR3 = method.startsWith("r3");
-          const isLingBot = method === "lingbot_map";
-          const hasMapTrajectory = Boolean(video.analysisResult.map_trajectory);
-          const isAlreadyInPlanSpace = (hasMapTrajectory && !isLingBot) || manualOverride;
-          const r3Quality = ps?.r3_trajectory_quality as Record<string, unknown> | undefined;
-          const r3Projection = r3Quality?.projection as Record<string, unknown> | undefined;
-          return {
-            trajectory: convertTrajectory(
-              video.analysisResult.map_trajectory ||
-              video.analysisResult.plan_trajectory ||
-              video.analysisResult.trajectory,
-            ),
-            turnPoints: video.analysisResult.map_turn_points || video.analysisResult.turn_points || [],
-            ownerName: video.ownerName,
-            color: video.color,
-            videoId: video.video_id,
-            method: video.analysisResult.method,
-            coordinateConvention: String(r3Projection?.plan_coordinate_convention || "") || undefined,
-            mapAligned: isAlreadyInPlanSpace,
-            manualPlanSpace: manualOverride,
-            // TrajectoryMap is a 2D surface.  Its camera-dot overlay must use
-            // the same plan coordinates as the rendered path, never raw c2w.
-            r3CameraPoints: isR3 && Array.isArray(
-              video.analysisResult.plan_trajectory || video.analysisResult.trajectory,
-            )
-              ? (video.analysisResult.plan_trajectory || video.analysisResult.trajectory)
-              : undefined,
-            mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(ps?.scale_factor, 1),
-            r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace,
-          };
-        });
+        const trajectoriesData = finalAnalyzedVideos.map(trajectoryDataFromVideo);
 
         const totalPoints = trajectoriesData.reduce((sum, t) => sum + t.trajectory.length, 0);
         if (totalPoints === 0) {
@@ -787,6 +839,72 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         setAnalysisProgress(0);
         setCurrentStep('');
       }, 2000);
+    }
+  };
+
+  const handleR3TrajectorySourceChange = async (source: R3TrajectorySource) => {
+    setR3TrajectorySource(source);
+    const targets = videos.filter((video) => (
+      video.video_id &&
+      video.analysisResult &&
+      String(video.analysisResult.method || "").startsWith("r3")
+    ));
+    if (targets.length === 0) return;
+
+    setIsSwitchingR3Trajectory(true);
+    try {
+      const responses = await Promise.all(targets.map(async (video) => ({
+        videoId: video.video_id as string,
+        response: await apiClient.getR3Trajectory(video.video_id as string, source),
+      })));
+      const byVideoId = new Map<string, R3TrajectoryResponse>(
+        responses.map(({ videoId, response }) => [videoId, response]),
+      );
+      const updatedVideos = videos.map((video) => {
+        if (!video.video_id || !video.analysisResult) return video;
+        const response = byVideoId.get(video.video_id);
+        if (!response) return video;
+        return {
+          ...video,
+          analysisResult: mergeR3TrajectoryResponse(
+            video.analysisResult,
+            response,
+            video.analysisResult.raw_trajectory_3d,
+          ),
+        };
+      });
+      setVideos(updatedVideos);
+
+      const analyzed = updatedVideos.filter((video) => video.analysisResult);
+      if (analyzed.length > 0 && onTrajectoryAnalyzed) {
+        const trajectoriesData = analyzed.map(trajectoryDataFromVideo);
+        onTrajectoryAnalyzed(
+          trajectoriesData[0].trajectory,
+          trajectoriesData[0].turnPoints,
+          (analyzed[0].analysisResult?.processing_stats || {}) as Record<string, unknown>,
+          trajectoriesData,
+        );
+      }
+
+      const fallback = responses.find(({ response }) => (
+        response.trajectory_source !== source
+      ));
+      if (fallback) {
+        toast.warning(
+          `Robust-кандидат не применён: ${fallback.response.trajectory_source_fallback_reason || "quality gate"}. Показана исходная R³.`,
+        );
+      } else {
+        toast.success(
+          source === "robust_candidate"
+            ? "Показана robust-траектория из полного pose graph"
+            : "Показана исходная траектория R³",
+        );
+      }
+    } catch (error) {
+      console.error("Failed to switch R3 trajectory source:", error);
+      toast.error("Не удалось переключить источник R³ траектории");
+    } finally {
+      setIsSwitchingR3Trajectory(false);
     }
   };
 
@@ -1246,9 +1364,48 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             </Button>
           </div>
           {analysisMethod === 'r3' && (
-            <p className="text-xs text-muted-foreground">
-              Использует Depth Anything 3 — нейросеть для 3D-реконструкции сцены
-            </p>
+            <div className="space-y-3 rounded-lg border border-primary/20 bg-primary/5 p-3">
+              <p className="text-xs text-muted-foreground">
+                Использует Depth Anything 3 и сохраняет исходную реконструкцию для сравнения.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={r3TrajectorySource === 'raw' ? 'default' : 'outline'}
+                  onClick={() => handleR3TrajectorySourceChange('raw')}
+                  disabled={isAnalyzing || isSwitchingR3Trajectory}
+                >
+                  Исходная R³
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={r3TrajectorySource === 'robust_candidate' ? 'default' : 'outline'}
+                  onClick={() => handleR3TrajectorySourceChange('robust_candidate')}
+                  disabled={isAnalyzing || isSwitchingR3Trajectory}
+                >
+                  {isSwitchingR3Trajectory ? (
+                    <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  Robust graph
+                </Button>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                <span>
+                  Robust graph использует все относительные позы и автоматически откатывается
+                  к исходной R³, если quality gate не пройден.
+                </span>
+                {activeR3TrajectorySource && (
+                  <Badge variant={activeR3TrajectorySource === 'robust_candidate' ? 'default' : 'secondary'}>
+                    Сейчас: {activeR3TrajectorySource === 'robust_candidate' ? 'robust' : 'исходная'}
+                  </Badge>
+                )}
+                {activeR3FallbackReason && (
+                  <Badge variant="outline">Fallback: {activeR3FallbackReason}</Badge>
+                )}
+              </div>
+            </div>
           )}
           {analysisMethod === 'lingbot' && (
             <p className="text-xs text-muted-foreground">
