@@ -685,7 +685,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             },
             video.ownerName,
             analysisMethod,
-            analysisMethod === 'r3' ? { frame_stride: 5, max_frames: 1500, ckpt: 'r3_long.safetensors', size: 392, mode: 'strided' } : undefined,
+            analysisMethod === 'r3' ? { frame_stride: 3, max_frames: 3000, ckpt: 'r3_long.safetensors', size: 392, mode: 'strided' } : undefined,
             true
           );
 

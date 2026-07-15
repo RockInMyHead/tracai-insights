@@ -252,8 +252,8 @@ export class ApiClient {
       force_reprocess: forceReprocess,
     };
     if (analysisMethod === 'r3') {
-      body.frame_stride = r3Options?.frame_stride ?? 5;
-      body.max_frames = r3Options?.max_frames ?? 1500;
+      body.frame_stride = r3Options?.frame_stride ?? 3;
+      body.max_frames = r3Options?.max_frames ?? 3000;
       body.ckpt = r3Options?.ckpt ?? 'r3_long.safetensors';
       body.size = r3Options?.size ?? 392;
       body.mode = r3Options?.mode ?? 'strided';
