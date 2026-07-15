@@ -85,6 +85,29 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(result["turn_points"][0]["turn_type"], "left")
         self.assertAlmostEqual(result["turn_points"][0]["angle_degrees"], 90.0, delta=2.0)
 
+    def test_opencv_right_turn_has_canonical_right_handedness(self) -> None:
+        poses = [
+            make_pose(i, 0.0, 0.0, float(i), rotation_for_forward(0.0, 0.0, 1.0))
+            for i in range(18)
+        ]
+        poses.extend(
+            make_pose(
+                len(poses),
+                float(index),
+                0.0,
+                17.0,
+                rotation_for_forward(1.0, 0.0, 0.0),
+            )
+            for index in range(1, 19)
+        )
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+
+        self.assertLess(result["plan_trajectory"][-1][1], -15.0)
+        self.assertEqual(len(result["turn_points"]), 1)
+        self.assertEqual(result["turn_points"][0]["turn_type"], "right")
+        self.assertAlmostEqual(result["turn_points"][0]["angle_degrees"], -90.0, delta=2.0)
+
     def test_projects_floor_path_and_maps_turn_to_source_frame(self) -> None:
         poses = [make_pose(i, float(i), 0.0, 0.0) for i in range(12)]
         poses.extend(make_pose(i + 12, 11.0, 0.0, float(i + 1)) for i in range(11))
@@ -92,7 +115,10 @@ class R3TrajectoryTests(unittest.TestCase):
         result = build_r3_trajectory(
             poses,
             [2.0] * len(poses),
-            {"source_indices": [i * 5 for i in range(len(poses))]},
+            {
+                "source_indices": [i * 5 for i in range(len(poses))],
+                "source_timestamps_seconds": [i * 0.2 for i in range(len(poses))],
+            },
         )
 
         self.assertEqual(len(result["plan_trajectory"]), len(poses))
@@ -100,6 +126,11 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["turn_points"]), 1)
         turn = result["turn_points"][0]
         self.assertIsNotNone(turn["source_frame_index"])
+        self.assertAlmostEqual(
+            turn["timestamp_seconds"],
+            result["source_timestamps_seconds"][turn["trajectory_index"]],
+            places=6,
+        )
         self.assertEqual(turn["position"], result["plan_trajectory"][turn["trajectory_index"]])
 
     def test_low_confidence_isolated_reverse_pose_is_repaired(self) -> None:
@@ -182,11 +213,12 @@ class R3TrajectoryTests(unittest.TestCase):
         orientation = result["trajectory_quality"]["turn_detection"]["camera_orientation"]
         self.assertFalse(orientation["reliable"])
 
-    def test_separates_repeated_turns_and_repairs_underestimated_loop(self) -> None:
+    def test_camera_turn_evidence_never_rewrites_position_geometry(self) -> None:
         # This reproduces the field regression: the reconstructed translation
         # bends only 20 degrees at each physical 90-degree corner.  The old
-        # largest-span candidate merged all four same-sign turns into one and
-        # globally disabled the otherwise correct camera-yaw signal.
+        # largest-span candidate merged all four same-sign turns into one. A
+        # later workaround rotated every future point from camera yaw, making
+        # one bad orientation observation capable of corrupting the full tail.
         poses = []
         x = 0.0
         z = 0.0
@@ -224,15 +256,25 @@ class R3TrajectoryTests(unittest.TestCase):
             self.assertEqual(turn["angle_source"], "camera_orientation")
             self.assertAlmostEqual(abs(turn["trajectory_angle_degrees"]), 20.0, delta=2.0)
             self.assertAlmostEqual(abs(turn["angle_degrees"]), 90.0, delta=2.0)
+            self.assertEqual(turn["geometry_angle_degrees"], turn["trajectory_angle_degrees"])
+            self.assertEqual(turn["observation_angle_degrees"], turn["angle_degrees"])
+            self.assertFalse(turn["geometry_mutated"])
 
         raw_plan = np.asarray(result["raw_plan_trajectory"], dtype=np.float64)
-        corrected_plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
+        plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
         raw_closure_error = float(np.linalg.norm(raw_plan[-1, :2] - raw_plan[0, :2]))
-        corrected_closure_error = float(np.linalg.norm(corrected_plan[-1, :2] - corrected_plan[0, :2]))
+        closure_error = float(np.linalg.norm(plan[-1, :2] - plan[0, :2]))
         self.assertGreater(raw_closure_error, 100.0)
-        self.assertLess(corrected_closure_error, 12.0)
+        self.assertTrue(np.array_equal(plan, raw_plan))
+        self.assertEqual(closure_error, raw_closure_error)
         correction = result["trajectory_quality"]["heading_correction"]
-        self.assertEqual(correction["applied_count"], 4)
+        self.assertEqual(correction["method"], "camera_orientation_observation_only")
+        self.assertFalse(correction["geometry_mutated"])
+        self.assertFalse(correction["applied"])
+        self.assertEqual(correction["applied_count"], 0)
+        self.assertEqual(correction["suppressed_count"], 4)
+        self.assertEqual(len(correction["observations"]), 4)
+        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 4)
 
     def test_trajectory_plane_prevents_pitch_dependent_scale(self) -> None:
         # A downward-looking camera makes camera-local up tilt backward.  Using
@@ -323,6 +365,43 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(scale["applied_count"], 1)
         self.assertAlmostEqual(scale["regime_changes"][0]["raw_velocity_ratio"], 3.0, delta=0.05)
         self.assertAlmostEqual(distance, 142.0, delta=3.0)
+
+    def test_exact_timestamps_prevent_false_scale_reset_from_frame_cadence(self) -> None:
+        poses = [make_pose(0, 0.0, 0.0, 0.0)]
+        timestamps = [0.0]
+        z = 0.0
+        timestamp = 0.0
+        for _ in range(60):
+            z += 1.0
+            timestamp += 0.2
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+            timestamps.append(timestamp)
+        for _ in range(80):
+            # Three times the displacement but also three times the elapsed
+            # presentation time: physical velocity did not change.
+            z += 3.0
+            timestamp += 0.6
+            poses.append(make_pose(len(poses), 0.0, 0.0, z))
+            timestamps.append(timestamp)
+
+        result = build_r3_trajectory(
+            poses,
+            [2.0] * len(poses),
+            {
+                "source_indices": list(range(len(poses))),
+                "source_timestamps_seconds": timestamps,
+            },
+            run_params={
+                "online_fallback_enabled": True,
+                "fallback_boundaries": [61],
+                "fallback_boundary_source": "pose_edge_log",
+            },
+        )
+
+        scale = result["trajectory_quality"]["scale_stability"]
+        self.assertEqual(scale["motion_time_base"], "presentation_timestamp_seconds")
+        self.assertFalse(scale["applied"])
+        self.assertEqual(scale["quality"], "stable_epochs")
 
     def test_repeated_fallbacks_do_not_compound_one_scale_epoch(self) -> None:
         poses = []

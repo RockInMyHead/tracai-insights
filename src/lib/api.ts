@@ -71,6 +71,7 @@ export interface VideoAnalysisResult {
     raw_trajectory_3d?: number[][];
     plan_trajectory?: number[][];
     r3_source_frame_indices?: Array<number | null>;
+    r3_source_timestamps_seconds?: Array<number | null>;
     r3_pose_confidence?: Array<number | null>;  // Уверенность каждой позиции
     total_processing_time: number;
     video_info: {
@@ -841,6 +842,7 @@ export class ApiClient {
       frame_index: number;
       r3_frame_index?: number;
       source_frame_index?: number | null;
+      timestamp_seconds?: number | null;
       trajectory_index: number;
       angle_degrees: number;
       position: number[];
@@ -848,6 +850,7 @@ export class ApiClient {
       confidence?: number | null;
     }>;
     source_frame_indices?: Array<number | null>;
+    source_timestamps_seconds?: Array<number | null>;
     cameras?: unknown[];
     stats?: {
       source_points: number;
@@ -912,6 +915,7 @@ export class ApiClient {
       frame_index: number;
       r3_frame_index?: number;
       source_frame_index?: number | null;
+      timestamp_seconds?: number | null;
       trajectory_index: number;
       angle_degrees: number;
       position: number[];
@@ -919,6 +923,7 @@ export class ApiClient {
       confidence?: number | null;
     }>;
     source_frame_indices?: Array<number | null>;
+    source_timestamps_seconds?: Array<number | null>;
     trajectory_quality?: Record<string, unknown>;
     run_params?: Record<string, unknown>;
     fallback_summary?: Record<string, unknown>;

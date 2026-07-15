@@ -652,6 +652,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
                   raw_trajectory_3d: rawTrajectory3d,
                   r3_camera_points: rawTrajectory3d,
                   r3_source_frame_indices: filtered.source_frame_indices ?? [],
+                  r3_source_timestamps_seconds: filtered.source_timestamps_seconds ?? [],
                   turn_points: refinedTurns.length > 0 ? refinedTurns : analysisData.turn_points,
                   estimated_distance:
                     typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
