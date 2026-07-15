@@ -35,6 +35,11 @@ try:
 except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_pose_graph import load_pose_graph_summary
 
+try:
+    from r3_pose_graph_optimizer import load_pose_graph_candidate_summary
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_pose_graph_optimizer import load_pose_graph_candidate_summary
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("gpu_worker")
 
@@ -916,6 +921,9 @@ def _load_r3_run_params(base: Path, point_count: int = 0) -> tuple[dict, dict]:
     )
     run_params["pose_graph_optimizer_ready"] = pose_graph_summary.get("optimizer_ready", False)
     run_params["pose_graph_edge_count"] = pose_graph_summary.get("edge_count", 0)
+    candidate_summary = load_pose_graph_candidate_summary(base)
+    run_params["pose_graph_candidate_accepted"] = candidate_summary.get("accepted", False)
+    run_params["pose_graph_optimizer_seconds"] = candidate_summary.get("runtime_seconds")
     return run_params, fallback_summary
 
 
@@ -1328,6 +1336,7 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         base / "pose_graph_edges.npz",
         point_count=len(list((base / "camera").glob("*.npz"))),
     )
+    pose_graph_candidate = load_pose_graph_candidate_summary(base)
 
     return {
         "success": True,
@@ -1344,6 +1353,7 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         "pose_confidence": pose_confidence,
         "pose_edges": pose_edges,
         "pose_graph": pose_graph,
+        "pose_graph_candidate": pose_graph_candidate,
         "trajectory": trajectory,
     }
 
@@ -2230,6 +2240,7 @@ async def r3_get_pointcloud_filtered(
             base / "pose_graph_edges.npz",
             point_count=camera_count,
         )
+        pose_graph_candidate = load_pose_graph_candidate_summary(base)
         run_mode = str(run_params.get("mode") or "").lower()
         # Missing mode means the output was produced by an older wrapper that
         # cannot be trusted for the new strided+fallback+metric R3 preset.
@@ -2281,6 +2292,7 @@ async def r3_get_pointcloud_filtered(
                 "run_params": run_params,
                 "fallback_summary": fallback_summary,
                 "pose_graph": pose_graph_summary,
+                "pose_graph_candidate": pose_graph_candidate,
                 "stale_run": stale_run,
             },
         }
@@ -2306,6 +2318,7 @@ async def r3_get_trajectory(video_id: str):
             base / "pose_graph_edges.npz",
             point_count=len(trajectory_bundle.get("plan_trajectory", [])),
         )
+        pose_graph_candidate = load_pose_graph_candidate_summary(base)
         return _sanitize_for_json({
             "success": True,
             "video_id": video_id,
@@ -2321,6 +2334,7 @@ async def r3_get_trajectory(video_id: str):
             "run_params": run_params,
             "fallback_summary": fallback_summary,
             "pose_graph": pose_graph_summary,
+            "pose_graph_candidate": pose_graph_candidate,
         })
     except HTTPException:
         raise

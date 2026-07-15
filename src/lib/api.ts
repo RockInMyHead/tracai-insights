@@ -74,6 +74,7 @@ export interface VideoAnalysisResult {
     r3_source_timestamps_seconds?: Array<number | null>;
     r3_pose_confidence?: Array<number | null>;  // Уверенность каждой позиции
     r3_pose_graph?: Record<string, unknown>;
+    r3_pose_graph_candidate?: Record<string, unknown>;
     total_processing_time: number;
     video_info: {
       width: number;
@@ -929,6 +930,7 @@ export class ApiClient {
     run_params?: Record<string, unknown>;
     fallback_summary?: Record<string, unknown>;
     pose_graph?: Record<string, unknown>;
+    pose_graph_candidate?: Record<string, unknown>;
   }> {
     const resp = await agentFetch(`${this.baseUrl}/api/r3-trajectory/${videoId}`);
     if (!resp.ok) {

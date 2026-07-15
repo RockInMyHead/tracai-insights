@@ -33,6 +33,17 @@ try:
 except ImportError:  # pragma: no cover - package-style startup
     from backend.r3_pose_graph import load_pose_graph_summary
 
+try:
+    from r3_pose_graph_optimizer import (
+        load_pose_graph_candidate_summary,
+        run_pose_graph_shadow,
+    )
+except ImportError:  # pragma: no cover - package-style startup
+    from backend.r3_pose_graph_optimizer import (
+        load_pose_graph_candidate_summary,
+        run_pose_graph_shadow,
+    )
+
 R3_DIR = Path("/home/artem/trackai/R3")
 CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
 
@@ -1234,6 +1245,34 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
         r3_output / "pose_graph_edges.npz",
         point_count=len(poses),
     )
+    optimizer_mode = (os.getenv("R3_POSE_GRAPH_OPTIMIZER_MODE") or "shadow").strip().lower()
+    pose_graph_candidate = load_pose_graph_candidate_summary(r3_output)
+    if (
+        optimizer_mode == "shadow"
+        and pose_graph_summary.get("optimizer_ready", False)
+        and len(poses) >= 2
+    ):
+        emit("r3_pose_graph_optimizer_start", {
+            "mode": "shadow",
+            "poses": len(poses),
+            "edges": pose_graph_summary.get("edge_count", 0),
+        })
+        pose_graph_candidate = run_pose_graph_shadow(
+            r3_output,
+            np.asarray([pose["pose"] for pose in poses], dtype=np.float64),
+        )
+        emit("r3_pose_graph_optimizer_complete", {
+            "accepted": pose_graph_candidate.get("accepted", False),
+            "runtime_seconds": pose_graph_candidate.get("runtime_seconds"),
+            "objective_improvement": pose_graph_candidate.get("objective_improvement"),
+            "rejection_reasons": pose_graph_candidate.get("rejection_reasons", []),
+        })
+    elif optimizer_mode not in {"off", "shadow"}:
+        pose_graph_candidate = {
+            "available": False,
+            "accepted": False,
+            "error": f"unsupported optimizer mode: {optimizer_mode}",
+        }
 
     result = {
         "success": True,
@@ -1259,6 +1298,9 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "fallback_boundary_source": fallback_summary["source"],
             "fallback_events": fallback_summary["events"],
             "pose_graph_optimizer_ready": pose_graph_summary.get("optimizer_ready", False),
+            "pose_graph_optimizer_mode": optimizer_mode,
+            "pose_graph_candidate_accepted": pose_graph_candidate.get("accepted", False),
+            "pose_graph_optimizer_seconds": pose_graph_candidate.get("runtime_seconds"),
         },
         "camera_poses": sanitize_json(poses),
         "num_poses_total": len(poses),
@@ -1266,6 +1308,7 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
         "output_dir": str(r3_output),
         "frame_selection": sanitize_json(frame_selection),
         "pose_graph": sanitize_json(pose_graph_summary),
+        "pose_graph_candidate": sanitize_json(pose_graph_candidate),
     }
 
     # Generate point cloud from depth maps
