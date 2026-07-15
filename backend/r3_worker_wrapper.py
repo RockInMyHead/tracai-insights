@@ -28,8 +28,84 @@ try:
 except ImportError:  # pragma: no cover - package-style startup
     from backend.r3_trajectory import summarize_fallback_edges
 
+try:
+    from r3_pose_graph import load_pose_graph_summary
+except ImportError:  # pragma: no cover - package-style startup
+    from backend.r3_pose_graph import load_pose_graph_summary
+
 R3_DIR = Path("/home/artem/trackai/R3")
 CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
+
+R3_POSE_GRAPH_EXPORT_MARKER = "# TRACKAI_R3_POSE_GRAPH_EXPORT_V1"
+R3_POSE_GRAPH_EXPORT_ANCHOR = '''                with open(os.path.join(output_dir, "pose_edge_log.json"), "w") as f:
+                    json.dump(edge_records, f)
+'''
+R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPORT_V1
+                pose_graph_capacity = len(edges)
+                pose_graph_edge_sequence = np.empty(pose_graph_capacity, dtype=np.int64)
+                pose_graph_frame_i = np.empty(pose_graph_capacity, dtype=np.int32)
+                pose_graph_frame_j = np.empty(pose_graph_capacity, dtype=np.int32)
+                pose_graph_model_frame_i = np.empty(pose_graph_capacity, dtype=np.int64)
+                pose_graph_model_frame_j = np.empty(pose_graph_capacity, dtype=np.int64)
+                pose_graph_rel_pose = np.empty((pose_graph_capacity, 9), dtype=np.float32)
+                pose_graph_confidence = np.empty(pose_graph_capacity, dtype=np.float32)
+                pose_graph_confidence_t = np.full(pose_graph_capacity, np.nan, dtype=np.float32)
+                pose_graph_confidence_r = np.full(pose_graph_capacity, np.nan, dtype=np.float32)
+                pose_graph_edge_type = np.full(pose_graph_capacity, 255, dtype=np.uint8)
+                pose_graph_count = 0
+                for edge_sequence, edge in enumerate(edges):
+                    frame_i = int(edge.frame_i)
+                    frame_j = int(edge.frame_j)
+                    if frame_i not in frame_id_to_output_idx or frame_j not in frame_id_to_output_idx:
+                        continue
+                    rel_pose = getattr(edge, "rel_pose_enc", None)
+                    if rel_pose is None:
+                        continue
+                    rel_pose_values = rel_pose.detach().cpu().float().numpy().reshape(-1)
+                    if rel_pose_values.size != 9 or not np.isfinite(rel_pose_values).all():
+                        continue
+                    confidence_t = getattr(edge, "confidence_t", None)
+                    confidence_r = getattr(edge, "confidence_r", None)
+                    record_index = pose_graph_count
+                    pose_graph_edge_sequence[record_index] = edge_sequence
+                    pose_graph_frame_i[record_index] = frame_id_to_output_idx[frame_i]
+                    pose_graph_frame_j[record_index] = frame_id_to_output_idx[frame_j]
+                    pose_graph_model_frame_i[record_index] = frame_i
+                    pose_graph_model_frame_j[record_index] = frame_j
+                    pose_graph_rel_pose[record_index] = rel_pose_values
+                    pose_graph_confidence[record_index] = float(edge.confidence)
+                    if confidence_t is not None:
+                        pose_graph_confidence_t[record_index] = float(confidence_t)
+                    if confidence_r is not None:
+                        pose_graph_confidence_r[record_index] = float(confidence_r)
+                    pose_graph_edge_type[record_index] = {
+                        "normal": 0,
+                        "bridge": 1,
+                        "anchor": 2,
+                    }.get(edge.edge_type, 255)
+                    pose_graph_count += 1
+                if pose_graph_count:
+                    np.savez_compressed(
+                        os.path.join(output_dir, "pose_graph_edges.npz"),
+                        schema_version=np.asarray([1], dtype=np.int32),
+                        pose_encoding=np.asarray("txyz_qxyzw_fovxy"),
+                        transform_convention=np.asarray("target_hmat=relative_hmat@reference_hmat"),
+                        frame_index_space=np.asarray("exported_camera_index"),
+                        absolute_pose_space=np.asarray("world_to_camera"),
+                        confidence_semantics=np.asarray("softplus_positive_weight_not_covariance"),
+                        edge_type_names=np.asarray(["normal", "bridge", "anchor", "unknown"]),
+                        edge_sequence=pose_graph_edge_sequence[:pose_graph_count],
+                        frame_i=pose_graph_frame_i[:pose_graph_count],
+                        frame_j=pose_graph_frame_j[:pose_graph_count],
+                        model_frame_i=pose_graph_model_frame_i[:pose_graph_count],
+                        model_frame_j=pose_graph_model_frame_j[:pose_graph_count],
+                        rel_pose_enc=pose_graph_rel_pose[:pose_graph_count],
+                        confidence=pose_graph_confidence[:pose_graph_count],
+                        confidence_t=pose_graph_confidence_t[:pose_graph_count],
+                        confidence_r=pose_graph_confidence_r[:pose_graph_count],
+                        edge_type=pose_graph_edge_type[:pose_graph_count],
+                    )
+'''
 
 
 def emit(event_type, data=None):
@@ -54,6 +130,77 @@ def conf_stats(conf_values):
         "percentiles": {k: float(v) for k, v in zip(keys, p)},
         "counts_by_threshold": {str(t): int((conf_values >= t).sum()) for t in CONF_THRESHOLDS},
     }
+
+
+def _patch_r3_infer_source(source: str) -> tuple[str, dict]:
+    """Inject a versioned full-edge sidecar export into supported R3 infer.py."""
+    if R3_POSE_GRAPH_EXPORT_MARKER in source:
+        return source, {"status": "already_available", "changed": False}
+    if R3_POSE_GRAPH_EXPORT_ANCHOR not in source:
+        return source, {
+            "status": "unsupported_infer_source",
+            "changed": False,
+            "reason": "pose_edge_log export anchor not found",
+        }
+    patched = source.replace(
+        R3_POSE_GRAPH_EXPORT_ANCHOR,
+        R3_POSE_GRAPH_EXPORT_ANCHOR + R3_POSE_GRAPH_EXPORT_INSERTION,
+        1,
+    )
+    try:
+        compile(patched, "infer.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
+def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
+    """Patch the external R3 exporter atomically, or report why it was skipped."""
+    enabled = (os.getenv("R3_EXPORT_POSE_GRAPH_EDGES") or "true").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return {"status": "disabled", "changed": False}
+    infer_path = Path(r3_dir) / "infer.py"
+    try:
+        source = infer_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {
+            "status": "infer_read_failed",
+            "changed": False,
+            "path": str(infer_path),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    patched, diagnostics = _patch_r3_infer_source(source)
+    diagnostics = {"path": str(infer_path), **diagnostics}
+    if not diagnostics["changed"]:
+        return diagnostics
+    temporary_path = infer_path.with_name(
+        f".{infer_path.name}.trackai.{os.getpid()}.tmp"
+    )
+    try:
+        temporary_path.write_text(patched, encoding="utf-8")
+        os.replace(temporary_path, infer_path)
+    except Exception as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {
+            "status": "infer_write_failed",
+            "changed": False,
+            "path": str(infer_path),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    return diagnostics
+
+
+def _prepare_r3_pose_graph_export() -> dict:
+    diagnostics = _ensure_r3_pose_graph_export(R3_DIR)
+    emit("r3_pose_graph_export", diagnostics)
+    return diagnostics
 
 
 def _probe_video_frame_timestamps(video_path: str) -> tuple[list[float | None], dict]:
@@ -441,6 +588,7 @@ def run_r3_inference(frames_dir: str, output_dir: str, ckpt_name: str = "r3.safe
                      mode: str = "test", size: int = 392,
                      max_frames: int = 0):
     """Run R³ inference via subprocess using conda r3 env."""
+    _prepare_r3_pose_graph_export()
     cmd, resolved_mode, resolved_ckpt = _build_r3_infer_cmd(frames_dir, output_dir, ckpt_name, mode, size, max_frames)
 
     emit("r3_start", {"cmd": " ".join(str(c) for c in cmd[-12:])})
@@ -581,6 +729,7 @@ def run_r3_inference_segmented(
     windows = plan_segment_windows(len(source_frames), segment_frames, overlap_frames)
     if len(windows) <= 1:
         return run_r3_inference(frames_dir, output_dir, ckpt_name, mode, size, 0)
+    _prepare_r3_pose_graph_export()
 
     combined_output = Path(output_dir)
     segments_root = combined_output / "segments"
@@ -726,6 +875,7 @@ def run_r3_inference_live(frames_dir: str, output_dir: str, camera_dir: Path,
     """Run R³ inference and emit frame_processed events as .npz files appear."""
     import numpy as np
 
+    _prepare_r3_pose_graph_export()
     cmd, resolved_mode, resolved_ckpt = _build_r3_infer_cmd(frames_dir, output_dir, ckpt_name, mode, size, max_frames)
 
     emit("r3_start", {"cmd": " ".join(str(c) for c in cmd[-12:])})
@@ -1080,6 +1230,10 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
         point_count=len(poses),
         bridge_window=bridge_window,
     )
+    pose_graph_summary = load_pose_graph_summary(
+        r3_output / "pose_graph_edges.npz",
+        point_count=len(poses),
+    )
 
     result = {
         "success": True,
@@ -1104,12 +1258,14 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
             "fallback_boundaries": fallback_summary["boundaries"],
             "fallback_boundary_source": fallback_summary["source"],
             "fallback_events": fallback_summary["events"],
+            "pose_graph_optimizer_ready": pose_graph_summary.get("optimizer_ready", False),
         },
         "camera_poses": sanitize_json(poses),
         "num_poses_total": len(poses),
         "pose_confidence": sanitize_json(pose_conf if pose_conf else None),
         "output_dir": str(r3_output),
         "frame_selection": sanitize_json(frame_selection),
+        "pose_graph": sanitize_json(pose_graph_summary),
     }
 
     # Generate point cloud from depth maps

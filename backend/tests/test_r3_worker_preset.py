@@ -5,14 +5,23 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from r3_worker_wrapper import _build_r3_infer_cmd, _probe_video_frame_timestamps
+from r3_worker_wrapper import (
+    R3_POSE_GRAPH_EXPORT_ANCHOR,
+    _build_r3_infer_cmd,
+    _ensure_r3_pose_graph_export,
+    _patch_r3_infer_source,
+    _probe_video_frame_timestamps,
+)
 
 
 def option_value(command: list[str], option: str) -> str:
@@ -20,6 +29,103 @@ def option_value(command: list[str], option: str) -> str:
 
 
 class R3WorkerPresetTests(unittest.TestCase):
+    def test_pose_graph_export_patch_is_valid_and_idempotent(self) -> None:
+        source = (
+            "import json, os\nimport numpy as np\n"
+            "def export(output_dir, edge_records, edges, frame_id_to_output_idx):\n"
+            "    if True:\n"
+            "        if edge_records:\n"
+            f"{R3_POSE_GRAPH_EXPORT_ANCHOR}"
+        )
+
+        patched, diagnostics = _patch_r3_infer_source(source)
+        patched_again, repeated = _patch_r3_infer_source(patched)
+
+        self.assertTrue(diagnostics["changed"])
+        self.assertIn('"pose_graph_edges.npz"', patched)
+        self.assertIn('"rel_pose_enc"', patched)
+        self.assertIn('"confidence_t"', patched)
+        self.assertIn('"confidence_r"', patched)
+        self.assertEqual(patched_again, patched)
+        self.assertEqual(repeated["status"], "already_available")
+
+    def test_patched_export_writes_full_relative_edge_payload(self) -> None:
+        source = (
+            "import json, os\nimport numpy as np\n"
+            "def export(output_dir, edge_records, edges, frame_id_to_output_idx):\n"
+            "    if True:\n"
+            "        if edge_records:\n"
+            f"{R3_POSE_GRAPH_EXPORT_ANCHOR}"
+        )
+        patched, diagnostics = _patch_r3_infer_source(source)
+        namespace: dict = {}
+        exec(patched, namespace)
+
+        class FakeTensor:
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def float(self):
+                return self
+
+            def numpy(self):
+                return np.asarray(
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.9, 0.7],
+                    dtype=np.float32,
+                )
+
+            def reshape(self, _size):
+                return self
+
+        edge = SimpleNamespace(
+            frame_i=10,
+            frame_j=20,
+            rel_pose_enc=FakeTensor(),
+            confidence=2.0,
+            confidence_t=2.1,
+            confidence_r=1.9,
+            edge_type="normal",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            namespace["export"](
+                directory,
+                [{"frame_i": 0, "frame_j": 1}],
+                [edge],
+                {10: 0, 20: 1},
+            )
+            with np.load(Path(directory) / "pose_graph_edges.npz", allow_pickle=False) as archive:
+                exported = {key: archive[key].copy() for key in archive.files}
+
+        self.assertTrue(diagnostics["changed"])
+        self.assertEqual(str(exported["absolute_pose_space"]), "world_to_camera")
+        self.assertEqual(str(exported["confidence_semantics"]), "softplus_positive_weight_not_covariance")
+        self.assertEqual(exported["rel_pose_enc"][0, :3].tolist(), [1.0, 0.0, 0.0])
+        self.assertAlmostEqual(float(exported["confidence_t"][0]), 2.1, places=5)
+        self.assertAlmostEqual(float(exported["confidence_r"][0]), 1.9, places=5)
+
+    def test_pose_graph_export_patches_external_infer_atomically(self) -> None:
+        source = (
+            "import json, os\nimport numpy as np\n"
+            "def export(output_dir, edge_records, edges, frame_id_to_output_idx):\n"
+            "    if True:\n"
+            "        if edge_records:\n"
+            f"{R3_POSE_GRAPH_EXPORT_ANCHOR}"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            infer_path = Path(directory) / "infer.py"
+            infer_path.write_text(source, encoding="utf-8")
+
+            first = _ensure_r3_pose_graph_export(directory)
+            second = _ensure_r3_pose_graph_export(directory)
+            persisted = infer_path.read_text(encoding="utf-8")
+
+        self.assertEqual(first["status"], "patched")
+        self.assertEqual(second["status"], "already_available")
+        self.assertIn('"pose_graph_edges.npz"', persisted)
+
     @patch("r3_worker_wrapper.subprocess.run")
     def test_probes_exact_video_presentation_timestamps(self, run_mock) -> None:
         run_mock.return_value = SimpleNamespace(
