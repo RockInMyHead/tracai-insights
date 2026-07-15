@@ -26,6 +26,11 @@ except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_trajectory import build_r3_trajectory, summarize_fallback_edges
 
 try:
+    from r3_run_compat import sampling_contract_matches
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_run_compat import sampling_contract_matches
+
+try:
     from r3_pointcloud import PointCloudBuildCancelled, build_sampled_pointcloud
 except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_pointcloud import PointCloudBuildCancelled, build_sampled_pointcloud
@@ -1790,7 +1795,14 @@ def _reset_r3_output_dir(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> bool:
+def _r3_run_matches(
+    output_dir: Path,
+    frame_stride: int,
+    max_frames: int,
+    ckpt: str,
+    size: int,
+    mode: str,
+) -> bool:
     """Return True only when existing artifacts were generated with compatible R³ params."""
     params_path = output_dir / "run_params.json"
     if not params_path.exists():
@@ -1832,8 +1844,21 @@ def _r3_run_matches(output_dir: Path, max_frames: int, ckpt: str, mode: str) -> 
         saved_bridge_ratio = float(params.get("fallback_min_bridge_baseline_ratio") or 0.0)
         saved_bridge_lookback = int(params.get("fallback_max_bridge_lookback") or 0)
         expected_max_frames = 0 if selection.get("long_video_sampling") else int(max_frames)
+        # These are inference inputs, not display preferences.  Reusing poses
+        # produced at a lower temporal/spatial density makes an accuracy
+        # rerun look successful while silently replaying the old geometry.
+        expected_long_target_fps = float(os.getenv("R3_LONG_TARGET_FPS") or "8")
+        sampling_match = sampling_contract_matches(
+            params,
+            selection,
+            frame_stride=frame_stride,
+            max_frames=max_frames,
+            size=size,
+            long_target_fps=expected_long_target_fps,
+        )
         basic_match = (
-            int(params.get("max_frames") or 0) == expected_max_frames
+            sampling_match
+            and int(params.get("max_frames") or 0) == expected_max_frames
             and saved_ckpt.endswith(str(ckpt))
             and saved_mode == mode_l
             and saved_pose_method == expected_pose_method
@@ -1929,7 +1954,14 @@ async def r3_process_stream(
 
     # Проверяем, есть ли уже готовые .npz файлы (R³ уже выполнен)
     existing_npz = sorted(camera_dir.glob("*.npz")) if camera_dir.exists() else []
-    compatible_existing_run = len(existing_npz) >= 2 and _r3_run_matches(video_output_dir, max_frames, ckpt, mode)
+    compatible_existing_run = len(existing_npz) >= 2 and _r3_run_matches(
+        video_output_dir,
+        frame_stride,
+        max_frames,
+        ckpt,
+        size,
+        mode,
+    )
     REPLAY_MODE = replay or compatible_existing_run
 
     if replay and not REPLAY_MODE:

@@ -623,6 +623,8 @@ def run_r3_inference(frames_dir: str, output_dir: str, ckpt_name: str = "r3.safe
             params["mode"] = resolved_mode
             params["wrapper_requested_mode"] = mode
             params["wrapper_resolved_ckpt"] = resolved_ckpt
+            params["wrapper_input_size"] = int(size)
+            params["wrapper_max_frames"] = int(max_frames)
             params_path.write_text(json.dumps(sanitize_json(params), indent=2), encoding="utf-8")
         except Exception as exc:
             emit("warning", {"message": f"failed to update run_params mode: {exc}"})
@@ -978,6 +980,19 @@ def run_r3_inference_live(frames_dir: str, output_dir: str, camera_dir: Path,
                     "num_processed": len(remaining),
                     "new_poses": sanitize_json(remaining_poses),
                 })
+
+    params_path = Path(output_dir) / "run_params.json"
+    if params_path.exists():
+        try:
+            params = json.loads(params_path.read_text())
+            params["mode"] = resolved_mode
+            params["wrapper_requested_mode"] = mode
+            params["wrapper_resolved_ckpt"] = resolved_ckpt
+            params["wrapper_input_size"] = int(size)
+            params["wrapper_max_frames"] = int(max_frames)
+            params_path.write_text(json.dumps(sanitize_json(params), indent=2), encoding="utf-8")
+        except Exception as exc:
+            emit("warning", {"message": f"failed to stamp live run params: {exc}"})
 
     return output_dir
 
@@ -1374,7 +1389,11 @@ def main():
             os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "600"),
         )
     )
-    long_target_fps = float(os.getenv("R3_LONG_TARGET_FPS", "5"))
+    # Turns made while walking often complete in about one second.  Five
+    # observations per second are marginal once blur/occlusion removes even a
+    # couple of frames; eight preserves temporal overlap without approaching
+    # the source video's full GPU/memory cost.
+    long_target_fps = float(os.getenv("R3_LONG_TARGET_FPS", "8"))
 
     # Step 1: preserve a dense-enough sequence across the whole route. Native
     # long mode receives every selected frame in one process.
