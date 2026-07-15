@@ -21,6 +21,14 @@ from r3_worker_wrapper import (
     _ensure_r3_pose_graph_export,
     _patch_r3_infer_source,
     _probe_video_frame_timestamps,
+    collect_results,
+)
+from r3_pose_graph import (
+    R3_ABSOLUTE_POSE_SPACE,
+    R3_CONFIDENCE_SEMANTICS,
+    R3_POSE_ENCODING,
+    R3_POSE_GRAPH_SCHEMA_VERSION,
+    R3_RELATIVE_TRANSFORM_CONVENTION,
 )
 
 
@@ -125,6 +133,64 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(first["status"], "patched")
         self.assertEqual(second["status"], "already_available")
         self.assertIn('"pose_graph_edges.npz"', persisted)
+
+    def test_collect_results_runs_guarded_shadow_optimizer(self) -> None:
+        point_count = 8
+        truth = np.broadcast_to(np.eye(4), (point_count, 4, 4)).copy()
+        truth[:, 0, 3] = np.arange(point_count, dtype=float)
+        initial = truth.copy()
+        initial[:, 0, 3] *= 1.2
+        rel_pose = np.tile(
+            # The R3 sidecar stores world-to-camera transforms.  Increasing
+            # camera centers therefore produces a negative relative t_x.
+            np.asarray([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.8, 0.8]),
+            (point_count - 1, 1),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "run_params.json").write_text("{}", encoding="utf-8")
+            camera_dir = output / "camera"
+            camera_dir.mkdir()
+            for index, pose in enumerate(initial):
+                np.savez_compressed(
+                    camera_dir / f"{index:06d}.npz",
+                    pose=pose,
+                    intrinsics=np.eye(3),
+                )
+            np.savez_compressed(
+                output / "pose_graph_edges.npz",
+                schema_version=np.asarray([R3_POSE_GRAPH_SCHEMA_VERSION], dtype=np.int32),
+                pose_encoding=np.asarray(R3_POSE_ENCODING),
+                transform_convention=np.asarray(R3_RELATIVE_TRANSFORM_CONVENTION),
+                frame_index_space=np.asarray("exported_camera_index"),
+                absolute_pose_space=np.asarray(R3_ABSOLUTE_POSE_SPACE),
+                confidence_semantics=np.asarray(R3_CONFIDENCE_SEMANTICS),
+                frame_i=np.arange(point_count - 1, dtype=np.int32),
+                frame_j=np.arange(1, point_count, dtype=np.int32),
+                rel_pose_enc=rel_pose.astype(np.float32),
+                confidence=np.full(point_count - 1, 2.0, dtype=np.float32),
+                confidence_t=np.full(point_count - 1, 2.0, dtype=np.float32),
+                confidence_r=np.full(point_count - 1, 2.0, dtype=np.float32),
+                edge_type=np.zeros(point_count - 1, dtype=np.uint8),
+            )
+
+            with patch.dict(
+                os.environ,
+                {"R3_POSE_GRAPH_OPTIMIZER_MODE": "shadow"},
+                clear=False,
+            ):
+                result = collect_results(directory, export_pointcloud=False)
+            raw_last_pose = np.load(camera_dir / "000007.npz")["pose"]
+            with np.load(output / "pose_graph_candidate.npz") as archive:
+                candidate_last_pose = archive["c2w"][-1]
+
+        self.assertTrue(result["pose_graph"]["optimizer_ready"])
+        self.assertTrue(result["pose_graph_candidate"]["available"])
+        self.assertTrue(result["pose_graph_candidate"]["accepted"])
+        self.assertEqual(result["run_params"]["pose_graph_optimizer_mode"], "shadow")
+        np.testing.assert_allclose(raw_last_pose, initial[-1])
+        self.assertAlmostEqual(float(candidate_last_pose[0, 3]), 7.0, delta=0.05)
 
     @patch("r3_worker_wrapper.subprocess.run")
     def test_probes_exact_video_presentation_timestamps(self, run_mock) -> None:

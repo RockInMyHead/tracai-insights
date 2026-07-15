@@ -1039,6 +1039,7 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
         "r3_source_timestamps_seconds": trajectory_bundle.get("source_timestamps_seconds", []),
         "r3_pose_confidence": confidence or None,
         "r3_pose_graph": r3_result.get("pose_graph"),
+        "r3_pose_graph_candidate": r3_result.get("pose_graph_candidate"),
         "pointcloud_status": r3_result.get("pointcloud_status"),
         "r3_projection": trajectory_bundle["trajectory_quality"].get("projection", {}).get("method", "robust_floor_plane"),
         "processing_stats": {
