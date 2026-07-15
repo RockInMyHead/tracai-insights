@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_pointcloud import PointCloudBuildCancelled, build_sampled_pointcloud
 
+try:
+    from r3_pose_graph import load_pose_graph_summary
+except ImportError:  # pragma: no cover - supports package-style startup
+    from backend.r3_pose_graph import load_pose_graph_summary
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(name)s — %(levelname)s — %(message)s")
 logger = logging.getLogger("gpu_worker")
 
@@ -905,6 +910,12 @@ def _load_r3_run_params(base: Path, point_count: int = 0) -> tuple[dict, dict]:
     run_params["fallback_boundaries"] = fallback_summary["boundaries"]
     run_params["fallback_boundary_source"] = fallback_summary["source"]
     run_params["fallback_events"] = fallback_summary["events"]
+    pose_graph_summary = load_pose_graph_summary(
+        base / "pose_graph_edges.npz",
+        point_count=point_count,
+    )
+    run_params["pose_graph_optimizer_ready"] = pose_graph_summary.get("optimizer_ready", False)
+    run_params["pose_graph_edge_count"] = pose_graph_summary.get("edge_count", 0)
     return run_params, fallback_summary
 
 
@@ -1313,6 +1324,11 @@ def _r3_run_diagnostics(video_id: str) -> dict:
     except Exception as e:
         trajectory = {"quality": "error", "error": str(e)}
 
+    pose_graph = load_pose_graph_summary(
+        base / "pose_graph_edges.npz",
+        point_count=len(list((base / "camera").glob("*.npz"))),
+    )
+
     return {
         "success": True,
         "video_id": video_id,
@@ -1327,6 +1343,7 @@ def _r3_run_diagnostics(video_id: str) -> dict:
         "camera_translation_sample": _r3_camera_translation_samples(base),
         "pose_confidence": pose_confidence,
         "pose_edges": pose_edges,
+        "pose_graph": pose_graph,
         "trajectory": trajectory,
     }
 
@@ -2209,6 +2226,10 @@ async def r3_get_pointcloud_filtered(
         base = _r3_output_dir(video_id)
         camera_count = len(list((base / "camera").glob("*.npz")))
         run_params, fallback_summary = _load_r3_run_params(base, point_count=camera_count)
+        pose_graph_summary = load_pose_graph_summary(
+            base / "pose_graph_edges.npz",
+            point_count=camera_count,
+        )
         run_mode = str(run_params.get("mode") or "").lower()
         # Missing mode means the output was produced by an older wrapper that
         # cannot be trusted for the new strided+fallback+metric R3 preset.
@@ -2259,6 +2280,7 @@ async def r3_get_pointcloud_filtered(
                 "has_frame_idx": bool(points.ndim == 2 and points.shape[1] > 7),
                 "run_params": run_params,
                 "fallback_summary": fallback_summary,
+                "pose_graph": pose_graph_summary,
                 "stale_run": stale_run,
             },
         }
@@ -2280,6 +2302,10 @@ async def r3_get_trajectory(video_id: str):
             base,
             point_count=len(trajectory_bundle.get("plan_trajectory", [])),
         )
+        pose_graph_summary = load_pose_graph_summary(
+            base / "pose_graph_edges.npz",
+            point_count=len(trajectory_bundle.get("plan_trajectory", [])),
+        )
         return _sanitize_for_json({
             "success": True,
             "video_id": video_id,
@@ -2294,6 +2320,7 @@ async def r3_get_trajectory(video_id: str):
             "trajectory_quality": trajectory_bundle.get("trajectory_quality", {}),
             "run_params": run_params,
             "fallback_summary": fallback_summary,
+            "pose_graph": pose_graph_summary,
         })
     except HTTPException:
         raise
