@@ -87,6 +87,8 @@ export interface VideoAnalysisResult {
   message: string;
 }
 
+export type R3TrajectorySource = "raw" | "robust_candidate";
+
 export interface TrackingOptions {
   detect_interval?: number;
   turn_vote_threshold?: number;
@@ -905,7 +907,10 @@ export class ApiClient {
   }
 
   /** Rebuild only the current R3 trajectory; avoids loading the point cloud. */
-  async getR3Trajectory(videoId: string): Promise<{
+  async getR3Trajectory(
+    videoId: string,
+    trajectorySource: R3TrajectorySource = "raw",
+  ): Promise<{
     success: boolean;
     video_id: string;
     method: string;
@@ -927,12 +932,19 @@ export class ApiClient {
     source_frame_indices?: Array<number | null>;
     source_timestamps_seconds?: Array<number | null>;
     trajectory_quality?: Record<string, unknown>;
+    trajectory_source_requested?: R3TrajectorySource;
+    trajectory_source?: R3TrajectorySource;
+    trajectory_source_fallback_reason?: string | null;
+    trajectory_source_selection?: Record<string, unknown>;
     run_params?: Record<string, unknown>;
     fallback_summary?: Record<string, unknown>;
     pose_graph?: Record<string, unknown>;
     pose_graph_candidate?: Record<string, unknown>;
   }> {
-    const resp = await agentFetch(`${this.baseUrl}/api/r3-trajectory/${videoId}`);
+    const query = new URLSearchParams({ trajectory_source: trajectorySource });
+    const resp = await agentFetch(
+      `${this.baseUrl}/api/r3-trajectory/${videoId}?${query.toString()}`,
+    );
     if (!resp.ok) {
       throw new Error(`R3 trajectory fetch failed (HTTP ${resp.status})`);
     }
