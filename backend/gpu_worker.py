@@ -1308,6 +1308,7 @@ def _r3_run_diagnostics(video_id: str) -> dict:
             "turns": len(trajectory_bundle.get("turn_points", [])),
             "quality": trajectory_bundle.get("trajectory_quality", {}),
             "source_frame_indices": trajectory_bundle.get("source_frame_indices", []),
+            "source_timestamps_seconds": trajectory_bundle.get("source_timestamps_seconds", []),
         }
     except Exception as e:
         trajectory = {"quality": "error", "error": str(e)}
@@ -2202,6 +2203,7 @@ async def r3_get_pointcloud_filtered(
         raw_trajectory_3d = []
         turn_points = []
         source_frame_indices = []
+        source_timestamps_seconds = []
         cameras = []
         trajectory_quality = None
         base = _r3_output_dir(video_id)
@@ -2219,6 +2221,7 @@ async def r3_get_pointcloud_filtered(
                 raw_trajectory_3d = trajectory_bundle["raw_trajectory_3d"]
                 turn_points = trajectory_bundle["turn_points"]
                 source_frame_indices = trajectory_bundle["source_frame_indices"]
+                source_timestamps_seconds = trajectory_bundle.get("source_timestamps_seconds", [])
                 trajectory_quality = trajectory_bundle["trajectory_quality"]
             if include_cameras:
                 cameras = loaded_cameras
@@ -2233,6 +2236,7 @@ async def r3_get_pointcloud_filtered(
             "raw_trajectory_3d": raw_trajectory_3d,
             "turn_points": turn_points,
             "source_frame_indices": source_frame_indices,
+            "source_timestamps_seconds": source_timestamps_seconds,
             "cameras": cameras,
             "stats": {
                 "source_points": source_points,
@@ -2286,6 +2290,7 @@ async def r3_get_trajectory(video_id: str):
             "raw_trajectory_3d": trajectory_bundle.get("raw_trajectory_3d", []),
             "turn_points": trajectory_bundle.get("turn_points", []),
             "source_frame_indices": trajectory_bundle.get("source_frame_indices", []),
+            "source_timestamps_seconds": trajectory_bundle.get("source_timestamps_seconds", []),
             "trajectory_quality": trajectory_bundle.get("trajectory_quality", {}),
             "run_params": run_params,
             "fallback_summary": fallback_summary,

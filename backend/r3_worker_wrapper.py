@@ -56,6 +56,73 @@ def conf_stats(conf_values):
     }
 
 
+def _probe_video_frame_timestamps(video_path: str) -> tuple[list[float | None], dict]:
+    """Read presentation timestamps in decode order without decoding pixels.
+
+    Source-frame index divided by nominal FPS is wrong for variable-frame-rate
+    recordings and after dropped frames.  R3 still consumes numbered JPEGs,
+    but retaining their original PTS lets downstream motion constraints use
+    the real time delta instead of silently assuming a constant cadence.
+    """
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_frames",
+        "-show_entries", "frame=best_effort_timestamp_time",
+        "-of", "json",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return [], {
+            "available": False,
+            "source": "ffprobe_best_effort_timestamp_time",
+            "error": type(exc).__name__,
+        }
+    if result.returncode != 0:
+        return [], {
+            "available": False,
+            "source": "ffprobe_best_effort_timestamp_time",
+            "error": (result.stderr or "ffprobe_failed").strip()[-500:],
+        }
+    try:
+        frames = json.loads(result.stdout).get("frames", [])
+    except (AttributeError, json.JSONDecodeError) as exc:
+        return [], {
+            "available": False,
+            "source": "ffprobe_best_effort_timestamp_time",
+            "error": type(exc).__name__,
+        }
+
+    timestamps: list[float | None] = []
+    finite_count = 0
+    for frame in frames if isinstance(frames, list) else []:
+        raw = frame.get("best_effort_timestamp_time") if isinstance(frame, dict) else None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = math.nan
+        if math.isfinite(value):
+            timestamps.append(value)
+            finite_count += 1
+        else:
+            timestamps.append(None)
+    return timestamps, {
+        "available": finite_count > 0,
+        "source": "ffprobe_best_effort_timestamp_time",
+        "decoded_frames": len(timestamps),
+        "finite_timestamps": finite_count,
+    }
+
+
 def extract_frames(
     video_path: str,
     output_dir: str,
@@ -139,7 +206,18 @@ def extract_frames(
 
     selected_list = sorted(selected_indices)
     saved_source_indices = []
+    saved_source_timestamps = []
     saved_count = 0
+    probed_timestamps, timestamp_probe = _probe_video_frame_timestamps(video_path)
+
+    def source_timestamp(source_idx: int) -> float | None:
+        if 0 <= source_idx < len(probed_timestamps):
+            value = probed_timestamps[source_idx]
+            if value is not None and math.isfinite(value):
+                return float(value)
+        if fps > 0:
+            return float(source_idx / fps)
+        return None
 
     # For long MJPEG AVI files, sequential OpenCV decoding can stop early on
     # some FFmpeg builds. Seeking the selected source frames preserves full
@@ -154,6 +232,7 @@ def extract_frames(
             out_path = frames_dir / f"frame_{saved_count:06d}.jpg"
             cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             saved_source_indices.append(int(source_idx))
+            saved_source_timestamps.append(source_timestamp(int(source_idx)))
             saved_count += 1
     else:
         frame_idx = 0
@@ -165,12 +244,27 @@ def extract_frames(
                 out_path = frames_dir / f"frame_{saved_count:06d}.jpg"
                 cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 saved_source_indices.append(int(frame_idx))
+                saved_source_timestamps.append(source_timestamp(int(frame_idx)))
                 saved_count += 1
                 if max_frames > 0 and saved_count >= len(selected_indices):
                     break
             frame_idx += 1
 
     cap.release()
+
+    exact_timestamp_count = sum(
+        1
+        for source_idx in saved_source_indices
+        if 0 <= source_idx < len(probed_timestamps)
+        and probed_timestamps[source_idx] is not None
+        and math.isfinite(float(probed_timestamps[source_idx]))
+    )
+    if saved_count > 0 and exact_timestamp_count == saved_count:
+        timestamp_source = "ffprobe_best_effort_timestamp_time"
+    elif exact_timestamp_count > 0:
+        timestamp_source = "mixed_ffprobe_and_nominal_fps"
+    else:
+        timestamp_source = "nominal_fps_fallback"
 
     frame_selection = {
         "video_path": str(video_path),
@@ -193,6 +287,11 @@ def extract_frames(
         "source_frame_min": min(saved_source_indices) if saved_source_indices else None,
         "source_frame_max": max(saved_source_indices) if saved_source_indices else None,
         "source_indices": saved_source_indices,
+        "source_timestamps_seconds": saved_source_timestamps,
+        "timestamp_source": timestamp_source,
+        "exact_timestamp_count": exact_timestamp_count,
+        "fallback_timestamp_count": saved_count - exact_timestamp_count,
+        "timestamp_probe": timestamp_probe,
     }
     try:
         (Path(output_dir) / "frame_selection.json").write_text(

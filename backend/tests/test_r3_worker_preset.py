@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from r3_worker_wrapper import _build_r3_infer_cmd
+from r3_worker_wrapper import _build_r3_infer_cmd, _probe_video_frame_timestamps
 
 
 def option_value(command: list[str], option: str) -> str:
@@ -18,6 +20,28 @@ def option_value(command: list[str], option: str) -> str:
 
 
 class R3WorkerPresetTests(unittest.TestCase):
+    @patch("r3_worker_wrapper.subprocess.run")
+    def test_probes_exact_video_presentation_timestamps(self, run_mock) -> None:
+        run_mock.return_value = SimpleNamespace(
+            returncode=0,
+            stderr="",
+            stdout=json.dumps({
+                "frames": [
+                    {"best_effort_timestamp_time": "0.000000"},
+                    {"best_effort_timestamp_time": "0.033367"},
+                    {"best_effort_timestamp_time": "0.101000"},
+                ],
+            }),
+        )
+
+        timestamps, diagnostics = _probe_video_frame_timestamps("/tmp/input.mp4")
+
+        self.assertEqual(timestamps, [0.0, 0.033367, 0.101])
+        self.assertTrue(diagnostics["available"])
+        self.assertEqual(diagnostics["finite_timestamps"], 3)
+        command = run_mock.call_args.args[0]
+        self.assertIn("frame=best_effort_timestamp_time", command)
+
     def test_release_preset_neutralizes_regressed_pgo_settings(self) -> None:
         stale_environment = {
             "R3_REL_POSE_METHOD": "pgo",

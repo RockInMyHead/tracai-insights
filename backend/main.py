@@ -1036,6 +1036,7 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
         "r3_camera_points": raw_trajectory_3d,
         "r3_raw_camera_points": trajectory_bundle["raw_camera_points"],
         "r3_source_frame_indices": trajectory_bundle["source_frame_indices"],
+        "r3_source_timestamps_seconds": trajectory_bundle.get("source_timestamps_seconds", []),
         "r3_pose_confidence": confidence or None,
         "pointcloud_status": r3_result.get("pointcloud_status"),
         "r3_projection": trajectory_bundle["trajectory_quality"].get("projection", {}).get("method", "robust_floor_plane"),

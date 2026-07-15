@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-R3_TRAJECTORY_POSTPROCESS_VERSION = 3
+R3_TRAJECTORY_POSTPROCESS_VERSION = 4
 
 
 def summarize_fallback_edges(
@@ -518,15 +518,17 @@ def _stabilize_scale_regimes(
     confidence: np.ndarray,
     source_indices: Sequence[int | None],
     run_params: Mapping[str, Any] | None,
+    source_timestamps: Sequence[float | None] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Normalize confirmed fallback scale epochs without cumulative drift.
 
     The previous guard searched every point for a step-size change and then
     multiplied the *entire remaining tail*.  Several detections therefore
     compounded (2.74x × 1.78x × ... in the production run).  Here boundaries
-    must come from R3's actual bridge-edge log, motion is normalized by source
-    frame spacing, adjacent fallback segments with the same scale are grouped,
-    and every epoch is scaled independently against the first stable epoch.
+    must come from R3's actual bridge-edge log, motion is normalized by exact
+    presentation time when available, adjacent fallback segments with the same
+    scale are grouped, and every epoch is scaled independently against the
+    first stable epoch.
     """
     diagnostics: dict[str, Any] = {
         "method": "explicit_fallback_scale_epochs",
@@ -542,22 +544,48 @@ def _stabilize_scale_regimes(
 
     deltas = np.diff(plan_points[:, :2], axis=0)
     steps = np.linalg.norm(deltas, axis=1)
-    try:
-        source = np.asarray([
-            float(value) if value is not None else np.nan for value in source_indices
-        ], dtype=np.float64)
-    except (TypeError, ValueError):
-        source = np.arange(len(plan_points), dtype=np.float64)
-    if source.size != len(plan_points):
-        source = np.arange(len(plan_points), dtype=np.float64)
-    valid_source = np.isfinite(source)
-    if not valid_source.all():
-        indices = np.arange(len(source), dtype=np.float64)
-        if valid_source.any():
-            source = np.interp(indices, indices[valid_source], source[valid_source])
-        else:
-            source = indices
-    source_deltas = np.diff(source)
+    sample_axis: np.ndarray | None = None
+    if source_timestamps is not None:
+        try:
+            timestamps = np.asarray([
+                float(value) if value is not None else np.nan for value in source_timestamps
+            ], dtype=np.float64)
+        except (TypeError, ValueError):
+            timestamps = np.asarray([], dtype=np.float64)
+        valid_timestamps = np.isfinite(timestamps)
+        minimum_timestamp_support = max(2, int(math.ceil(len(plan_points) * 0.8)))
+        if timestamps.size == len(plan_points) and int(valid_timestamps.sum()) >= minimum_timestamp_support:
+            indices = np.arange(len(timestamps), dtype=np.float64)
+            if not valid_timestamps.all():
+                timestamps = np.interp(
+                    indices,
+                    indices[valid_timestamps],
+                    timestamps[valid_timestamps],
+                )
+            if np.count_nonzero(np.diff(timestamps) > 0) >= max(1, len(timestamps) - 2):
+                sample_axis = timestamps
+                diagnostics["motion_time_base"] = "presentation_timestamp_seconds"
+
+    if sample_axis is None:
+        try:
+            source = np.asarray([
+                float(value) if value is not None else np.nan for value in source_indices
+            ], dtype=np.float64)
+        except (TypeError, ValueError):
+            source = np.arange(len(plan_points), dtype=np.float64)
+        if source.size != len(plan_points):
+            source = np.arange(len(plan_points), dtype=np.float64)
+        valid_source = np.isfinite(source)
+        if not valid_source.all():
+            indices = np.arange(len(source), dtype=np.float64)
+            if valid_source.any():
+                source = np.interp(indices, indices[valid_source], source[valid_source])
+            else:
+                source = indices
+        sample_axis = source
+        diagnostics["motion_time_base"] = "source_frame_index"
+
+    source_deltas = np.diff(sample_axis)
     positive_source_deltas = source_deltas[np.isfinite(source_deltas) & (source_deltas > 0)]
     default_source_delta = float(np.median(positive_source_deltas)) if positive_source_deltas.size else 1.0
     source_deltas = np.where(
@@ -951,6 +979,7 @@ def _detect_turns(
     plan_points: np.ndarray,
     source_frame_indices: Sequence[int | None],
     confidence: np.ndarray,
+    source_timestamps: Sequence[float | None] | None = None,
     rotations: Sequence[np.ndarray] | None = None,
     floor_basis: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1032,16 +1061,28 @@ def _detect_turns(
         else:
             turn_type = "left" if angle > 0 else "right"
         source_index = source_frame_indices[center] if center < len(source_frame_indices) else None
+        timestamp = (
+            source_timestamps[center]
+            if source_timestamps is not None and center < len(source_timestamps)
+            else None
+        )
         turns.append({
             "frame_index": source_index if source_index is not None else center,
             "r3_frame_index": center,
             "source_frame_index": source_index,
+            "timestamp_seconds": round(float(timestamp), 6) if timestamp is not None else None,
             "trajectory_index": center,
             "angle_degrees": round(angle, 1),
             "position": [round(float(v), 6) for v in plan_points[center]],
             "turn_type": turn_type,
             "confidence": round(float(confidence[center]), 5) if np.isfinite(confidence[center]) else None,
             "angle_source": candidate["angle_source"],
+            # Camera orientation is an independent observation.  It may
+            # improve the semantic turn estimate, but it must never silently
+            # rewrite the R3 translation geometry.
+            "geometry_angle_degrees": round(float(candidate["angle"]), 1),
+            "observation_angle_degrees": round(angle, 1),
+            "geometry_mutated": False,
             "trajectory_angle_degrees": round(float(candidate["angle"]), 1),
             "camera_angle_degrees": (
                 round(float(candidate["orientation_angle"]), 1)
@@ -1063,23 +1104,28 @@ def _detect_turns(
         "candidate_count": len(candidates),
         "active_groups": len(candidates),
         "camera_overrides": camera_overrides,
+        "camera_geometry_policy": "observation_only",
         "camera_orientation": camera_diagnostics,
     }
 
 
-def _apply_camera_turn_corrections(
+def _summarize_camera_turn_disagreements(
     plan_points: np.ndarray,
     turns: Sequence[Mapping[str, Any]],
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Rotate future plan steps by camera-confirmed missing turn angles.
+    """Report camera/translation disagreement without changing geometry.
 
-    R3 translation can turn only 20 degrees while its c2w rotations correctly
-    turn 90.  Rotating the remainder around the event centre preserves every
-    measured step length and the raw 3D reconstruction, but restores the
-    missing yaw on the 2D plan so loops do not collapse into a broad arc.
+    A camera pan, a wrong floor normal, or a single orientation sign error can
+    make camera yaw disagree with the reconstructed translation.  The old
+    post-processor treated camera yaw as an instruction and rotated *every*
+    future plan point around the detected turn.  One bad observation therefore
+    corrupted the whole remainder of a production route.
+
+    Camera yaw remains valuable evidence for turn classification, so expose
+    the discrepancy to diagnostics and the future factor-graph optimizer.  The
+    returned geometry is always an exact copy of the R3 position projection.
     """
-    corrected = plan_points.copy()
-    applied: list[dict[str, Any]] = []
+    observations: list[dict[str, Any]] = []
     for turn in sorted(turns, key=lambda item: int(item.get("trajectory_index", 0))):
         if turn.get("angle_source") != "camera_orientation":
             continue
@@ -1094,28 +1140,24 @@ def _apply_camera_turn_corrections(
             abs(missing_angle) < 12.0
             or abs(missing_angle) > 100.0
             or pivot_index < 0
-            or pivot_index >= len(corrected) - 1
+            or pivot_index >= len(plan_points) - 1
         ):
             continue
-        radians = math.radians(missing_angle)
-        cosine = math.cos(radians)
-        sine = math.sin(radians)
-        rotation = np.array([[cosine, -sine], [sine, cosine]], dtype=np.float64)
-        pivot = corrected[pivot_index, :2].copy()
-        corrected[pivot_index + 1:, :2] = (
-            rotation @ (corrected[pivot_index + 1:, :2] - pivot).T
-        ).T + pivot
-        applied.append({
+        observations.append({
             "trajectory_index": pivot_index,
             "trajectory_angle_degrees": round(trajectory_angle, 1),
             "camera_angle_degrees": round(target_angle, 1),
-            "applied_delta_degrees": round(missing_angle, 1),
+            "disagreement_degrees": round(missing_angle, 1),
+            "action": "reported_not_applied",
         })
-    return corrected, {
-        "method": "camera_confirmed_piecewise_rotation",
-        "applied": bool(applied),
-        "applied_count": len(applied),
-        "corrections": applied,
+    return plan_points.copy(), {
+        "method": "camera_orientation_observation_only",
+        "geometry_mutated": False,
+        "applied": False,
+        "applied_count": 0,
+        "suppressed_count": len(observations),
+        "corrections": [],
+        "observations": observations,
     }
 
 
@@ -1139,6 +1181,30 @@ def _source_frame_indices(camera_poses: Sequence[Mapping[str, Any]], frame_selec
             except Exception:
                 source = None
         result.append(source)
+    return result
+
+
+def _source_timestamps(camera_poses: Sequence[Mapping[str, Any]], frame_selection: Any) -> list[float | None]:
+    timestamps: list[Any] = []
+    if isinstance(frame_selection, Mapping):
+        raw = frame_selection.get("source_timestamps_seconds")
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            timestamps = list(raw)
+    result: list[float | None] = []
+    for index, pose in enumerate(camera_poses):
+        frame = pose.get("frame", index)
+        try:
+            frame_index = int(frame)
+        except Exception:
+            frame_index = index
+        timestamp: float | None = None
+        if 0 <= frame_index < len(timestamps):
+            try:
+                candidate = float(timestamps[frame_index])
+                timestamp = candidate if math.isfinite(candidate) else None
+            except (TypeError, ValueError):
+                timestamp = None
+        result.append(timestamp)
     return result
 
 
@@ -1183,12 +1249,14 @@ def build_r3_trajectory(
             "raw_camera_points": [],
             "turn_points": [],
             "source_frame_indices": [],
+            "source_timestamps_seconds": [],
             "trajectory_quality": {"quality": "empty", "raw_points": 0},
         }
 
     raw = np.vstack(points)
     confidence = _pose_confidences(valid_poses, pose_confidence)
     source_indices = _source_frame_indices(valid_poses, frame_selection)
+    source_timestamps = _source_timestamps(valid_poses, frame_selection)
     cleaned_3d, filter_quality = _clean_positions(raw, confidence)
     projected_plan, plane, floor_basis = _project_to_floor(cleaned_3d, rotations)
     raw_plan, scale_stability = _stabilize_scale_regimes(
@@ -1196,15 +1264,17 @@ def build_r3_trajectory(
         confidence,
         source_indices,
         run_params,
+        source_timestamps=source_timestamps,
     )
     turns, turn_detection = _detect_turns(
         raw_plan,
         source_indices,
         confidence,
+        source_timestamps=source_timestamps,
         rotations=rotations,
         floor_basis=floor_basis,
     )
-    plan, heading_correction = _apply_camera_turn_corrections(raw_plan, turns)
+    plan, heading_correction = _summarize_camera_turn_disagreements(raw_plan, turns)
     for turn in turns:
         index = int(turn.get("trajectory_index", -1))
         if 0 <= index < len(plan):
@@ -1219,6 +1289,7 @@ def build_r3_trajectory(
         "raw_camera_points": _json_points(raw),
         "turn_points": turns,
         "source_frame_indices": source_indices,
+        "source_timestamps_seconds": source_timestamps,
         "pose_confidence": [round(float(v), 6) if np.isfinite(v) else None for v in confidence],
         "trajectory_quality": {
             "postprocess_version": R3_TRAJECTORY_POSTPROCESS_VERSION,
@@ -1226,6 +1297,14 @@ def build_r3_trajectory(
             "projection": plane,
             "scale_stability": scale_stability,
             "turn_detection": turn_detection,
+            "geometry_contract": {
+                "plan_source": "r3_translation_floor_projection",
+                "camera_orientation_mutates_plan": False,
+                "plan_matches_raw_plan": True,
+            },
+            "camera_turn_evidence": heading_correction,
+            # Backward-compatible diagnostics key.  No correction is applied
+            # from post-process version 4 onward.
             "heading_correction": heading_correction,
             "cleaned_distance": round(float(clean_steps.sum()), 6) if clean_steps.size else 0.0,
             "turns_detected": len(turns),
