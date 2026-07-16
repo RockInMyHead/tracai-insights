@@ -176,6 +176,7 @@ class LingBotMapAdapter:
                 try:
                     data = np.load(path)
                     for key in (
+                        "extrinsic",
                         "trajectory",
                         "poses",
                         "camera_poses",
@@ -186,7 +187,34 @@ class LingBotMapAdapter:
                         "world_T_cam",
                     ):
                         if key in data:
-                            return {"poses": data[key].tolist(), "source_file": path.name, "source_key": key}
+                            pose_array = np.asarray(data[key])
+                            if (
+                                pose_array.ndim >= 3
+                                and pose_array.shape[-2:] in {(3, 4), (4, 4)}
+                            ):
+                                confidence = data.get("depth_conf")
+                                poses = self._poses_from_extrinsics(
+                                    pose_array,
+                                    confidence=confidence,
+                                    input_is_w2c=(key == "cam_T_world"),
+                                    source_file=path.name,
+                                )
+                                if poses:
+                                    return {
+                                        "poses": poses,
+                                        "source_file": path.name,
+                                        "source_key": key,
+                                        "extrinsic_convention": "c2w",
+                                    }
+                            if (
+                                key == "extrinsic"
+                                and pose_array.ndim == 2
+                                and pose_array.shape in {(3, 4), (4, 4)}
+                            ):
+                                # Per-frame prediction; normalized together
+                                # with the other frame_*.npz files below.
+                                continue
+                            return {"poses": pose_array.tolist(), "source_file": path.name, "source_key": key}
                 except Exception:
                     continue
 
@@ -197,14 +225,18 @@ class LingBotMapAdapter:
                 data = np.load(path)
                 if "extrinsic" not in data:
                     continue
-                w2c = self._as_4x4(data["extrinsic"].astype(np.float32))
-                c2w = np.linalg.inv(w2c)
+                # Upstream demo.postprocess explicitly converts the camera
+                # prediction from w2c to c2w before --save_predictions.  Do
+                # not invert it a second time here.
+                c2w = self._as_4x4(data["extrinsic"].astype(np.float32))
+                confidence = self._frame_confidence(data.get("depth_conf"))
                 poses.append(
                     {
                         "frame_idx": idx,
                         "source_file": path.name,
                         "position": c2w[:3, 3].astype(float).tolist(),
                         "c2w": c2w.astype(float).tolist(),
+                        "confidence": confidence,
                     }
                 )
             except Exception:
@@ -213,6 +245,50 @@ class LingBotMapAdapter:
             return {"poses": poses, "source": "lingbot_per_frame_npz"}
 
         return {"poses": [], "source_file": None}
+
+    def _frame_confidence(self, value: Optional[np.ndarray]) -> Optional[float]:
+        if value is None:
+            return None
+        array = np.asarray(value, dtype=np.float32)
+        finite = array[np.isfinite(array)]
+        if finite.size == 0:
+            return None
+        return float(np.median(finite))
+
+    def _poses_from_extrinsics(
+        self,
+        extrinsics: np.ndarray,
+        *,
+        confidence: Optional[np.ndarray],
+        input_is_w2c: bool,
+        source_file: str,
+    ) -> list[Dict[str, Any]]:
+        matrices = np.asarray(extrinsics)
+        while matrices.ndim > 3 and matrices.shape[0] == 1:
+            matrices = matrices[0]
+        if matrices.ndim != 3:
+            return []
+        confidence_array = np.asarray(confidence) if confidence is not None else None
+        poses: list[Dict[str, Any]] = []
+        for index, matrix in enumerate(matrices):
+            try:
+                c2w = self._as_4x4(np.asarray(matrix, dtype=np.float32))
+                if input_is_w2c:
+                    c2w = np.linalg.inv(c2w)
+                frame_confidence = None
+                if confidence_array is not None and confidence_array.ndim >= 1:
+                    conf_index = min(index, confidence_array.shape[0] - 1)
+                    frame_confidence = self._frame_confidence(confidence_array[conf_index])
+                poses.append({
+                    "frame_idx": index,
+                    "source_file": source_file,
+                    "position": c2w[:3, 3].astype(float).tolist(),
+                    "c2w": c2w.astype(float).tolist(),
+                    "confidence": frame_confidence,
+                })
+            except Exception:
+                continue
+        return poses
 
     def _discover_or_create_pointcloud(self, files: Iterable[Path], output_dir: Path) -> Optional[Path]:
         for path in files:
@@ -324,8 +400,8 @@ class LingBotMapAdapter:
                 x = (uu.astype(np.float32) - cx) / fx * z
                 y = (vv.astype(np.float32) - cy) / fy * z
                 cam = np.stack([x, y, z, np.ones_like(z)], axis=1)
-                w2c = self._as_4x4(np.asarray(data["extrinsic"], dtype=np.float32))
-                c2w = np.linalg.inv(w2c)
+                # Saved LingBot predictions already use c2w extrinsics.
+                c2w = self._as_4x4(np.asarray(data["extrinsic"], dtype=np.float32))
                 world = (c2w @ cam.T).T[:, :3].astype(np.float32)
 
                 if image is not None:

@@ -120,3 +120,19 @@ The public TrackAI backend proxies these as:
 - `GET /api/lingbot-sessions/{session_id}/trajectory`
 - `GET /api/lingbot-sessions/{session_id}/pointcloud`
 - `GET /api/lingbot-sessions/{session_id}/metadata`
+
+## R3 production fusion
+
+When `LINGBOT_FUSION_ENABLED=true`, an R3 production job submits the same video
+to this worker after R3 has released the shared GPU. The VPS robustly aligns the
+LingBot trajectory to R3 with a non-reflecting 2D similarity transform. LingBot
+is therefore an observation candidate, not an unconditional replacement:
+
+- large residuals or a left/right turn conflict keep the result in shadow mode;
+- an accepted candidate is blended mainly where R3 confidence is weak;
+- the fixed floor-plan optimizer compares the R3 and fused candidates and keeps
+  the route with the better feasible map score;
+- worker failure or timeout never suppresses the original R3 result.
+
+Upstream LingBot output stores `extrinsic` as camera-to-world (`c2w`). The
+adapter preserves that convention; it must not invert the matrix a second time.

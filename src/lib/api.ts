@@ -31,6 +31,9 @@ export interface VideoAnalysisResult {
     method: string;
     trajectory: number[][];
     map_trajectory?: number[][];
+    floorplan_constraint?: Record<string, unknown>;
+    lingbot_fusion_candidate?: Record<string, unknown>;
+    lingbot_shadow?: Record<string, unknown>;
     turn_points: Array<{
       frame_index: number;
       trajectory_index: number;
@@ -57,13 +60,19 @@ export interface VideoAnalysisResult {
       gating_failure_rate?: number;
       map_matching_applied?: boolean;
       map_trajectory_points?: number;
+      map_distance_meters?: number;
+      map_confidence?: number;
+      floorplan_constraint?: Record<string, unknown>;
       map_auto_scale?: number;
     };
     map_metadata?: {
+      map_id?: string;
       plan_width: number;
       plan_height: number;
-      grid_cell: number;
-      auto_scale: number;
+      grid_cell?: number;
+      auto_scale?: number;
+      meters_per_pixel?: number;
+      person_radius_meters?: number;
       source: string;
     };
     r3_camera_points?: number[][];  // Все позиции камер R³ для отрисовки облака точек
@@ -97,6 +106,7 @@ export interface TrackingOptions {
 }
 
 export interface MapContext {
+  floorplan_id?: string;
   floor_plan_data?: string | null;
   drawn_plan?: unknown[] | null;
   reference_point?: { x: number; y: number } | null;
@@ -245,6 +255,7 @@ export class ApiClient {
       turn_vote_threshold: trackingOptions?.turn_vote_threshold ?? 3,
       use_ml_roi: trackingOptions?.use_ml_roi ?? true,
       floor_plan_data: mapContext?.floor_plan_data ?? null,
+      floorplan_id: mapContext?.floorplan_id ?? 'kerama_marazzi_2025',
       drawn_plan: mapContext?.drawn_plan ?? null,
       reference_point: mapContext?.reference_point ?? null,
       direction_point: mapContext?.direction_point ?? null,
@@ -254,7 +265,7 @@ export class ApiClient {
     };
     if (analysisMethod === 'r3') {
       body.frame_stride = r3Options?.frame_stride ?? 3;
-      body.max_frames = r3Options?.max_frames ?? 3000;
+      body.max_frames = r3Options?.max_frames ?? 2000;
       body.ckpt = r3Options?.ckpt ?? 'r3_long.safetensors';
       body.size = r3Options?.size ?? 392;
       body.mode = r3Options?.mode ?? 'strided';
@@ -308,6 +319,7 @@ export class ApiClient {
     if (mapContext?.floor_plan_data) {
       formData.append('floor_plan_data', mapContext.floor_plan_data);
     }
+    formData.append('floorplan_id', mapContext?.floorplan_id ?? 'kerama_marazzi_2025');
     if (mapContext?.drawn_plan) {
       formData.append('drawn_plan', JSON.stringify(mapContext.drawn_plan));
     }
@@ -476,6 +488,7 @@ export class ApiClient {
   }
 
   async updateTaskContext(taskId: string, context: {
+    floorplan_id?: string;
     floor_plan_data?: string | null;
     drawn_plan?: unknown[] | null;
     reference_point?: { x: number; y: number } | null;
@@ -843,6 +856,11 @@ export class ApiClient {
     plan_trajectory?: number[][];
     /** Cleaned c2w translations for Three.js only; never use these as map X/Y. */
     raw_trajectory_3d?: number[][];
+    map_trajectory?: number[][];
+    map_turn_points?: Array<Record<string, unknown>>;
+    floorplan_constraint?: Record<string, unknown>;
+    lingbot_fusion_candidate?: Record<string, unknown>;
+    lingbot_shadow?: Record<string, unknown>;
     turn_points?: Array<{
       frame_index: number;
       r3_frame_index?: number;
@@ -919,6 +937,19 @@ export class ApiClient {
     plan_trajectory: number[][];
     raw_plan_trajectory?: number[][];
     raw_trajectory_3d?: number[][];
+    map_trajectory?: number[][];
+    map_turn_points?: Array<{
+      frame_index: number;
+      trajectory_index: number;
+      angle_degrees: number;
+      position: number[];
+      turn_type: string;
+      [key: string]: unknown;
+    }>;
+    floorplan_constraint?: Record<string, unknown>;
+    lingbot_fusion_candidate?: Record<string, unknown>;
+    lingbot_shadow?: Record<string, unknown>;
+    processing_stats?: Record<string, unknown>;
     turn_points?: Array<{
       frame_index: number;
       r3_frame_index?: number;

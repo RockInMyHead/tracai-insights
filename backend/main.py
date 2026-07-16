@@ -25,6 +25,22 @@ try:
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.r3_trajectory import build_r3_trajectory
 
+try:
+    from floorplan_constraints import (
+        DEFAULT_FLOORPLAN_ID,
+        apply_floorplan_constraints,
+    )
+except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
+    from backend.floorplan_constraints import (
+        DEFAULT_FLOORPLAN_ID,
+        apply_floorplan_constraints,
+    )
+
+try:
+    from lingbot_fusion import attach_lingbot_fusion_candidate
+except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
+    from backend.lingbot_fusion import attach_lingbot_fusion_candidate
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +59,14 @@ BATCH_WAIT_SECONDS = 1  # минимальная задержка — обраб
 # GPU Worker — тяжёлый CV-пайплайн вынесен на отдельный сервер с RTX 3090
 GPU_WORKER_URL = os.getenv("GPU_WORKER_URL", "http://79.137.227.106:8003")
 LINGBOT_WORKER_URL = os.getenv("LINGBOT_WORKER_URL", "http://79.137.227.106:8004")
+LINGBOT_FUSION_ENABLED = os.getenv("LINGBOT_FUSION_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+LINGBOT_FUSION_TARGET_FRAMES = int(os.getenv("LINGBOT_FUSION_TARGET_FRAMES", "3000"))
+LINGBOT_FUSION_KEYFRAME_INTERVAL = int(os.getenv("LINGBOT_FUSION_KEYFRAME_INTERVAL", "6"))
+LINGBOT_FUSION_TIMEOUT_SECONDS = int(
+    os.getenv("LINGBOT_FUSION_TIMEOUT_SECONDS", str(3 * 60 * 60))
+)
 
 #
 # Helper: safely convert numpy/scipy types to plain JSON-serializable objects
@@ -288,6 +312,8 @@ def _map_context_summary(map_ctx: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
     if "client_source" in map_ctx:
         summary["client_source"] = map_ctx.get("client_source")
+    if map_ctx.get("floorplan_id"):
+        summary["floorplan_id"] = map_ctx.get("floorplan_id")
     if map_ctx.get("floor_plan_data"):
         summary["has_floor_plan_data"] = True
     if map_ctx.get("drawn_plan"):
@@ -355,14 +381,60 @@ def _parse_json_field(value: Any, default: Any = None) -> Any:
 
 def _extract_map_context(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     map_context = {
+        "floorplan_id": payload.get("floorplan_id") or DEFAULT_FLOORPLAN_ID,
         "floor_plan_data": payload.get("floor_plan_data"),
         "drawn_plan": _parse_json_field(payload.get("drawn_plan")),
         "reference_point": _parse_json_field(payload.get("reference_point")),
         "direction_point": _parse_json_field(payload.get("direction_point")),
     }
-    if not map_context["floor_plan_data"] and not map_context["drawn_plan"]:
-        return None
     return map_context
+
+
+def _load_task_map_context(video_id: str) -> Dict[str, Any]:
+    """Load the durable start/direction used for map-constrained R3 queries."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+        row = cursor.fetchone()
+        conn.close()
+        parsed = json.loads(row[0]) if row and row[0] else {}
+        if isinstance(parsed, dict):
+            parsed.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
+            return parsed
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to load map context: {exc}")
+    return {"floorplan_id": DEFAULT_FLOORPLAN_ID}
+
+
+def _merge_task_map_context(video_id: str, map_context: Optional[Dict[str, Any]]) -> None:
+    """Persist the exact map anchor before an asynchronous analysis starts."""
+    if not map_context:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+        row = cursor.fetchone()
+        try:
+            existing = json.loads(row[0]) if row and row[0] else {}
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+        # None is meaningful for anchor fields: clearing a direction in the
+        # UI must not resurrect the previous database value when the
+        # lightweight R3 trajectory endpoint is queried later.
+        existing.update(map_context)
+        existing.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
+        cursor.execute(
+            "UPDATE tracking_tasks SET map_context = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (json.dumps(existing), video_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to persist map context: {exc}")
 
 
 def _load_manual_trajectories() -> Dict[str, Any]:
@@ -1060,6 +1132,55 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
     }
 
 
+def _merge_r3_production_trajectory(base: dict, selected: dict) -> dict:
+    """Promote the worker's accepted production pose source into saved output.
+
+    Raw camera poses remain available for 3D diagnostics; only the floor-plan
+    trajectory and its turn/source metadata are selected here.
+    """
+    if not isinstance(selected, dict) or not selected.get("success"):
+        return base
+    plan = selected.get("plan_trajectory") or selected.get("trajectory") or []
+    if not isinstance(plan, list) or len(plan) < 2:
+        return base
+    source = str(selected.get("trajectory_source") or "raw")
+    method = {
+        "scale_aware_candidate": "r3_reconstruction_scale_aware",
+        "robust_candidate": "r3_reconstruction_robust_candidate",
+    }.get(source, "r3_reconstruction")
+    updated = dict(base)
+    updated.update({
+        "method": method,
+        "trajectory": plan,
+        "plan_trajectory": plan,
+        "turn_points": selected.get("turn_points") or [],
+        "trajectory_points": len(plan),
+        "r3_source_frame_indices": selected.get("source_frame_indices") or [],
+        "r3_source_timestamps_seconds": selected.get("source_timestamps_seconds") or [],
+        "r3_pose_graph": selected.get("pose_graph"),
+        "r3_pose_graph_candidate": selected.get("pose_graph_candidate"),
+        "r3_scale_aware_candidate": selected.get("scale_aware_candidate"),
+    })
+    quality = selected.get("trajectory_quality") or {}
+    stats = dict(base.get("processing_stats") or {})
+    stats.update({
+        "turns_detected": len(updated["turn_points"]),
+        "r3_trajectory_quality": quality,
+        "r3_trajectory_source": source,
+        "r3_trajectory_source_requested": selected.get(
+            "trajectory_source_requested", "scale_aware_candidate"
+        ),
+        "r3_trajectory_source_fallback_reason": selected.get(
+            "trajectory_source_fallback_reason"
+        ),
+        "r3_trajectory_source_selection": selected.get(
+            "trajectory_source_selection"
+        ) or {},
+    })
+    updated["processing_stats"] = stats
+    return updated
+
+
 def _schedule_process_video_background(
     background_tasks: Optional[BackgroundTasks],
     video_id: str,
@@ -1399,6 +1520,9 @@ def _lingbot_to_trackai_result(
 ) -> Dict[str, Any]:
     poses = trajectory_payload.get("poses") if isinstance(trajectory_payload, dict) else []
     trajectory: List[List[float]] = []
+    raw_trajectory_3d: List[List[float]] = []
+    pose_confidence: List[Optional[float]] = []
+    camera_poses: List[Dict[str, Any]] = []
 
     if isinstance(poses, list):
         for pose in poses:
@@ -1426,6 +1550,21 @@ def _lingbot_to_trackai_result(
                 # TrackAI plan UI expects x/y/z-like points. For LingBot camera
                 # poses, horizontal movement is better represented by x/z; y is height.
                 trajectory.append([x, z, y])
+                raw_trajectory_3d.append([x, y, z])
+                confidence = pose.get("confidence") if isinstance(pose, dict) else None
+                try:
+                    confidence_value = float(confidence) if confidence is not None else None
+                    if confidence_value is not None and not _math.isfinite(confidence_value):
+                        confidence_value = None
+                except (TypeError, ValueError):
+                    confidence_value = None
+                pose_confidence.append(confidence_value)
+                if isinstance(pose, dict) and isinstance(pose.get("c2w"), list):
+                    camera_poses.append({
+                        "frame_idx": pose.get("frame_idx", len(trajectory) - 1),
+                        "c2w": pose.get("c2w"),
+                        "confidence": confidence_value,
+                    })
 
     estimated_distance = 0.0
     for i in range(1, len(trajectory)):
@@ -1454,6 +1593,8 @@ def _lingbot_to_trackai_result(
     return {
         "method": "lingbot_map",
         "trajectory": trajectory,
+        "plan_trajectory": trajectory,
+        "raw_trajectory_3d": raw_trajectory_3d,
         "turn_points": [],
         "trajectory_turn_points": [],
         "frame_count": len(trajectory),
@@ -1461,6 +1602,8 @@ def _lingbot_to_trackai_result(
         "lingbot_session_id": session_id,
         "lingbot_metadata": metadata,
         "lingbot_trajectory": trajectory_payload,
+        "lingbot_camera_poses": camera_poses,
+        "lingbot_pose_confidence": pose_confidence,
         "processing_stats": {
             "algorithm": "LingBot-Map",
             "session_id": session_id,
@@ -2144,6 +2287,10 @@ async def process_video_background(
             raise Exception(gpu_result.get("error", "GPU Worker returned unsuccessful status"))
 
         result = gpu_result["result"]
+        # The GPU worker supplies visual motion.  The VPS owns the immutable
+        # Kerama plan and applies the same production constraints to every
+        # reconstruction backend, even when an older worker is deployed.
+        result = apply_floorplan_constraints(result, map_context)
         processing_time = gpu_result.get("processing_time", 0)
         logger.info(f"[{video_id}] GPU Worker completed in {processing_time}s")
 
@@ -2197,6 +2344,7 @@ async def process_video_r3_background(
     ckpt: str = "r3_long.safetensors",
     size: int = 392,
     mode: str = "strided",
+    map_context: Optional[Dict[str, Any]] = None,
 ):
     """Background task — отправляет видео на GPU Worker для R³ реконструкции.
 
@@ -2267,6 +2415,93 @@ async def process_video_r3_background(
         # Конвертируем R³ camera poses в формат траектории
         r3_result = gpu_result["result"]
         trajectory_data = _r3_poses_to_trajectory(r3_result, scale_factor=scale_factor)
+        try:
+            async with aiohttp.ClientSession() as source_session:
+                async with source_session.get(
+                    f"{GPU_WORKER_URL}/api/r3-trajectory/{video_id}",
+                    params={"trajectory_source": "scale_aware_candidate"},
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as source_response:
+                    if source_response.status == 200:
+                        selected_trajectory = await source_response.json()
+                        trajectory_data = _merge_r3_production_trajectory(
+                            trajectory_data,
+                            selected_trajectory,
+                        )
+                    else:
+                        logger.warning(
+                            f"[{video_id}] Production trajectory selection returned "
+                            f"HTTP {source_response.status}; keeping raw R3"
+                        )
+        except Exception as source_error:
+            logger.warning(
+                f"[{video_id}] Production trajectory selection failed; keeping raw R3: "
+                f"{source_error}"
+            )
+
+        # LingBot runs after R3 on the shared RTX 3090 and acts as an
+        # independent geometry observer. Failure is deliberately non-fatal:
+        # production falls back to the already selected R3 trajectory.
+        if LINGBOT_FUSION_ENABLED and video_path and video_path.exists():
+            try:
+                processing_status[video_id].update({
+                    "status": "lingbot_fusion",
+                    "progress": 70,
+                    "message": "Запуск LingBot-Map для проверки геометрии R³...",
+                })
+                submission = await _submit_lingbot_session(
+                    video_path,
+                    fps=10,
+                    target_frames=LINGBOT_FUSION_TARGET_FRAMES,
+                    keyframe_interval=LINGBOT_FUSION_KEYFRAME_INTERVAL,
+                    use_sdpa=True,
+                    mask_sky=False,
+                )
+                fusion_session_id = str(submission.get("session_id") or "")
+                if not fusion_session_id:
+                    raise RuntimeError("LingBot worker did not return session_id")
+                processing_status[video_id]["lingbot_fusion_session_id"] = fusion_session_id
+                lingbot_result = await _await_lingbot_session_result(
+                    video_id,
+                    fusion_session_id,
+                    timeout_seconds=LINGBOT_FUSION_TIMEOUT_SECONDS,
+                )
+                trajectory_data = attach_lingbot_fusion_candidate(
+                    trajectory_data,
+                    lingbot_result,
+                )
+                logger.info(
+                    "[%s] LingBot fusion candidate accepted=%s",
+                    video_id,
+                    trajectory_data.get("lingbot_fusion_candidate", {}).get("accepted"),
+                )
+            except Exception as lingbot_error:
+                logger.warning(
+                    "[%s] LingBot shadow/fusion unavailable; keeping R3: %s",
+                    video_id,
+                    lingbot_error,
+                )
+                stats = dict(trajectory_data.get("processing_stats") or {})
+                stats["lingbot_shadow_available"] = False
+                stats["lingbot_fusion"] = {
+                    "accepted": False,
+                    "reason": "worker_unavailable",
+                    "error": str(lingbot_error),
+                }
+                trajectory_data["processing_stats"] = stats
+        else:
+            stats = dict(trajectory_data.get("processing_stats") or {})
+            stats["lingbot_shadow_available"] = False
+            stats["lingbot_fusion"] = {
+                "accepted": False,
+                "reason": (
+                    "disabled"
+                    if not LINGBOT_FUSION_ENABLED
+                    else "video_not_available_on_vps"
+                ),
+            }
+            trajectory_data["processing_stats"] = stats
+        trajectory_data = apply_floorplan_constraints(trajectory_data, map_context)
 
         # Сохраняем результат
         video_filename = video_path.name if video_path and video_path.exists() else f"{video_id}_{original_filename}"
@@ -2287,7 +2522,7 @@ async def process_video_r3_background(
         processing_status[video_id].update({
             "status": "completed",
             "progress": 100,
-            "message": "R³ реконструкция завершена",
+            "message": "R³ + LingBot + план: обработка завершена",
             "result": trajectory_data,
         })
         _update_task_status(video_id, "completed", 100)
@@ -2316,18 +2551,19 @@ def _schedule_r3_process_background(
     ckpt: str = "r3_long.safetensors",
     size: int = 392,
     mode: str = "strided",
+    map_context: Optional[Dict[str, Any]] = None,
 ) -> None:
     if background_tasks is not None:
         background_tasks.add_task(
             process_video_r3_background,
             video_id, video_path, original_filename,
-            scale_factor, frame_stride, max_frames, ckpt, size, mode,
+            scale_factor, frame_stride, max_frames, ckpt, size, mode, map_context,
         )
     else:
         asyncio.create_task(
             process_video_r3_background(
                 video_id, video_path, original_filename,
-                scale_factor, frame_stride, max_frames, ckpt, size, mode,
+                scale_factor, frame_stride, max_frames, ckpt, size, mode, map_context,
             )
         )
 
@@ -2551,7 +2787,9 @@ async def update_task_context(task_id: str, request: Request) -> Dict[str, Any]:
     """Обновить контекст задачи (чертеж, план, имя сотрудника) — вызывается фронтом при каждом изменении."""
     try:
         body = await request.json()
-        map_context = {}
+        map_context = {
+            "floorplan_id": body.get("floorplan_id") or DEFAULT_FLOORPLAN_ID,
+        }
         if body.get("floor_plan_data"):
             map_context["floor_plan_data"] = body["floor_plan_data"]
         if body.get("drawn_plan"):
@@ -2685,8 +2923,7 @@ async def register_existing_video_task(video_id: str, request: Request) -> Dict[
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _start_lingbot_session(
-    video_id: str,
+async def _submit_lingbot_session(
     video_path: Optional[Path],
     fps: int = 10,
     target_frames: int = 1500,
@@ -2733,6 +2970,26 @@ async def _start_lingbot_session(
                 except Exception:
                     raise HTTPException(status_code=502, detail="LingBot worker returned invalid JSON")
 
+    return result
+
+
+async def _start_lingbot_session(
+    video_id: str,
+    video_path: Optional[Path],
+    fps: int = 10,
+    target_frames: int = 1500,
+    keyframe_interval: int = 6,
+    use_sdpa: bool = True,
+    mask_sky: bool = False,
+) -> Dict[str, Any]:
+    result = await _submit_lingbot_session(
+        video_path,
+        fps=fps,
+        target_frames=target_frames,
+        keyframe_interval=keyframe_interval,
+        use_sdpa=use_sdpa,
+        mask_sky=mask_sky,
+    )
     processing_status[video_id] = {
         "status": "queued",
         "progress": 0,
@@ -2743,6 +3000,36 @@ async def _start_lingbot_session(
     }
     _persist_lingbot_session_id(video_id, result.get("session_id"))
     return result
+
+
+async def _await_lingbot_session_result(
+    video_id: str,
+    session_id: str,
+    *,
+    timeout_seconds: int,
+    poll_seconds: float = 2.0,
+) -> Dict[str, Any]:
+    """Wait for a shadow LingBot run without replacing the R3 status result."""
+    deadline = time.monotonic() + max(1, timeout_seconds)
+    while time.monotonic() < deadline:
+        status = await _fetch_lingbot_json(f"/sessions/{session_id}/status")
+        state = str(status.get("status") or "unknown")
+        progress = float(status.get("progress") or 0.0)
+        if video_id in processing_status:
+            processing_status[video_id].update({
+                "status": "lingbot_fusion",
+                "progress": min(94, 70 + int(round(progress * 24))),
+                "message": "LingBot-Map строит второе геометрическое наблюдение...",
+                "lingbot_fusion_session_id": session_id,
+            })
+        if state == "completed":
+            metadata = await _fetch_lingbot_json(f"/sessions/{session_id}/metadata")
+            trajectory = await _fetch_lingbot_json(f"/sessions/{session_id}/trajectory")
+            return _lingbot_to_trackai_result(video_id, session_id, metadata, trajectory)
+        if state == "failed":
+            raise RuntimeError(status.get("error") or "LingBot shadow reconstruction failed")
+        await asyncio.sleep(max(0.25, poll_seconds))
+    raise TimeoutError(f"LingBot shadow reconstruction timed out after {timeout_seconds}s")
 
 
 @app.post("/api/analyze-video-by-id")
@@ -2760,6 +3047,7 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
         turn_vote_threshold = int(body.get("turn_vote_threshold", 3))
         use_ml_roi = bool(body.get("use_ml_roi", True))
         map_context = _extract_map_context(body)
+        _merge_task_map_context(video_id, map_context)
         force_reprocess = bool(body.get("force_reprocess", False))
 
         # При явном новом анализе ручная траектория больше не должна подменять результат.
@@ -2853,7 +3141,7 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 background_tasks,
                 video_id, video_path, original_filename,
                 scale_factor,
-                frame_stride, max_frames, ckpt, size, mode,
+                frame_stride, max_frames, ckpt, size, mode, map_context,
             )
         else:
             _schedule_process_video_background(
@@ -3831,7 +4119,45 @@ async def r3_trajectory_proxy(
                 if resp.status != 200:
                     return JSONResponse({"detail": text[:500]}, status_code=resp.status)
                 try:
-                    return JSONResponse(json.loads(text))
+                    worker_result = json.loads(text)
+                    # The LingBot shadow run is owned by the VPS and therefore
+                    # is not present in the R3 GPU worker response. Re-attach
+                    # the persisted guarded candidate before map selection so
+                    # frontend refreshes keep the production fusion result.
+                    analysis_path = OUTPUT_DIR / f"{video_id}_analysis.json"
+                    if analysis_path.exists():
+                        try:
+                            saved_payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+                            saved_result = saved_payload.get("analysis_result") or {}
+                            saved_stats = saved_result.get("processing_stats") or {}
+                            requested_source = str(trajectory_source or "raw")
+                            saved_source = str(
+                                saved_stats.get("r3_trajectory_source")
+                                or "scale_aware_candidate"
+                            )
+                            candidate = saved_result.get("lingbot_fusion_candidate")
+                            if (
+                                isinstance(candidate, dict)
+                                and candidate.get("accepted")
+                                and requested_source == saved_source
+                            ):
+                                worker_result["lingbot_fusion_candidate"] = candidate
+                                worker_result["lingbot_shadow"] = saved_result.get("lingbot_shadow")
+                                stats = dict(worker_result.get("processing_stats") or {})
+                                stats["lingbot_fusion"] = saved_stats.get("lingbot_fusion") or {}
+                                stats["lingbot_shadow_available"] = True
+                                worker_result["processing_stats"] = stats
+                        except Exception as saved_error:
+                            logger.warning(
+                                "[%s] Could not restore persisted LingBot fusion: %s",
+                                video_id,
+                                saved_error,
+                            )
+                    constrained = apply_floorplan_constraints(
+                        worker_result,
+                        _load_task_map_context(video_id),
+                    )
+                    return JSONResponse(_to_json_serializable(constrained))
                 except json.JSONDecodeError:
                     return JSONResponse(
                         {"detail": "GPU Worker returned invalid trajectory JSON"},
