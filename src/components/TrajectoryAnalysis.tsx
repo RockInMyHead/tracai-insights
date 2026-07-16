@@ -93,20 +93,12 @@ const mergeR3TrajectoryResponse = (
       )
     : [];
   if (!response.success || planTrajectory.length < 2) return analysisData;
-  const mapTrajectory = Array.isArray(response.map_trajectory)
-    ? response.map_trajectory.filter(
-        (point) => Array.isArray(point) && point.length >= 2,
-      )
-    : [];
-  const displayTrajectory = mapTrajectory.length >= 2 ? mapTrajectory : planTrajectory;
 
   const selectedSource = response.trajectory_source ?? "raw";
   const trajectoryQuality = response.trajectory_quality ?? {};
   const cleanedDistance = trajectoryQuality.cleaned_distance;
   const currentStats =
     (analysisData.processing_stats as Record<string, unknown> | undefined) || {};
-  const responseStats = response.processing_stats ?? {};
-  const responseEstimatedDistance = finiteNum(responseStats.estimated_distance, Number.NaN);
   const mergedRawTrajectory = Array.isArray(rawTrajectory3d) && rawTrajectory3d.length >= 2
     ? rawTrajectory3d
     : analysisData.raw_trajectory_3d;
@@ -118,9 +110,8 @@ const mergeR3TrajectoryResponse = (
       : selectedSource === "robust_candidate"
         ? "r3_reconstruction_robust_candidate"
         : "r3_reconstruction",
-    trajectory: displayTrajectory,
+    trajectory: planTrajectory,
     plan_trajectory: planTrajectory,
-    map_trajectory: mapTrajectory.length >= 2 ? mapTrajectory : undefined,
     raw_trajectory_3d: mergedRawTrajectory,
     r3_camera_points: mergedRawTrajectory,
     r3_source_frame_indices: response.source_frame_indices ?? [],
@@ -131,19 +122,12 @@ const mergeR3TrajectoryResponse = (
     turn_points: Array.isArray(response.turn_points)
       ? response.turn_points
       : analysisData.turn_points,
-    map_turn_points: Array.isArray(response.map_turn_points)
-      ? response.map_turn_points
-      : undefined,
-    floorplan_constraint: response.floorplan_constraint,
-    trajectory_points: displayTrajectory.length,
+    trajectory_points: planTrajectory.length,
     processing_stats: {
       ...currentStats,
       ...extraStats,
-      ...responseStats,
       estimated_distance:
-        Number.isFinite(responseEstimatedDistance)
-          ? responseEstimatedDistance
-          : typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
+        typeof cleanedDistance === "number" && Number.isFinite(cleanedDistance)
           ? cleanedDistance
           : currentStats.estimated_distance,
       turns_detected: Array.isArray(response.turn_points)
@@ -155,9 +139,6 @@ const mergeR3TrajectoryResponse = (
       r3_trajectory_source_fallback_reason:
         response.trajectory_source_fallback_reason ?? null,
       r3_trajectory_source_selection: response.trajectory_source_selection ?? {},
-      floorplan_constraint: response.floorplan_constraint ?? {},
-      map_matching_applied: mapTrajectory.length >= 2,
-      map_trajectory_points: mapTrajectory.length,
     },
   } as AnalysisData;
 };
@@ -171,15 +152,11 @@ const trajectoryDataFromVideo = (video: VideoWithOwner): TrajectoryData => {
   const isLingBot = method === "lingbot_map";
   const hasMapTrajectory = Boolean(result.map_trajectory);
   const isAlreadyInPlanSpace = (hasMapTrajectory && !isLingBot) || manualOverride;
-  const floorplanConstraint = (
-    result.floorplan_constraint || stats?.floorplan_constraint || {}
-  ) as Record<string, unknown>;
-  const mapRejected = isR3 && floorplanConstraint.accepted === false;
   const r3Quality = stats?.r3_trajectory_quality as Record<string, unknown> | undefined;
   const r3Projection = r3Quality?.projection as Record<string, unknown> | undefined;
   return {
     trajectory: convertTrajectory(
-      mapRejected ? [] : (result.map_trajectory || result.plan_trajectory || result.trajectory),
+      result.map_trajectory || result.plan_trajectory || result.trajectory,
     ),
     turnPoints: result.map_turn_points || result.turn_points || [],
     ownerName: video.ownerName,
@@ -193,7 +170,7 @@ const trajectoryDataFromVideo = (video: VideoWithOwner): TrajectoryData => {
       ? (result.plan_trajectory || result.trajectory)
       : undefined,
     mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(stats?.scale_factor, 1),
-    r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace && !mapRejected,
+    r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace,
   };
 };
 
@@ -226,8 +203,9 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const [detectInterval, setDetectInterval] = useState<number>(5);
   const [turnVoteThreshold, setTurnVoteThreshold] = useState<number>(3);
   const [useMlRoi, setUseMlRoi] = useState<boolean>(true);
-  const [analysisMethod] = useState<'slam' | 'r3' | 'lingbot'>('r3');
-  const r3TrajectorySource: R3TrajectorySource = 'scale_aware_candidate';
+  const [analysisMethod, setAnalysisMethod] = useState<'slam' | 'r3' | 'lingbot'>('slam');
+  const [r3TrajectorySource, setR3TrajectorySource] = useState<R3TrajectorySource>('scale_aware_candidate');
+  const [isSwitchingR3Trajectory, setIsSwitchingR3Trajectory] = useState(false);
   const [liveViewVideoId, setLiveViewVideoId] = useState<string | null>(null);
   const [showLiveView, setShowLiveView] = useState(false);
   const [floorPlan, setFloorPlan] = useState<string | null>(null);
@@ -261,9 +239,12 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const activeAnalysisStats = (
     analysisResult?.data?.processing_stats || {}
   ) as Record<string, unknown>;
-  const activeFloorplanConstraint = (
-    activeAnalysisStats.floorplan_constraint || {}
-  ) as Record<string, unknown>;
+  const activeR3TrajectorySource = String(
+    activeAnalysisStats.r3_trajectory_source || "",
+  );
+  const activeR3FallbackReason = String(
+    activeAnalysisStats.r3_trajectory_source_fallback_reason || "",
+  );
 
   // Загрузка плана из localStorage при инициализации
   useEffect(() => {
@@ -587,10 +568,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       toast.error("Добавьте хотя бы одно видео для анализа");
       return;
     }
-    if (!(externalReferencePoint || referencePoint) || !externalDirectionPoint) {
-      toast.error("Сначала укажите на фиксированном плане точку старта и направление движения");
-      return;
-    }
 
     console.log(`🚀 Начало пакетного анализа ${videos.length} видео`);
     console.log(`📏 Коэффициент масштаба: ${scaleFactor}`);
@@ -638,7 +615,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             }
             apiClient
               .updateTaskContext(uploadedVideoId, {
-                floorplan_id: 'kerama_marazzi_2025',
                 floor_plan_data: externalFloorPlan || floorPlan,
                 drawn_plan: drawnPlan || null,
                 reference_point: externalReferencePoint || referencePoint,
@@ -669,7 +645,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             processingId = uploadedVideoId;
             apiClient
               .updateTaskContext(uploadedVideoId, {
-                floorplan_id: 'kerama_marazzi_2025',
                 floor_plan_data: externalFloorPlan || floorPlan,
                 drawn_plan: drawnPlan || null,
                 reference_point: externalReferencePoint || referencePoint,
@@ -706,7 +681,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               use_ml_roi: useMlRoi,
             },
             {
-              floorplan_id: 'kerama_marazzi_2025',
               floor_plan_data: externalFloorPlan || floorPlan,
               drawn_plan: drawnPlan || null,
               reference_point: externalReferencePoint || referencePoint,
@@ -714,7 +688,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             },
             video.ownerName,
             analysisMethod,
-            analysisMethod === 'r3' ? { frame_stride: 3, max_frames: 2000, ckpt: 'r3_long.safetensors', size: 392, mode: 'strided' } : undefined,
+            analysisMethod === 'r3' ? { frame_stride: 3, max_frames: 3000, ckpt: 'r3_long.safetensors', size: 392, mode: 'strided' } : undefined,
             true
           );
 
@@ -868,6 +842,74 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         setAnalysisProgress(0);
         setCurrentStep('');
       }, 2000);
+    }
+  };
+
+  const handleR3TrajectorySourceChange = async (source: R3TrajectorySource) => {
+    setR3TrajectorySource(source);
+    const targets = videos.filter((video) => (
+      video.video_id &&
+      video.analysisResult &&
+      String(video.analysisResult.method || "").startsWith("r3")
+    ));
+    if (targets.length === 0) return;
+
+    setIsSwitchingR3Trajectory(true);
+    try {
+      const responses = await Promise.all(targets.map(async (video) => ({
+        videoId: video.video_id as string,
+        response: await apiClient.getR3Trajectory(video.video_id as string, source),
+      })));
+      const byVideoId = new Map<string, R3TrajectoryResponse>(
+        responses.map(({ videoId, response }) => [videoId, response]),
+      );
+      const updatedVideos = videos.map((video) => {
+        if (!video.video_id || !video.analysisResult) return video;
+        const response = byVideoId.get(video.video_id);
+        if (!response) return video;
+        return {
+          ...video,
+          analysisResult: mergeR3TrajectoryResponse(
+            video.analysisResult,
+            response,
+            video.analysisResult.raw_trajectory_3d,
+          ),
+        };
+      });
+      setVideos(updatedVideos);
+
+      const analyzed = updatedVideos.filter((video) => video.analysisResult);
+      if (analyzed.length > 0 && onTrajectoryAnalyzed) {
+        const trajectoriesData = analyzed.map(trajectoryDataFromVideo);
+        onTrajectoryAnalyzed(
+          trajectoriesData[0].trajectory,
+          trajectoriesData[0].turnPoints,
+          (analyzed[0].analysisResult?.processing_stats || {}) as Record<string, unknown>,
+          trajectoriesData,
+        );
+      }
+
+      const fallback = responses.find(({ response }) => (
+        response.trajectory_source !== source
+      ));
+      if (fallback) {
+        toast.warning(
+          `Кандидат не применён: ${fallback.response.trajectory_source_fallback_reason || "quality gate"}. Показан безопасный fallback.`,
+        );
+      } else {
+        toast.success(
+          source === "scale_aware_candidate"
+            ? "Показана scale-aware траектория с привязкой масштаба к полу"
+            : source === "robust_candidate"
+              ? "Показана robust-траектория из полного pose graph"
+              : "Показана исходная траектория R³",
+        );
+      }
+    } catch (error) {
+      console.error("Failed to switch R3 trajectory source:", error);
+      toast.error("Не удалось переключить источник R³ траектории");
+    } finally {
+      setIsSwitchingR3Trajectory(false);
     }
   };
 
@@ -1285,23 +1327,100 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         </div>
         )}
 
-        {/* Single production pipeline */}
+        {/* Method selector */}
         <div className="space-y-2">
-          <Label className="text-sm font-medium">Production-анализ</Label>
+          <Label className="text-sm font-medium">Метод анализа</Label>
+          <div className="grid grid-cols-3 gap-2">
+            <Button
+              type="button"
+              variant={analysisMethod === 'slam' ? 'default' : 'outline'}
+              className="h-auto py-3"
+              onClick={() => setAnalysisMethod('slam')}
+              disabled={isAnalyzing}
+            >
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-sm font-semibold">SLAM</span>
+                <span className="text-[10px] opacity-70">Классический</span>
+              </div>
+            </Button>
+            <Button
+              type="button"
+              variant={analysisMethod === 'r3' ? 'default' : 'outline'}
+              className="h-auto py-3"
+              onClick={() => setAnalysisMethod('r3')}
+              disabled={isAnalyzing}
+            >
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-sm font-semibold">R³</span>
+                <span className="text-[10px] opacity-70">3D реконструкция</span>
+              </div>
+            </Button>
+            <Button
+              type="button"
+              variant={analysisMethod === 'lingbot' ? 'default' : 'outline'}
+              className="h-auto py-3"
+              onClick={() => setAnalysisMethod('lingbot')}
+              disabled={isAnalyzing}
+            >
+              <div className="flex flex-col items-center gap-1">
+                <span className="text-sm font-semibold">LingBot</span>
+                <span className="text-[10px] opacity-70">Map GPU</span>
+              </div>
+            </Button>
+          </div>
           {analysisMethod === 'r3' && (
             <div className="space-y-3 rounded-lg border border-primary/20 bg-primary/5 p-3">
+              <p className="text-xs text-muted-foreground">
+                Использует Depth Anything 3 и сохраняет исходную реконструкцию для сравнения.
+              </p>
+              <div className="grid grid-cols-3 gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={r3TrajectorySource === 'raw' ? 'default' : 'outline'}
+                  onClick={() => handleR3TrajectorySourceChange('raw')}
+                  disabled={isAnalyzing || isSwitchingR3Trajectory}
+                >
+                  Исходная R³
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={r3TrajectorySource === 'robust_candidate' ? 'default' : 'outline'}
+                  onClick={() => handleR3TrajectorySourceChange('robust_candidate')}
+                  disabled={isAnalyzing || isSwitchingR3Trajectory}
+                >
+                  {isSwitchingR3Trajectory ? (
+                    <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  Robust graph
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={r3TrajectorySource === 'scale_aware_candidate' ? 'default' : 'outline'}
+                  onClick={() => handleR3TrajectorySourceChange('scale_aware_candidate')}
+                  disabled={isAnalyzing || isSwitchingR3Trajectory}
+                >
+                  Scale-aware
+                </Button>
+              </div>
               <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
                 <span>
-                  Единый production-конвейер: R³ → robust graph → scale-aware → ограничения
-                  фиксированного плана Kerama Marazzi.
+                  Scale-aware выравнивает локальный масштаб по устойчивой высоте камеры над
+                  плоскостью пола и откатывается к robust/raw при провале quality gate.
                 </span>
-                <Badge variant="default">Production pipeline</Badge>
-                {typeof activeFloorplanConstraint.accepted === 'boolean' && (
-                  <Badge variant={activeFloorplanConstraint.accepted ? 'default' : 'outline'}>
-                    {activeFloorplanConstraint.accepted
-                      ? `План применён · ${Math.round(finiteNum(activeFloorplanConstraint.confidence) * 100)}%`
-                      : `План отклонён: ${String(activeFloorplanConstraint.reason || 'quality gate')}`}
+                {activeR3TrajectorySource && (
+                  <Badge variant={activeR3TrajectorySource !== 'raw' ? 'default' : 'secondary'}>
+                    Сейчас: {activeR3TrajectorySource === 'scale_aware_candidate'
+                      ? 'scale-aware'
+                      : activeR3TrajectorySource === 'robust_candidate'
+                        ? 'robust'
+                        : 'исходная'}
                   </Badge>
+                )}
+                {activeR3FallbackReason && (
+                  <Badge variant="outline">Fallback: {activeR3FallbackReason}</Badge>
                 )}
               </div>
             </div>
@@ -1344,12 +1463,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         <div className="space-y-3">
           <Button
             onClick={analyzeAllVideos}
-            disabled={
-              videos.length === 0
-              || isAnalyzing
-              || !(externalReferencePoint || referencePoint)
-              || !externalDirectionPoint
-            }
+            disabled={videos.length === 0 || isAnalyzing}
             className="w-full"
           >
             {isAnalyzing ? (
@@ -1360,7 +1474,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             ) : (
               <>
                 <Activity className="h-4 w-4 mr-2" />
-                Запустить production-анализ
+                Запустить {analysisMethod === 'r3' ? 'R³' : analysisMethod === 'lingbot' ? 'LingBot-Map' : 'SLAM'}-анализ
                 {videos.length > 0 ? ` (${videos.length} видео)` : ''}
               </>
             )}

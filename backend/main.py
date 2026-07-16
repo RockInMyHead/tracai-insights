@@ -25,17 +25,6 @@ try:
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.r3_trajectory import build_r3_trajectory
 
-try:
-    from floorplan_constraints import (
-        DEFAULT_FLOORPLAN_ID,
-        apply_floorplan_constraints,
-    )
-except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
-    from backend.floorplan_constraints import (
-        DEFAULT_FLOORPLAN_ID,
-        apply_floorplan_constraints,
-    )
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -299,8 +288,6 @@ def _map_context_summary(map_ctx: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
     if "client_source" in map_ctx:
         summary["client_source"] = map_ctx.get("client_source")
-    if map_ctx.get("floorplan_id"):
-        summary["floorplan_id"] = map_ctx.get("floorplan_id")
     if map_ctx.get("floor_plan_data"):
         summary["has_floor_plan_data"] = True
     if map_ctx.get("drawn_plan"):
@@ -368,60 +355,14 @@ def _parse_json_field(value: Any, default: Any = None) -> Any:
 
 def _extract_map_context(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     map_context = {
-        "floorplan_id": payload.get("floorplan_id") or DEFAULT_FLOORPLAN_ID,
         "floor_plan_data": payload.get("floor_plan_data"),
         "drawn_plan": _parse_json_field(payload.get("drawn_plan")),
         "reference_point": _parse_json_field(payload.get("reference_point")),
         "direction_point": _parse_json_field(payload.get("direction_point")),
     }
+    if not map_context["floor_plan_data"] and not map_context["drawn_plan"]:
+        return None
     return map_context
-
-
-def _load_task_map_context(video_id: str) -> Dict[str, Any]:
-    """Load the durable start/direction used for map-constrained R3 queries."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
-        row = cursor.fetchone()
-        conn.close()
-        parsed = json.loads(row[0]) if row and row[0] else {}
-        if isinstance(parsed, dict):
-            parsed.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
-            return parsed
-    except Exception as exc:
-        logger.warning(f"[{video_id}] Failed to load map context: {exc}")
-    return {"floorplan_id": DEFAULT_FLOORPLAN_ID}
-
-
-def _merge_task_map_context(video_id: str, map_context: Optional[Dict[str, Any]]) -> None:
-    """Persist the exact map anchor before an asynchronous analysis starts."""
-    if not map_context:
-        return
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
-        row = cursor.fetchone()
-        try:
-            existing = json.loads(row[0]) if row and row[0] else {}
-            if not isinstance(existing, dict):
-                existing = {}
-        except Exception:
-            existing = {}
-        # None is meaningful for anchor fields: clearing a direction in the
-        # UI must not resurrect the previous database value when the
-        # lightweight R3 trajectory endpoint is queried later.
-        existing.update(map_context)
-        existing.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
-        cursor.execute(
-            "UPDATE tracking_tasks SET map_context = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (json.dumps(existing), video_id),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        logger.warning(f"[{video_id}] Failed to persist map context: {exc}")
 
 
 def _load_manual_trajectories() -> Dict[str, Any]:
@@ -1117,55 +1058,6 @@ def _r3_poses_to_trajectory(r3_result: dict, scale_factor: float = 1.0) -> dict:
             "width": 0, "height": 0, "fps": 0, "frame_count": num_frames, "duration": 0,
         },
     }
-
-
-def _merge_r3_production_trajectory(base: dict, selected: dict) -> dict:
-    """Promote the worker's accepted production pose source into saved output.
-
-    Raw camera poses remain available for 3D diagnostics; only the floor-plan
-    trajectory and its turn/source metadata are selected here.
-    """
-    if not isinstance(selected, dict) or not selected.get("success"):
-        return base
-    plan = selected.get("plan_trajectory") or selected.get("trajectory") or []
-    if not isinstance(plan, list) or len(plan) < 2:
-        return base
-    source = str(selected.get("trajectory_source") or "raw")
-    method = {
-        "scale_aware_candidate": "r3_reconstruction_scale_aware",
-        "robust_candidate": "r3_reconstruction_robust_candidate",
-    }.get(source, "r3_reconstruction")
-    updated = dict(base)
-    updated.update({
-        "method": method,
-        "trajectory": plan,
-        "plan_trajectory": plan,
-        "turn_points": selected.get("turn_points") or [],
-        "trajectory_points": len(plan),
-        "r3_source_frame_indices": selected.get("source_frame_indices") or [],
-        "r3_source_timestamps_seconds": selected.get("source_timestamps_seconds") or [],
-        "r3_pose_graph": selected.get("pose_graph"),
-        "r3_pose_graph_candidate": selected.get("pose_graph_candidate"),
-        "r3_scale_aware_candidate": selected.get("scale_aware_candidate"),
-    })
-    quality = selected.get("trajectory_quality") or {}
-    stats = dict(base.get("processing_stats") or {})
-    stats.update({
-        "turns_detected": len(updated["turn_points"]),
-        "r3_trajectory_quality": quality,
-        "r3_trajectory_source": source,
-        "r3_trajectory_source_requested": selected.get(
-            "trajectory_source_requested", "scale_aware_candidate"
-        ),
-        "r3_trajectory_source_fallback_reason": selected.get(
-            "trajectory_source_fallback_reason"
-        ),
-        "r3_trajectory_source_selection": selected.get(
-            "trajectory_source_selection"
-        ) or {},
-    })
-    updated["processing_stats"] = stats
-    return updated
 
 
 def _schedule_process_video_background(
@@ -2252,10 +2144,6 @@ async def process_video_background(
             raise Exception(gpu_result.get("error", "GPU Worker returned unsuccessful status"))
 
         result = gpu_result["result"]
-        # The GPU worker supplies visual motion.  The VPS owns the immutable
-        # Kerama plan and applies the same production constraints to every
-        # reconstruction backend, even when an older worker is deployed.
-        result = apply_floorplan_constraints(result, map_context)
         processing_time = gpu_result.get("processing_time", 0)
         logger.info(f"[{video_id}] GPU Worker completed in {processing_time}s")
 
@@ -2309,7 +2197,6 @@ async def process_video_r3_background(
     ckpt: str = "r3_long.safetensors",
     size: int = 392,
     mode: str = "strided",
-    map_context: Optional[Dict[str, Any]] = None,
 ):
     """Background task — отправляет видео на GPU Worker для R³ реконструкции.
 
@@ -2380,30 +2267,6 @@ async def process_video_r3_background(
         # Конвертируем R³ camera poses в формат траектории
         r3_result = gpu_result["result"]
         trajectory_data = _r3_poses_to_trajectory(r3_result, scale_factor=scale_factor)
-        try:
-            async with aiohttp.ClientSession() as source_session:
-                async with source_session.get(
-                    f"{GPU_WORKER_URL}/api/r3-trajectory/{video_id}",
-                    params={"trajectory_source": "scale_aware_candidate"},
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as source_response:
-                    if source_response.status == 200:
-                        selected_trajectory = await source_response.json()
-                        trajectory_data = _merge_r3_production_trajectory(
-                            trajectory_data,
-                            selected_trajectory,
-                        )
-                    else:
-                        logger.warning(
-                            f"[{video_id}] Production trajectory selection returned "
-                            f"HTTP {source_response.status}; keeping raw R3"
-                        )
-        except Exception as source_error:
-            logger.warning(
-                f"[{video_id}] Production trajectory selection failed; keeping raw R3: "
-                f"{source_error}"
-            )
-        trajectory_data = apply_floorplan_constraints(trajectory_data, map_context)
 
         # Сохраняем результат
         video_filename = video_path.name if video_path and video_path.exists() else f"{video_id}_{original_filename}"
@@ -2453,19 +2316,18 @@ def _schedule_r3_process_background(
     ckpt: str = "r3_long.safetensors",
     size: int = 392,
     mode: str = "strided",
-    map_context: Optional[Dict[str, Any]] = None,
 ) -> None:
     if background_tasks is not None:
         background_tasks.add_task(
             process_video_r3_background,
             video_id, video_path, original_filename,
-            scale_factor, frame_stride, max_frames, ckpt, size, mode, map_context,
+            scale_factor, frame_stride, max_frames, ckpt, size, mode,
         )
     else:
         asyncio.create_task(
             process_video_r3_background(
                 video_id, video_path, original_filename,
-                scale_factor, frame_stride, max_frames, ckpt, size, mode, map_context,
+                scale_factor, frame_stride, max_frames, ckpt, size, mode,
             )
         )
 
@@ -2689,9 +2551,7 @@ async def update_task_context(task_id: str, request: Request) -> Dict[str, Any]:
     """Обновить контекст задачи (чертеж, план, имя сотрудника) — вызывается фронтом при каждом изменении."""
     try:
         body = await request.json()
-        map_context = {
-            "floorplan_id": body.get("floorplan_id") or DEFAULT_FLOORPLAN_ID,
-        }
+        map_context = {}
         if body.get("floor_plan_data"):
             map_context["floor_plan_data"] = body["floor_plan_data"]
         if body.get("drawn_plan"):
@@ -2900,7 +2760,6 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
         turn_vote_threshold = int(body.get("turn_vote_threshold", 3))
         use_ml_roi = bool(body.get("use_ml_roi", True))
         map_context = _extract_map_context(body)
-        _merge_task_map_context(video_id, map_context)
         force_reprocess = bool(body.get("force_reprocess", False))
 
         # При явном новом анализе ручная траектория больше не должна подменять результат.
@@ -2994,7 +2853,7 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 background_tasks,
                 video_id, video_path, original_filename,
                 scale_factor,
-                frame_stride, max_frames, ckpt, size, mode, map_context,
+                frame_stride, max_frames, ckpt, size, mode,
             )
         else:
             _schedule_process_video_background(
@@ -3972,12 +3831,7 @@ async def r3_trajectory_proxy(
                 if resp.status != 200:
                     return JSONResponse({"detail": text[:500]}, status_code=resp.status)
                 try:
-                    worker_result = json.loads(text)
-                    constrained = apply_floorplan_constraints(
-                        worker_result,
-                        _load_task_map_context(video_id),
-                    )
-                    return JSONResponse(_to_json_serializable(constrained))
+                    return JSONResponse(json.loads(text))
                 except json.JSONDecodeError:
                     return JSONResponse(
                         {"detail": "GPU Worker returned invalid trajectory JSON"},

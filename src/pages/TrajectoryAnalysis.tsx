@@ -26,21 +26,14 @@ interface DrawnPlanShape {
   points: { x: number; y: number }[];
 }
 
-const FIXED_FLOORPLAN_ID = 'kerama_marazzi_2025';
-const FIXED_FLOORPLAN_URL = '/floorplans/kerama-marazzi-2025.png';
-const FIXED_FLOORPLAN_FILE = {
-  name: 'Керама Марацци 2025',
-  type: 'image/png',
-};
-
 const TrajectoryAnalysisPage = () => {
   const [trajectory, setTrajectory] = useState<unknown[]>([]);
   const [turnPoints, setTurnPoints] = useState<Record<string, unknown>[]>([]);
   const [stats, setStats] = useState<Record<string, unknown> | null>(null);
   const [selectedVideo, setSelectedVideo] = useState<VideoListItem | null>(null);
   const [videoUrl, setVideoUrl] = useState("");
-  const [floorPlan, setFloorPlan] = useState<string | null>(FIXED_FLOORPLAN_URL);
-  const [floorPlanFile, setFloorPlanFile] = useState<{ name: string; type: string } | null>(FIXED_FLOORPLAN_FILE);
+  const [floorPlan, setFloorPlan] = useState<string | null>(null);
+  const [floorPlanFile, setFloorPlanFile] = useState<{ name: string; type: string } | null>(null);
   const [drawnPlan, setDrawnPlan] = useState<DrawnPlanShape[] | null>(null);
   const [activePlanId, setActivePlanId] = useState<number | null>(null);
   const [isEditorOpen, setIsEditorOpen] = useState(false);
@@ -53,12 +46,43 @@ const TrajectoryAnalysisPage = () => {
   const planImgRef = useRef<HTMLImageElement>(null);
   const [planImgLayout, setPlanImgLayout] = useState<{ dispX: number; dispY: number; dispW: number; dispH: number; cw: number; ch: number } | null>(null);
 
-  // План является частью production-конвейера. Пользователь задаёт только
-  // старт и направление; старые загруженные планы намеренно игнорируются.
+  // Загрузка плана и точки отсчета из localStorage при инициализации
   useEffect(() => {
-    localStorage.removeItem('floorPlan');
-    setFloorPlan(FIXED_FLOORPLAN_URL);
-    setFloorPlanFile(FIXED_FLOORPLAN_FILE);
+    const savedFloorPlan = localStorage.getItem('floorPlan');
+    if (savedFloorPlan) {
+      try {
+        const planData = JSON.parse(savedFloorPlan);
+        if (planData.data && planData.type) {
+          if (planData.type === "application/pdf") {
+            toast.info("PDF план загружен. Для повторного отображения загрузите файл заново.");
+            localStorage.removeItem('floorPlan');
+          } else if ((planData.data?.length || 0) > 1_500_000) {
+            // Слишком большой план (старый DWG SVG) — вызывает Out of memory и Not allowed to load
+            localStorage.removeItem('floorPlan');
+          } else if (planData.type === "image/svg+xml" && (planData.data?.length || 0) > 500_000) {
+            // Старый формат DWG→SVG — удаляем, теперь используем PNG
+            localStorage.removeItem('floorPlan');
+          } else {
+            setFloorPlan(planData.data);
+            setFloorPlanFile({ name: planData.name, type: planData.type });
+          }
+        } else {
+          const str = typeof planData === 'string' ? planData : planData?.data;
+          if (str && str.length > 1_500_000) {
+            localStorage.removeItem('floorPlan');
+          } else {
+            setFloorPlan(typeof planData === 'string' ? planData : planData?.data || savedFloorPlan);
+            setFloorPlanFile(planData?.name ? { name: planData.name, type: planData.type || 'image/png' } : null);
+          }
+        }
+      } catch (e) {
+        if (savedFloorPlan.length > 1_500_000) {
+          localStorage.removeItem('floorPlan');
+        } else {
+          setFloorPlan(savedFloorPlan);
+        }
+      }
+    }
 
     // Загрузка точки отсчета
     const savedReferencePoint = localStorage.getItem('referencePoint');
@@ -516,12 +540,12 @@ const TrajectoryAnalysisPage = () => {
             Анализ траектории движения
           </h1>
           <p className="text-muted-foreground text-lg">
-            Выберите старт и направление на фиксированном плане Kerama Marazzi, затем загрузите видео
+            Загрузите план помещения и видео для визуализации траектории движения на реальной карте
           </p>
         </div>
 
         {/* Floor Plan Upload */}
-        <Card className="mb-8" data-floorplan-id={FIXED_FLOORPLAN_ID}>
+        <Card className="mb-8">
           <CardHeader>
             <CardTitle className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -529,9 +553,30 @@ const TrajectoryAnalysisPage = () => {
                 План помещения
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <span className="rounded-md border border-primary/20 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
-                  Фиксированный план · масштаб по офису 10 м²
-                </span>
+                <Button
+                  variant={planMode === 'upload' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => setPlanMode('upload')}
+                  className="gap-2"
+                >
+                  <Upload className="h-4 w-4" /> Загрузить
+                </Button>
+                <Button
+                  variant={planMode === 'draw' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => setIsEditorOpen(true)}
+                  className="gap-2"
+                >
+                  <PenTool className="h-4 w-4" /> Нарисовать
+                </Button>
+                <Button
+                  variant={planMode === 'library' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => setPlanMode('library')}
+                  className="gap-2"
+                >
+                  <LibraryIcon className="h-4 w-4" /> Библиотека
+                </Button>
                 <Button
                   variant={setDirectionMode ? "default" : "outline"}
                   size="sm"
@@ -547,6 +592,48 @@ const TrajectoryAnalysisPage = () => {
             </CardTitle>
           </CardHeader>
           <CardContent>
+            {planMode === 'library' && (
+              <PlanLibrary onSelect={handlePlanSelect} selectedId={activePlanId || undefined} />
+            )}
+
+            {planMode === 'upload' && !floorPlan && (
+              <div className="border-2 border-dashed border-border rounded-xl p-8 text-center bg-muted/10">
+                <input
+                  ref={floorPlanInputRef}
+                  type="file"
+                  accept="image/*,.pdf,.dwg,application/dwg,application/acad,application/vnd.autodesk.autocad.drawing"
+                  className="hidden"
+                  onChange={handleFloorPlanUpload}
+                />
+
+                <div className="flex flex-col items-center gap-3">
+                  <div className="h-12 w-12 rounded-full bg-primary/10 flex items-center justify-center">
+                    <Map className="h-6 w-6 text-primary" />
+                  </div>
+                  <div>
+                    <p className="font-medium mb-1">Загрузите план помещения или выберите из библиотеки</p>
+                    <p className="text-sm text-muted-foreground">
+                      Изображение, PDF или DWG (AutoCAD)
+                    </p>
+                    <div className="text-xs bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2 mt-2 text-left max-w-md mx-auto">
+                      <strong>DWG &gt; 50 MB</strong> — экспортируйте в PNG в AutoCAD: <br />
+                      File → Export → PNG (или Plot → PNG)
+                      <br />
+                      <strong>Чертёж отображается некорректно?</strong> — экспортируйте план в PNG в AutoCAD для лучшего результата
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    className="gap-2"
+                    onClick={() => floorPlanInputRef.current?.click()}
+                  >
+                    <Upload className="h-4 w-4" />
+                    Выбрать файл
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {(floorPlan || drawnPlan) && planMode !== 'library' && (
               <div className="space-y-4">
                 {/* Zoom Controls */}
@@ -774,13 +861,24 @@ const TrajectoryAnalysisPage = () => {
                           </Button>
                         </>
                       )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="gap-1 text-destructive hover:text-destructive"
+                        onClick={handleFloorPlanRemove}
+                      >
+                        <X className="h-4 w-4" />
+                        Удалить план
+                      </Button>
                     </div>
                   </div>
 
                 <div className="text-xs text-muted-foreground text-center space-y-1">
-                  <p className="text-blue-600 font-medium">1. Кликните на план, чтобы установить точку старта</p>
-                  <p className="text-emerald-600 font-medium">2. Нажмите «Указать направление» и задайте первый вектор движения</p>
-                  <p>Красная разметка автоматически используется как непроходимые зоны.</p>
+                  <p>Изображения используются как фон для траектории</p>
+                  <p>PDF и DWG конвертируются в PNG на сервере</p>
+                  <p className="text-blue-600 font-medium">Кликните на план, чтобы установить точку отсчета траектории</p>
+                  <p className="text-green-600 font-medium">Траектория будет рисоваться от выбранной точки</p>
+                  <p className="text-emerald-600 font-medium">Нажмите «Указать направление» и кликните на план — траектория выровняется по направлению движения</p>
                 </div>
               </div>
             )}

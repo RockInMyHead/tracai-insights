@@ -878,38 +878,20 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                 variant="ghost"
                 size="sm"
                 className="h-7 w-7 p-0 text-[10px]"
-                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 75); }}
-                title="-75°"
+                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 15); }}
+                title="-15°"
               >
-                −75°
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 w-7 p-0 text-[10px]"
-                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 5); }}
-                title="-5°"
-              >
-                −5°
+                −15°
               </Button>
               <span className="text-[10px] font-mono min-w-[2.5ch] text-center">{directionAngleOffset}°</span>
               <Button
                 variant="ghost"
                 size="sm"
                 className="h-7 w-7 p-0 text-[10px]"
-                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 5); }}
-                title="+5°"
+                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 15); }}
+                title="+15°"
               >
-                +5°
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 w-7 p-0 text-[10px]"
-                onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 75); }}
-                title="+75°"
-              >
-                +75°
+                +15°
               </Button>
             </div>
           )}
@@ -993,34 +975,18 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                   variant="ghost"
                   size="sm"
                   className="h-7 w-7 p-0 text-[10px]"
-                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 75); }}
+                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 15); }}
                 >
-                  −75°
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 w-7 p-0 text-[10px]"
-                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v - 5); }}
-                >
-                  −5°
+                  −15°
                 </Button>
                 <span className="text-[10px] font-mono min-w-[3ch] text-center">{directionAngleOffset}°</span>
                 <Button
                   variant="ghost"
                   size="sm"
                   className="h-7 w-7 p-0 text-[10px]"
-                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 5); }}
+                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 15); }}
                 >
-                  +5°
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 w-7 p-0 text-[10px]"
-                  onClick={(e) => { e.stopPropagation(); setDirectionAngleOffset(v => v + 75); }}
-                >
-                  +75°
+                  +15°
                 </Button>
               </div>
             </>
