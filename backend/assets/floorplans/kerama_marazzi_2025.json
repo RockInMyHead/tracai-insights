@@ -19,6 +19,14 @@
   "walking_speed_mps": 1.2,
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
   "obstacle_mask_sha256": "ed6b256c874e094dd624ea9f4e032a5fd7fcb970304e5151d41d375b99bed27e",
+  "support_mask_file": "kerama_marazzi_2025_support.png",
+  "support_mask_sha256": "2b96be48fda519cea13f6ba8a24bf43359e2da55bf071ffba4c47e409e43bd8f",
+  "support_mask_generation": {
+    "method": "cad_ink_distance_envelope",
+    "radius_pixels": 60,
+    "grid_pixels": 4,
+    "coverage_ratio": 0.512133526850508
+  },
   "source_pdf_sha256": "8c5d7f40962d7a87984cbd0f460bc6f04aaf8882a61fb40bf7e90b9fbd858d17",
   "display_image_sha256": "36d15942bd55a95f2fa5f4955b7bf42d616262f453f37e780949f7ed80434f83",
   "source_pdf": "kerama-marazzi-2025.pdf",

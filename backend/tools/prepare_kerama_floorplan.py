@@ -72,6 +72,27 @@ def main() -> None:
         obstacle_path = BACKEND / "kerama_marazzi_2025_obstacles.png"
         Image.fromarray((mask * 255).astype(np.uint8)).save(obstacle_path, optimize=True)
 
+        # Positive CAD support prevents the solver from using the blank PDF
+        # canvas as an imaginary corridor.  Keep a generous envelope around
+        # all original drawing ink so real aisles remain connected.
+        support_radius_pixels = 60
+        support_grid_pixels = 4
+        original_gray = Image.fromarray(original).convert("L")
+        support_size = (
+            int(math.ceil(original_gray.width / support_grid_pixels)),
+            int(math.ceil(original_gray.height / support_grid_pixels)),
+        )
+        ink_grid = np.asarray(
+            original_gray.resize(support_size, Image.Resampling.BOX)
+        ) < 242
+        support_grid = ndimage.distance_transform_edt(~ink_grid) <= (
+            support_radius_pixels / support_grid_pixels
+        )
+        support_path = BACKEND / "kerama_marazzi_2025_support.png"
+        Image.fromarray((support_grid * 255).astype(np.uint8)).resize(
+            original_gray.size, Image.Resampling.NEAREST
+        ).save(support_path, optimize=True)
+
     source_pdf = PUBLIC / "kerama-marazzi-2025.pdf"
     source_pdf.write_bytes(marked_pdf.read_bytes())
     x1, y1, x2, y2 = OFFICE_INTERIOR
@@ -92,6 +113,14 @@ def main() -> None:
         "walking_speed_mps": 1.20,
         "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
         "obstacle_mask_sha256": hashlib.sha256(obstacle_path.read_bytes()).hexdigest(),
+        "support_mask_file": support_path.name,
+        "support_mask_sha256": hashlib.sha256(support_path.read_bytes()).hexdigest(),
+        "support_mask_generation": {
+            "method": "cad_ink_distance_envelope",
+            "radius_pixels": support_radius_pixels,
+            "grid_pixels": support_grid_pixels,
+            "coverage_ratio": float(support_grid.mean()),
+        },
         "source_pdf_sha256": hashlib.sha256(source_pdf.read_bytes()).hexdigest(),
         "display_image_sha256": hashlib.sha256(display_path.read_bytes()).hexdigest(),
         "source_pdf": source_pdf.name,

@@ -56,6 +56,24 @@ class LingBotFusionTests(unittest.TestCase):
             result["diagnostics"]["reason"],
             {"trajectory_disagreement_too_large", "turn_chirality_conflict"},
         )
+        self.assertTrue(result["independent_accepted"])
+        self.assertEqual(len(result["independent_plan_trajectory"]), len(lingbot))
+
+    def test_raw_lingbot_xyz_is_projected_to_its_motion_plane(self) -> None:
+        r3 = self._r3_path()
+        # Motion lies in world X/Z; raw X/Y projection would collapse it.
+        xyz = np.column_stack((r3[:, 0], np.full(len(r3), 3.0), r3[:, 1]))
+        result = build_lingbot_fusion_candidate(
+            {"plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist()},
+            {"trajectory": xyz.tolist()},
+        )
+        independent = np.asarray(result["independent_plan_trajectory"])
+        self.assertGreater(float(np.ptp(independent[:, 0])), 4.0)
+        self.assertGreater(float(np.ptp(independent[:, 1])), 4.0)
+        self.assertEqual(
+            result["diagnostics"]["lingbot_projection"]["method"],
+            "pca_motion_plane",
+        )
 
     def test_saved_upstream_extrinsic_is_kept_as_c2w(self) -> None:
         adapter = LingBotMapAdapter(repo_path=Path("."), model_path=Path("model.pt"))

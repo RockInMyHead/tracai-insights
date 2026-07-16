@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -10,6 +11,25 @@ from backend.floorplan_constraints import (
 
 
 class FloorplanConstraintEngineTests(unittest.TestCase):
+    def test_long_route_initial_heading_uses_only_early_anchor(self) -> None:
+        points = np.zeros((600, 2), dtype=float)
+        points[:49, 0] = np.arange(49)
+        points[49:, 0] = 48.0
+        points[49:, 1] = np.arange(1, 552)
+        self.assertAlmostEqual(
+            FloorplanConstraintEngine._initial_heading(points), 0.0, places=6
+        )
+
+    def test_segment_collision_sampling_matches_final_validation(self) -> None:
+        mask = np.zeros((30, 30), dtype=bool)
+        mask[10, 10] = True
+        engine = FloorplanConstraintEngine.from_mask(mask, grid_cell_pixels=1)
+        segment = np.asarray([[2.0, 2.0], [18.0, 18.0]])
+        self.assertEqual(
+            engine._segment_collides(segment[0], segment[1]),
+            engine._path_metrics(segment)["collision_ratio"] > 0.0,
+        )
+
     def test_r3_left_turn_keeps_physical_chirality_in_svg_coordinates(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
             np.zeros((140, 180), dtype=bool), meters_per_pixel=0.1
@@ -219,6 +239,48 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             updated["floorplan_constraint"]["observation_source_selection"]["reason"],
             "fusion_supported_by_floorplan",
         )
+
+    def test_fragmented_r3_selects_independent_lingbot_even_after_fusion_veto(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((120, 180), dtype=bool), meters_per_pixel=0.1
+        )
+        independent = [[float(x), 0.0, 0.0] for x in range(0, 61, 10)]
+        source = {
+            "method": "r3_reconstruction_scale_aware",
+            "plan_trajectory": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            "source_timestamps_seconds": [0.0, 60.0],
+            "turn_points": [{"trajectory_index": 1, "angle_degrees": 90.0}],
+            "processing_stats": {
+                "pose_graph": {
+                    "component_count": 25,
+                    "largest_component_coverage": 0.014,
+                }
+            },
+            "lingbot_fusion_candidate": {
+                "accepted": False,
+                "independent_accepted": True,
+                "independent_plan_trajectory": independent,
+                "diagnostics": {"reason": "turn_chirality_conflict"},
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine", return_value=engine
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
+        self.assertEqual(
+            updated["processing_stats"]["map_observation_source"],
+            "lingbot_independent",
+        )
+        self.assertEqual(
+            updated["floorplan_constraint"]["observation_source_selection"]["reason"],
+            "fragmented_r3_uses_independent_lingbot",
+        )
+        self.assertEqual(updated["map_turn_points"], [])
 
 
 if __name__ == "__main__":

@@ -33,6 +33,57 @@ def _finite_points(value: Any) -> np.ndarray:
     return np.asarray(points, dtype=np.float64)
 
 
+def _finite_points_3d(value: Any) -> np.ndarray:
+    """Read LingBot camera centres without accidentally treating X/Y as floor axes."""
+    if not isinstance(value, list):
+        return np.empty((0, 3), dtype=np.float64)
+    points: list[list[float]] = []
+    for item in value:
+        if isinstance(item, dict):
+            item = item.get("position") or item.get("point")
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        try:
+            point = [float(item[0]), float(item[1]), float(item[2])]
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(component) for component in point):
+            points.append(point)
+    return np.asarray(points, dtype=np.float64)
+
+
+def _lingbot_plan_projection(lingbot_result: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+    """Project a 3-D camera path onto its dominant motion plane.
+
+    LingBot exports XYZ camera centres.  Its first two coordinates are not a
+    guaranteed floor plane, so using them directly can collapse one direction
+    of a production route.  PCA is sign-ambiguous; the fusion stage evaluates
+    both signs of the second axis without ever reflecting the final similarity.
+    """
+    explicit = _finite_points(lingbot_result.get("plan_trajectory"))
+    if len(explicit) >= 2:
+        return explicit, {"method": "explicit_plan_trajectory"}
+    points = _finite_points_3d(lingbot_result.get("trajectory"))
+    if len(points) < 2:
+        return np.empty((0, 2), dtype=np.float64), {"method": "unavailable"}
+    centered = points - np.median(points, axis=0)
+    try:
+        _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return np.empty((0, 2), dtype=np.float64), {"method": "pca_failed"}
+    projected = centered @ vt[:2].T
+    total = max(float(np.sum(singular_values ** 2)), 1e-12)
+    return projected, {
+        "method": "pca_motion_plane",
+        "singular_values": [round(float(value), 8) for value in singular_values],
+        "explained_motion_plane_ratio": round(
+            float(np.sum(singular_values[:2] ** 2)) / total, 8
+        ),
+        "basis": [[round(float(value), 8) for value in row] for row in vt[:2]],
+        "normal": [round(float(value), 8) for value in vt[2]] if len(vt) > 2 else None,
+    }
+
+
 def _resample_by_time(points: np.ndarray, count: int) -> np.ndarray:
     if len(points) == 0 or count <= 0:
         return np.empty((0, 2), dtype=np.float64)
@@ -155,24 +206,43 @@ def build_lingbot_fusion_candidate(
 ) -> dict[str, Any]:
     """Return a guarded fusion candidate in the R3 plan coordinate system."""
     r3 = _finite_points(r3_result.get("plan_trajectory") or r3_result.get("trajectory"))
-    lingbot = _finite_points(
-        lingbot_result.get("plan_trajectory") or lingbot_result.get("trajectory")
-    )
+    lingbot, projection = _lingbot_plan_projection(lingbot_result)
     diagnostics: dict[str, Any] = {
-        "method": "robust_similarity_confidence_blend_v1",
+        "method": "robust_similarity_confidence_blend_v2",
         "accepted": False,
         "r3_points": int(len(r3)),
         "lingbot_points": int(len(lingbot)),
+        "lingbot_projection": projection,
     }
+    independent = [
+        [round(float(point[0]), 8), round(float(point[1]), 8), 0.0]
+        for point in lingbot
+    ]
+
+    def rejected(reason: str) -> dict[str, Any]:
+        diagnostics["reason"] = reason
+        diagnostics["independent_accepted"] = len(independent) >= 6
+        return {
+            "accepted": False,
+            "plan_trajectory": [],
+            "independent_accepted": len(independent) >= 6,
+            "independent_plan_trajectory": independent if len(independent) >= 6 else [],
+            "diagnostics": diagnostics,
+        }
     if len(r3) < 6 or len(lingbot) < 6:
-        diagnostics["reason"] = "trajectory_too_short"
-        return {"accepted": False, "plan_trajectory": [], "diagnostics": diagnostics}
+        return rejected("trajectory_too_short")
 
     lingbot_resampled = _resample_by_time(lingbot, len(r3))
-    fit = _robust_similarity(lingbot_resampled, r3)
+    variants = (lingbot_resampled, lingbot_resampled * np.asarray([1.0, -1.0]))
+    fitted = [(variant, _robust_similarity(variant, r3)) for variant in variants]
+    fitted = [(variant, fit) for variant, fit in fitted if fit is not None]
+    if not fitted:
+        return rejected("similarity_fit_failed")
+    lingbot_resampled, fit = min(
+        fitted, key=lambda item: float(np.median(item[1][3]))  # type: ignore[index]
+    )
     if fit is None:
-        diagnostics["reason"] = "similarity_fit_failed"
-        return {"accepted": False, "plan_trajectory": [], "diagnostics": diagnostics}
+        return rejected("similarity_fit_failed")
     scale, rotation, translation, _ = fit
     aligned = scale * (lingbot_resampled @ rotation) + translation
     residuals = np.linalg.norm(aligned - r3, axis=1)
@@ -207,11 +277,9 @@ def build_lingbot_fusion_candidate(
         "chirality_conflict": chirality_conflict,
     })
     if chirality_conflict:
-        diagnostics["reason"] = "turn_chirality_conflict"
-        return {"accepted": False, "plan_trajectory": [], "diagnostics": diagnostics}
+        return rejected("turn_chirality_conflict")
     if median_ratio > 0.06 or p95_ratio > 0.12:
-        diagnostics["reason"] = "trajectory_disagreement_too_large"
-        return {"accepted": False, "plan_trajectory": [], "diagnostics": diagnostics}
+        return rejected("trajectory_disagreement_too_large")
 
     global_strength = float(np.clip(0.42 * (1.0 - p95_ratio / 0.12), 0.12, 0.42))
     r3_confidence = _confidence_weights(r3_result.get("r3_pose_confidence"), len(r3))
@@ -237,6 +305,8 @@ def build_lingbot_fusion_candidate(
     return {
         "accepted": True,
         "plan_trajectory": trajectory,
+        "independent_accepted": True,
+        "independent_plan_trajectory": independent,
         "aligned_lingbot_trajectory": aligned_trajectory,
         "diagnostics": diagnostics,
     }

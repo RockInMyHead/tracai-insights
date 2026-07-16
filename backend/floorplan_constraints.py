@@ -84,6 +84,51 @@ def _trajectory_fractions(points: np.ndarray) -> np.ndarray:
     return cumulative / max(float(cumulative[-1]), 1e-12)
 
 
+def _resample_timestamps(values: Any, count: int) -> Any:
+    if not isinstance(values, list) or len(values) < 2 or count < 2:
+        return values
+    source = np.asarray([_finite_float(value, math.nan) for value in values], dtype=np.float64)
+    finite = np.flatnonzero(np.isfinite(source))
+    if len(finite) < 2:
+        return values
+    source = np.interp(np.arange(len(source)), finite, source[finite])
+    return np.interp(
+        np.linspace(0.0, 1.0, count), np.linspace(0.0, 1.0, len(source)), source
+    ).tolist()
+
+
+def _r3_is_severely_fragmented(result: dict[str, Any]) -> bool:
+    """Recognise graph failures without depending on one worker schema."""
+    containers = [
+        result,
+        result.get("processing_stats") or {},
+        result.get("trajectory_quality") or {},
+    ]
+    nested: list[dict[str, Any]] = []
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        nested.append(container)
+        for key in ("pose_graph", "graph", "r3_pose_graph", "pose_graph_summary"):
+            value = container.get(key)
+            if isinstance(value, dict):
+                nested.append(value)
+    components = 1
+    coverage = 1.0
+    connected = None
+    total = None
+    for item in nested:
+        components = max(components, int(_finite_float(item.get("component_count"), 1)))
+        for key in ("largest_component_coverage", "largest_component_ratio"):
+            if key in item:
+                coverage = min(coverage, _finite_float(item.get(key), 1.0))
+        connected = item.get("connected_pose_count", item.get("connected_poses", connected))
+        total = item.get("point_count", item.get("pose_count", total))
+    if connected is not None and total is not None and _finite_float(total) > 0:
+        coverage = min(coverage, _finite_float(connected) / _finite_float(total))
+    return components >= 4 or coverage < 0.45
+
+
 @dataclass(frozen=True)
 class FloorplanConfig:
     map_id: str
@@ -95,6 +140,8 @@ class FloorplanConfig:
     walking_speed_mps: float = 1.20
     obstacle_mask_file: str = "kerama_marazzi_2025_obstacles.png"
     obstacle_mask_sha256: str = ""
+    support_mask_file: str = ""
+    support_mask_sha256: str = ""
     source_pdf: str = "kerama-marazzi-2025.pdf"
     display_image: str = "kerama-marazzi-2025.png"
 
@@ -102,7 +149,12 @@ class FloorplanConfig:
 class FloorplanConstraintEngine:
     """Immutable map model plus deterministic trajectory alignment."""
 
-    def __init__(self, config: FloorplanConfig, obstacle_mask: np.ndarray):
+    def __init__(
+        self,
+        config: FloorplanConfig,
+        obstacle_mask: np.ndarray,
+        support_mask: Optional[np.ndarray] = None,
+    ):
         mask = np.asarray(obstacle_mask, dtype=bool)
         if mask.shape != (config.height, config.width):
             raise ValueError(
@@ -110,8 +162,12 @@ class FloorplanConstraintEngine:
                 f"{config.height}x{config.width}"
             )
         self.config = config
-        self._full_mask = mask
-        self._build_grid(mask)
+        support = None if support_mask is None else np.asarray(support_mask, dtype=bool)
+        if support is not None and support.shape != mask.shape:
+            raise ValueError("Floorplan support mask shape does not match obstacle mask")
+        self._full_mask = mask | (~support if support is not None else False)
+        self._support_mask = support
+        self._build_grid(self._full_mask, annotation_mask=mask)
 
     @classmethod
     def load(cls, map_id: str = DEFAULT_FLOORPLAN_ID) -> "FloorplanConstraintEngine":
@@ -127,6 +183,8 @@ class FloorplanConstraintEngine:
             walking_speed_mps=float(metadata.get("walking_speed_mps", 1.20)),
             obstacle_mask_file=metadata["obstacle_mask_file"],
             obstacle_mask_sha256=metadata.get("obstacle_mask_sha256", ""),
+            support_mask_file=metadata.get("support_mask_file", ""),
+            support_mask_sha256=metadata.get("support_mask_sha256", ""),
             source_pdf=metadata.get("source_pdf", "kerama-marazzi-2025.pdf"),
             display_image=metadata.get("display_image", "kerama-marazzi-2025.png"),
         )
@@ -138,7 +196,15 @@ class FloorplanConstraintEngine:
                     f"Floorplan obstacle mask hash mismatch for {config.map_id}"
                 )
         mask = np.asarray(Image.open(mask_path).convert("L")) >= 128
-        return cls(config, mask)
+        support = None
+        if config.support_mask_file:
+            support_path = ASSET_ROOT / config.support_mask_file
+            if config.support_mask_sha256:
+                actual_hash = hashlib.sha256(support_path.read_bytes()).hexdigest()
+                if actual_hash != config.support_mask_sha256:
+                    raise ValueError(f"Floorplan support mask hash mismatch for {config.map_id}")
+            support = np.asarray(Image.open(support_path).convert("L")) >= 128
+        return cls(config, mask, support)
 
     @classmethod
     def from_mask(
@@ -166,7 +232,7 @@ class FloorplanConstraintEngine:
             obstacle_mask,
         )
 
-    def _build_grid(self, mask: np.ndarray) -> None:
+    def _build_grid(self, mask: np.ndarray, annotation_mask: Optional[np.ndarray] = None) -> None:
         cell = self.config.grid_cell_pixels
         rows = int(math.ceil(self.config.height / cell))
         cols = int(math.ceil(self.config.width / cell))
@@ -192,7 +258,14 @@ class FloorplanConstraintEngine:
         _, nearest = ndimage.distance_transform_edt(occupied, return_indices=True)
         self._nearest_free_rows = nearest[0]
         self._nearest_free_cols = nearest[1]
-        ys, xs = np.where(base)
+        annotation = mask if annotation_mask is None else annotation_mask
+        annotation_padded = np.pad(
+            annotation,
+            ((0, rows * cell - self.config.height), (0, cols * cell - self.config.width)),
+            constant_values=False,
+        )
+        annotation_base = annotation_padded.reshape(rows, cell, cols, cell).any(axis=(1, 3))
+        ys, xs = np.where(annotation_base)
         self.annotation_bbox = (
             (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
             if len(xs)
@@ -330,7 +403,9 @@ class FloorplanConstraintEngine:
     def _initial_heading(relative: np.ndarray) -> float:
         if len(relative) < 2:
             return 0.0
-        upper = min(len(relative) - 1, max(5, len(relative) // 12))
+        # A percentage of a long video can span multiple real turns.  Only the
+        # genuinely early motion is allowed to define the user supplied arrow.
+        upper = min(len(relative) - 1, 48, max(5, len(relative) // 12))
         for index in range(upper, 0, -1):
             delta = relative[index] - relative[0]
             if float(np.linalg.norm(delta)) > 1e-8:
@@ -378,24 +453,16 @@ class FloorplanConstraintEngine:
         }
 
     def _segment_collides(self, start: np.ndarray, end: np.ndarray) -> bool:
-        delta = end - start
-        count = max(
-            1,
-            int(math.ceil(
-                float(np.max(np.abs(delta)))
-                / max(self.config.grid_cell_pixels * 0.25, 0.5)
-            )),
-        )
-        for step in range(count + 1):
-            if self._point_occupied(start + delta * (step / count)):
-                return True
-        return False
+        return any(self._point_occupied(point) for point in self._sample_path(
+            np.vstack((start, end))
+        ))
 
     def _astar(
         self,
         start_point: np.ndarray,
         end_point: np.ndarray,
         raw_segment: np.ndarray,
+        _search_margin_cells: Optional[int] = None,
     ) -> Optional[np.ndarray]:
         start = self._nearest_free(self._pixel_to_cell(start_point))
         end = self._nearest_free(self._pixel_to_cell(end_point))
@@ -408,8 +475,9 @@ class FloorplanConstraintEngine:
         # Large production machines can require a detour around their entire
         # footprint.  Thirty metres covers the wider Kerama equipment islands
         # where a 12 m local window left start/end in the same global component
-        # but still made A* report no path.
-        margin = max(24, int(round(30.0 / max(self.cell_meters, 1e-9))))
+        # but still made A* report no path.  On failure the search still doubles.
+        initial_margin = max(24, int(round(30.0 / max(self.cell_meters, 1e-9))))
+        margin = initial_margin if _search_margin_cells is None else _search_margin_cells
         min_x = max(0, min(start[0], end[0], int(raw_cells[:, 0].min())) - margin)
         max_x = min(self.cols - 1, max(start[0], end[0], int(raw_cells[:, 0].max())) + margin)
         min_y = max(0, min(start[1], end[1], int(raw_cells[:, 1].min())) - margin)
@@ -486,6 +554,16 @@ class FloorplanConstraintEngine:
                 previous[key] = current
                 heuristic = math.hypot(end[0] - nx, end[1] - ny)
                 heappush(queue, (candidate + heuristic, candidate, key))
+        # A route around a long machine can leave the first local window.
+        # Expand deterministically instead of declaring the plan disconnected.
+        full_margin = max(self.rows, self.cols)
+        if margin < full_margin:
+            return self._astar(
+                start_point,
+                end_point,
+                raw_segment,
+                _search_margin_cells=min(full_margin, margin * 2),
+            )
         return None
 
     def _collision_runs(self, points: np.ndarray) -> list[tuple[int, int]]:
@@ -563,6 +641,11 @@ class FloorplanConstraintEngine:
             "person_radius_meters": self.config.person_radius_meters,
             "point_count": int(len(raw)),
             "accepted": False,
+            "support_mask_enabled": self._support_mask is not None,
+            "support_coverage_ratio": (
+                round(float(np.mean(self._support_mask)), 8)
+                if self._support_mask is not None else None
+            ),
         }
         if len(raw) < 2:
             return {"accepted": False, "trajectory": [], "diagnostics": {**base_diagnostics, "reason": "trajectory_too_short"}}
@@ -654,10 +737,10 @@ class FloorplanConstraintEngine:
                 )
                 constrained_score = (
                     float(hypothesis["score"])
-                    + 0.18 * median_correction
-                    + 0.08 * p95_correction
-                    + 1.40 * abs(math.log(max(length_ratio, 1e-9)))
-                    + 0.03 * rerouted_segments
+                    + 0.02 * median_correction
+                    + 0.005 * p95_correction
+                    + 0.30 * abs(math.log(max(length_ratio, 1e-9)))
+                    + 0.02 * rerouted_segments
                 )
                 feasible.append({
                     **hypothesis,
@@ -729,7 +812,10 @@ class FloorplanConstraintEngine:
             "reason": None,
             "rejection_reasons": [],
             "quality_warnings": quality_warnings,
-            "constraint_mode": "hard_walkable_mask",
+            "constraint_mode": (
+                "hard_obstacles_and_cad_support"
+                if self._support_mask is not None else "hard_walkable_mask"
+            ),
             "hypothesis_count": len(hypotheses),
             "constrained_hypotheses_attempted": attempted,
             "feasible_hypotheses": len(feasible),
@@ -832,8 +918,12 @@ def apply_floorplan_constraints(
             convention = str(projection.get("plan_coordinate_convention") or convention)
     candidate_payload = result.get("lingbot_fusion_candidate")
     candidate_points: Any = []
+    independent_points: Any = []
     if isinstance(candidate_payload, dict) and candidate_payload.get("accepted"):
         candidate_points = candidate_payload.get("plan_trajectory") or []
+    if isinstance(candidate_payload, dict) and candidate_payload.get("independent_accepted"):
+        independent_points = candidate_payload.get("independent_plan_trajectory") or []
+    fragmented_r3 = method.startswith("r3") and _r3_is_severely_fragmented(result)
     primary_observation_source = (
         "r3"
         if method.startswith("r3")
@@ -843,20 +933,43 @@ def apply_floorplan_constraints(
     selected_observation_source = primary_observation_source
     source_selection: dict[str, Any] = {
         "primary": primary_observation_source,
-        "candidate": "r3_lingbot_fusion" if candidate_points else None,
+        "candidate": (
+            "lingbot_independent" if fragmented_r3 and independent_points
+            else ("r3_lingbot_fusion" if candidate_points else None)
+        ),
         "selected": primary_observation_source,
         "reason": "no_fusion_candidate" if not candidate_points else "primary_preferred",
     }
     try:
         engine = get_floorplan_engine(map_id)
-        alignment = engine.align(
-            points,
-            context.get("reference_point"),
-            context.get("direction_point"),
-            timestamps=result.get("r3_source_timestamps_seconds") or result.get("source_timestamps_seconds"),
-            coordinate_convention=convention,
+        source_timestamps = (
+            result.get("r3_source_timestamps_seconds")
+            or result.get("source_timestamps_seconds")
         )
-        if candidate_points:
+        if fragmented_r3 and independent_points:
+            selected_points = independent_points
+            selected_observation_source = "lingbot_independent"
+            alignment = engine.align(
+                independent_points,
+                context.get("reference_point"),
+                context.get("direction_point"),
+                timestamps=_resample_timestamps(source_timestamps, len(independent_points)),
+                coordinate_convention="x_right_y_down",
+            )
+            source_selection.update({
+                "selected": selected_observation_source,
+                "reason": "fragmented_r3_uses_independent_lingbot",
+                "r3_severely_fragmented": True,
+            })
+        else:
+            alignment = engine.align(
+                points,
+                context.get("reference_point"),
+                context.get("direction_point"),
+                timestamps=source_timestamps,
+                coordinate_convention=convention,
+            )
+        if candidate_points and not (fragmented_r3 and independent_points):
             candidate_alignment = engine.align(
                 candidate_points,
                 context.get("reference_point"),
@@ -932,7 +1045,10 @@ def apply_floorplan_constraints(
     stats["floorplan_id"] = map_id
     if alignment["accepted"]:
         mapped = alignment["trajectory"]
-        map_turns = _map_turn_points(result.get("turn_points"), selected_points, mapped)
+        # R3 turn indices have no valid correspondence to an independent
+        # LingBot trajectory and would create authoritative-looking false turns.
+        source_turns = [] if selected_observation_source == "lingbot_independent" else result.get("turn_points")
+        map_turns = _map_turn_points(source_turns, selected_points, mapped)
         updated["map_trajectory"] = mapped
         updated["map_turn_points"] = map_turns
         updated["final_turn_points"] = map_turns or result.get("turn_points") or []
