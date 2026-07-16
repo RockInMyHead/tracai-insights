@@ -406,9 +406,10 @@ class FloorplanConstraintEngine:
 
         raw_cells = np.asarray([self._pixel_to_cell(point) for point in raw_segment], dtype=np.int32)
         # Large production machines can require a detour around their entire
-        # footprint.  Twelve metres keeps search local while covering the
-        # widest annotated equipment blocks on the canonical plan.
-        margin = max(24, int(round(12.0 / max(self.cell_meters, 1e-9))))
+        # footprint.  Thirty metres covers the wider Kerama equipment islands
+        # where a 12 m local window left start/end in the same global component
+        # but still made A* report no path.
+        margin = max(24, int(round(30.0 / max(self.cell_meters, 1e-9))))
         min_x = max(0, min(start[0], end[0], int(raw_cells[:, 0].min())) - margin)
         max_x = min(self.cols - 1, max(start[0], end[0], int(raw_cells[:, 0].max())) + margin)
         min_y = max(0, min(start[1], end[1], int(raw_cells[:, 1].min())) - margin)
@@ -622,11 +623,18 @@ class FloorplanConstraintEngine:
                 if repaired is None:
                     continue
                 corrected_metrics = self._path_metrics(repaired)
-                if (
-                    corrected_metrics["collision_ratio"] > 0.0
-                    or corrected_metrics["outside_ratio"] > 0.0
-                ):
-                    continue
+                # Dense sample metrics can still report a single-pixel nick after
+                # A* + line-of-sight simplify, even when every polyline segment
+                # is collision-free.  The hard contract is segment safety.
+                if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
+                    repaired_again, extra_segments = self._repair_collisions(repaired)
+                    if repaired_again is None:
+                        continue
+                    repaired = repaired_again
+                    rerouted_segments += extra_segments
+                    corrected_metrics = self._path_metrics(repaired)
+                    if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
+                        continue
                 matched = _resample_polyline(
                     repaired,
                     _trajectory_fractions(hypothesis["points"]),
