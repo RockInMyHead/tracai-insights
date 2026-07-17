@@ -96,13 +96,79 @@ def _to_json_serializable(obj: Any):
 
     # Containers
     if isinstance(obj, dict):
-        return {k: _to_json_serializable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
+        return {str(k): _to_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
         return [_to_json_serializable(v) for v in obj]
 
-    # Fallback: leave as-is (bool, int, float, str, None, etc.)
-    return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, complex):
+        return [obj.real, obj.imag]
 
+    # Fallback: leave as-is (bool, int, float, str, None, etc.)
+    # Anything else that FastAPI cannot encode becomes a string.
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        return str(obj)
+
+
+def _status_response_payload(status_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a poll-safe status payload (never crash the UI on bad result types)."""
+    safe = _to_json_serializable(status_data)
+    if not isinstance(safe, dict):
+        return {"status": "unknown", "progress": 0, "message": "invalid status"}
+    return safe
+
+
+def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
+    """If analysis is already on disk / DB-completed, expose it even after restart."""
+    analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
+    db_completed = False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT status, progress FROM tracking_tasks WHERE id = ?",
+            (video_id,),
+        ).fetchone()
+        conn.close()
+        if row and str(row[0]).lower() in {"completed", "done", "success"}:
+            db_completed = True
+    except Exception:
+        db_completed = False
+    if not analysis_file.exists() and not db_completed:
+        return None
+    if not analysis_file.exists():
+        return {
+            "id": video_id,
+            "status": "completed",
+            "progress": 100,
+            "message": "Анализ завершён",
+        }
+    try:
+        with open(analysis_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        result = payload.get("analysis_result") or payload
+        return {
+            "id": video_id,
+            "status": "completed",
+            "progress": 100,
+            "message": "Анализ завершён",
+            "result": result,
+        }
+    except Exception as exc:
+        logger.warning("[%s] Could not load completed analysis for status: %s", video_id, exc)
+        return {
+            "id": video_id,
+            "status": "completed",
+            "progress": 100,
+            "message": "Анализ завершён",
+        }
 # Configure CORS (Safari лучше работает с 127.0.0.1, не localhost)
 app.add_middleware(
     CORSMiddleware,
@@ -1814,13 +1880,38 @@ async def get_video_status(video_id: str):
             manual_item.get("trajectory") or [],
             manual_item.get("turn_points") or [],
         )
-        return {
+        return JSONResponse(_status_response_payload({
             "status": "completed",
             "progress": 100,
             "message": "Ручная траектория готова",
             "result": manual_result,
             "manual_updated_at": manual_item.get("updated_at"),
-        }
+        }))
+
+    live = processing_status.get(video_id)
+    live_state = str((live or {}).get("status") or "").lower()
+    live_busy = live_state in {
+        "queued",
+        "processing",
+        "uploading_to_gpu",
+        "gpu_processing",
+        "running",
+        "lingbot_queued",
+        "lingbot_running",
+    }
+    # A stale in-memory payload (often with a non-serializable prior result)
+    # must not block a finished analysis after restart / re-open.
+    if not live_busy:
+        completed = _load_completed_analysis_status(video_id)
+        if completed is not None:
+            processing_status[video_id] = {
+                "status": "completed",
+                "progress": 100,
+                "message": completed.get("message") or "Анализ завершён",
+                "start_time": (live or {}).get("start_time") or time.time(),
+            }
+            return JSONResponse(_status_response_payload(completed))
+
     if video_id not in processing_status:
         lingbot_session_id = _load_lingbot_session_id(video_id)
         if lingbot_session_id:
@@ -1831,10 +1922,17 @@ async def get_video_status(video_id: str):
                 "lingbot_session_id": lingbot_session_id,
                 "start_time": time.time(),
             }
-            return await _merge_lingbot_status(video_id, processing_status[video_id])
-        return {"id": video_id, "status": "unknown", "progress": 0}
-    return await _merge_lingbot_status(video_id, processing_status[video_id])
+            merged = await _merge_lingbot_status(video_id, processing_status[video_id])
+            return JSONResponse(_status_response_payload(merged))
+        return JSONResponse({"id": video_id, "status": "unknown", "progress": 0})
 
+    # Never re-emit a previous heavy result while a new GPU job is running —
+    # FastAPI jsonable_encoder can 500 on leftover numpy / graph objects.
+    if live_busy and "result" in processing_status[video_id]:
+        processing_status[video_id].pop("result", None)
+
+    merged = await _merge_lingbot_status(video_id, processing_status[video_id])
+    return JSONResponse(_status_response_payload(merged))
 @app.post("/api/reset-status/{video_id}")
 async def reset_video_status(video_id: str):
     """Reset processing status for a video (to allow re-processing)."""
@@ -2307,6 +2405,7 @@ async def process_video_background(
             "progress": 5,
             "message": "Отправка видео на GPU-сервер для анализа..."
         })
+        processing_status[video_id].pop("result", None)
 
         timeout_sec = 7200  # 2 hours max
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
@@ -2433,8 +2532,10 @@ async def process_video_r3_background(
             "progress": 5,
             "message": "Отправка видео на GPU-сервер для R³ реконструкции..."
         })
+        # Drop any previous analysis payload so /api/status stays JSON-safe
+        # while this long GPU upload/inference is in flight.
+        processing_status[video_id].pop("result", None)
         logger.info(f"[{video_id}] Sending to GPU Worker R³ at {GPU_WORKER_URL}")
-
         timeout_sec = 7200
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
             params = {
