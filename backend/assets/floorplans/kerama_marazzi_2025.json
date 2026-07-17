@@ -18,19 +18,19 @@
   "person_radius_meters": 0.28,
   "walking_speed_mps": 1.2,
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
-  "obstacle_mask_sha256": "ed6b256c874e094dd624ea9f4e032a5fd7fcb970304e5151d41d375b99bed27e",
+  "obstacle_mask_sha256": "ffcf537e23040f7d4d52074248522dde37a01e5b768dc0fc509af4b7552c5a9f",
   "support_mask_file": "kerama_marazzi_2025_support.png",
-  "support_mask_sha256": "2b96be48fda519cea13f6ba8a24bf43359e2da55bf071ffba4c47e409e43bd8f",
+  "support_mask_sha256": "f1eed9806e2021124b01168f8b320f25ca4eca2d1e0595a29d168a15908a1ce5",
   "support_mask_generation": {
-    "method": "cad_ink_distance_envelope",
-    "radius_pixels": 60,
-    "grid_pixels": 4,
-    "coverage_ratio": 0.512133526850508
+    "method": "page_exterior_flood_fill",
+    "ink_threshold": 242,
+    "barrier_dilation_pixels": 2,
+    "coverage_ratio": 0.3584644274194175
   },
-  "source_pdf_sha256": "8c5d7f40962d7a87984cbd0f460bc6f04aaf8882a61fb40bf7e90b9fbd858d17",
-  "display_image_sha256": "36d15942bd55a95f2fa5f4955b7bf42d616262f453f37e780949f7ed80434f83",
+  "source_pdf_sha256": "6588fc4803cc0962022bf55f7d98fc0cbbe89feff958c9f7631a0a5f85e77adf",
+  "display_image_sha256": "275d10ad0b5ed9c21e06a03f4e98fdf3c7e3a692831202de0d6103a88e0e95c2",
   "source_pdf": "kerama-marazzi-2025.pdf",
   "display_image": "kerama-marazzi-2025.png",
-  "annotation_component_count": 76,
-  "annotation_pixel_count": 118092
+  "annotation_component_count": 77,
+  "annotation_pixel_count": 126884
 }

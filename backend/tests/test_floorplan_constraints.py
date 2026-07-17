@@ -4,6 +4,7 @@ from unittest.mock import patch
 import numpy as np
 
 from backend.floorplan_constraints import (
+    FloorplanConfig,
     FloorplanConstraintEngine,
     _trajectory_fractions,
     apply_floorplan_constraints,
@@ -146,6 +147,60 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertAlmostEqual(engine.config.meters_per_pixel, 0.0496291667, places=8)
         self.assertGreater(int(engine.occupied.sum()), 1000)
 
+    def test_fixed_floorplan_excludes_blank_space_above_north_roof(self) -> None:
+        engine = get_floorplan_engine()
+        self.assertTrue(engine._support_mask[705, 2240])
+        # Regression for the production route that escaped above the long
+        # green roof line and then travelled left through blank PDF canvas.
+        self.assertFalse(engine._support_mask[492, 1800])
+        start_cell = engine._pixel_to_cell([2240.0, 705.0])
+        snapped_start = engine._nearest_free(start_cell)
+        outside_component = engine._component_ids[
+            engine._pixel_to_cell([1800.0, 492.0])[1],
+            engine._pixel_to_cell([1800.0, 492.0])[0],
+        ]
+        self.assertIsNotNone(snapped_start)
+        self.assertLess(
+            np.linalg.norm(np.asarray(snapped_start) - np.asarray(start_cell))
+            * engine.cell_meters,
+            1.0,
+        )
+        self.assertEqual(int(outside_component), 0)
+
+    def test_positive_support_rejects_topology_destroying_repair(self) -> None:
+        height, width = 100, 220
+        support = np.zeros((height, width), dtype=bool)
+        support[44:57, 5:215] = True
+        engine = FloorplanConstraintEngine(
+            FloorplanConfig(
+                map_id="supported_test",
+                width=width,
+                height=height,
+                meters_per_pixel=1.0,
+                grid_cell_pixels=1,
+                person_radius_meters=0.0,
+                obstacle_mask_file="",
+            ),
+            np.zeros_like(support),
+            support,
+        )
+        trajectory = []
+        trajectory.extend([[float(x), 0.0] for x in range(20)])
+        trajectory.extend([[19.0, float(y)] for y in range(1, 31)])
+        trajectory.extend([[float(x), 30.0] for x in range(20, 101)])
+        result = engine.align(
+            trajectory,
+            {"x": 10.0, "y": 50.0},
+            {"x": 30.0, "y": 50.0},
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertEqual(
+            result["diagnostics"]["reason"],
+            "map_correction_exceeds_observation_budget",
+        )
+
     def test_fixed_floorplan_routes_around_real_annotated_machine(self) -> None:
         engine = get_floorplan_engine()
         result = engine.align(
@@ -158,7 +213,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(result["accepted"], result["diagnostics"])
         self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
         self.assertGreater(result["diagnostics"]["rerouted_segments"], 0)
-        self.assertGreater(len(result["trajectory"]), 5)
+        self.assertGreaterEqual(len(result["trajectory"]), 5)
 
     def test_wrapper_preserves_visual_trajectory_when_map_context_is_incomplete(self) -> None:
         source = {

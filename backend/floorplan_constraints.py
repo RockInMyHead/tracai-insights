@@ -967,7 +967,7 @@ class FloorplanConstraintEngine:
     ) -> dict[str, Any]:
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v4_guarded",
+            "engine": "floorplan_constraint_engine_v5_exterior_guarded",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -1067,12 +1067,25 @@ class FloorplanConstraintEngine:
             p95_correction = (
                 float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
             )
+            # A floor plan may select scale/yaw and make local obstacle
+            # repairs; it may not invent a different route.  The former
+            # production weights made a 12 m displacement almost free
+            # (0.005 * p95), so a geometrically absurd route could outrank a
+            # faithful observation merely because it had more clearance.
+            correction_budget = max(
+                2.5,
+                min(6.0, float(hypothesis["length_meters"]) * 0.12),
+            )
+            shape_preserved = (
+                p95_correction <= correction_budget
+                and 0.70 <= length_ratio <= 1.45
+            )
             constrained_score = (
                 float(hypothesis["score"])
-                + 0.02 * median_correction
-                + 0.005 * p95_correction
-                + 0.30 * abs(math.log(max(length_ratio, 1e-9)))
-                + 0.02 * rerouted_segments
+                + 0.15 * median_correction
+                + 0.06 * p95_correction
+                + 0.75 * abs(math.log(max(length_ratio, 1e-9)))
+                + 0.08 * rerouted_segments
             )
             feasible.append({
                 **hypothesis,
@@ -1081,6 +1094,8 @@ class FloorplanConstraintEngine:
                 "corrected_metrics": corrected_metrics,
                 "displacement_m": displacement_m,
                 "length_ratio": length_ratio,
+                "correction_budget_meters": correction_budget,
+                "shape_preserved": shape_preserved,
                 "constrained_score": constrained_score,
             })
 
@@ -1100,7 +1115,40 @@ class FloorplanConstraintEngine:
             }
 
         feasible.sort(key=lambda item: item["constrained_score"])
-        best = feasible[0]
+        # With a positive support mask, accepting an arbitrary collision-free
+        # path is worse than reporting that the visual observation and map do
+        # not agree.  Only shape-preserving candidates are authoritative.
+        production_feasible = (
+            [item for item in feasible if item["shape_preserved"]]
+            if self._support_mask is not None
+            else feasible
+        )
+        if not production_feasible:
+            closest = feasible[0]
+            closest_displacement = closest["displacement_m"]
+            closest_p95 = (
+                float(np.percentile(closest_displacement, 95))
+                if len(closest_displacement) else 0.0
+            )
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": "map_correction_exceeds_observation_budget",
+                    "rejection_reasons": ["topology_destroying_map_correction"],
+                    "hypothesis_count": len(hypotheses),
+                    "beam_size": len(beam),
+                    "constrained_hypotheses_attempted": attempted,
+                    "feasible_hypotheses": len(feasible),
+                    "correction_p95_meters": round(closest_p95, 3),
+                    "correction_budget_meters": round(
+                        float(closest["correction_budget_meters"]), 3
+                    ),
+                    "length_ratio": round(float(closest["length_ratio"]), 5),
+                },
+            }
+        best = production_feasible[0]
         repaired = best["repaired"]
         corrected_metrics = best["corrected_metrics"]
         displacement_m = best["displacement_m"]
@@ -1193,9 +1241,10 @@ class FloorplanConstraintEngine:
                 else:
                     nonlinear_diagnostics["accepted"] = False
                     nonlinear_diagnostics["reason"] = "safe_baseline_not_improved"
-        allowed_correction = max(
-            4.0,
-            min(12.0, float(best["length_meters"]) * 0.18),
+        allowed_correction = (
+            float(best["correction_budget_meters"])
+            if self._support_mask is not None
+            else max(4.0, min(12.0, float(best["length_meters"]) * 0.18))
         )
 
         # Scale, speed and correction magnitude affect confidence, but they do
@@ -1240,6 +1289,7 @@ class FloorplanConstraintEngine:
             "beam_size": len(beam),
             "constrained_hypotheses_attempted": attempted,
             "feasible_hypotheses": len(feasible),
+            "shape_preserving_hypotheses": len(production_feasible),
             "selected_scale_pixels_per_unit": round(float(best["scale"]), 8),
             "selected_yaw_offset_degrees": round(float(best["yaw"]), 3),
             "estimated_length_meters": round(float(best["length_meters"]), 3),
@@ -1252,6 +1302,7 @@ class FloorplanConstraintEngine:
             "start_snap_meters": round(start_snap_meters, 3),
             "correction_median_meters": round(float(np.median(displacement_m)), 3),
             "correction_p95_meters": round(p95_correction, 3),
+            "correction_budget_meters": round(allowed_correction, 3),
             "length_ratio": round(length_ratio, 5),
             "hypothesis_score": round(float(best["score"]), 6),
             "constrained_score": round(float(best["constrained_score"]), 6),
@@ -1519,7 +1570,7 @@ def apply_floorplan_constraints(
             "accepted": False,
             "trajectory": [],
             "diagnostics": {
-                "engine": "floorplan_constraint_engine_v4_guarded",
+                "engine": "floorplan_constraint_engine_v5_exterior_guarded",
                 "map_id": map_id,
                 "accepted": False,
                 "reason": "engine_error",

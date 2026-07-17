@@ -72,26 +72,37 @@ def main() -> None:
         obstacle_path = BACKEND / "kerama_marazzi_2025_obstacles.png"
         Image.fromarray((mask * 255).astype(np.uint8)).save(obstacle_path, optimize=True)
 
-        # Positive CAD support prevents the solver from using the blank PDF
-        # canvas as an imaginary corridor.  Keep a generous envelope around
-        # all original drawing ink so real aisles remain connected.
-        support_radius_pixels = 60
-        support_grid_pixels = 4
-        original_gray = Image.fromarray(original).convert("L")
-        support_size = (
-            int(math.ceil(original_gray.width / support_grid_pixels)),
-            int(math.ceil(original_gray.height / support_grid_pixels)),
+        # A distance halo around every CAD primitive is not a walkability
+        # model.  In particular it creates an artificial corridor on the
+        # *outside* of a long wall/roof line.  That failure is especially bad
+        # for map matching because A* can replace a real indoor route with a
+        # visually plausible straight line through blank PDF canvas.
+        #
+        # Treat page-border-connected white space as exterior instead.  CAD
+        # ink is used only as a flood-fill barrier; it is not made an obstacle
+        # (the immutable red annotation remains the no-go source of truth).
+        # Two pixels of dilation close antialiasing pinholes while preserving
+        # the large entrances and courtyards represented by the drawing.
+        support_barrier_dilation_pixels = 2
+        original_gray = np.asarray(Image.fromarray(original).convert("L"))
+        ink = original_gray < 242
+        barrier = ndimage.binary_dilation(
+            ink, iterations=support_barrier_dilation_pixels
         )
-        ink_grid = np.asarray(
-            original_gray.resize(support_size, Image.Resampling.BOX)
-        ) < 242
-        support_grid = ndimage.distance_transform_edt(~ink_grid) <= (
-            support_radius_pixels / support_grid_pixels
-        )
+        blank = ~barrier
+        blank_labels, _ = ndimage.label(blank)
+        border_labels = np.unique(np.concatenate((
+            blank_labels[0, :],
+            blank_labels[-1, :],
+            blank_labels[:, 0],
+            blank_labels[:, -1],
+        )))
+        exterior = np.isin(blank_labels, border_labels)
+        support = ~exterior
         support_path = BACKEND / "kerama_marazzi_2025_support.png"
-        Image.fromarray((support_grid * 255).astype(np.uint8)).resize(
-            original_gray.size, Image.Resampling.NEAREST
-        ).save(support_path, optimize=True)
+        Image.fromarray((support * 255).astype(np.uint8)).save(
+            support_path, optimize=True
+        )
 
     source_pdf = PUBLIC / "kerama-marazzi-2025.pdf"
     source_pdf.write_bytes(marked_pdf.read_bytes())
@@ -116,10 +127,10 @@ def main() -> None:
         "support_mask_file": support_path.name,
         "support_mask_sha256": hashlib.sha256(support_path.read_bytes()).hexdigest(),
         "support_mask_generation": {
-            "method": "cad_ink_distance_envelope",
-            "radius_pixels": support_radius_pixels,
-            "grid_pixels": support_grid_pixels,
-            "coverage_ratio": float(support_grid.mean()),
+            "method": "page_exterior_flood_fill",
+            "ink_threshold": 242,
+            "barrier_dilation_pixels": support_barrier_dilation_pixels,
+            "coverage_ratio": float(support.mean()),
         },
         "source_pdf_sha256": hashlib.sha256(source_pdf.read_bytes()).hexdigest(),
         "display_image_sha256": hashlib.sha256(display_path.read_bytes()).hexdigest(),
