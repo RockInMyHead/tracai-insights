@@ -1072,9 +1072,12 @@ class FloorplanConstraintEngine:
             # production weights made a 12 m displacement almost free
             # (0.005 * p95), so a geometrically absurd route could outrank a
             # faithful observation merely because it had more clearance.
+            # Budget scales with path length: a hard 6 m cap rejected faithful
+            # ~200 m warehouse routes (~13 m aisle snaps) while length_ratio
+            # already blocks topology-destroying shrinks (e.g. 0.34).
             correction_budget = max(
                 2.5,
-                min(6.0, float(hypothesis["length_meters"]) * 0.12),
+                min(15.0, float(hypothesis["length_meters"]) * 0.10),
             )
             shape_preserved = (
                 p95_correction <= correction_budget
