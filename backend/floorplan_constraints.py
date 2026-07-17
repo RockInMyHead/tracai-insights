@@ -15,6 +15,7 @@ from heapq import heappop, heappush
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -649,7 +650,10 @@ class FloorplanConstraintEngine:
                 # step. This makes the same physical map substantially
                 # invariant to grid_cell_pixels.
                 wall_multiplier = 0.55 * math.exp(-clearance / 0.45)
-                deviation_multiplier = min(1.5, 0.08 * deviation_meters)
+                # Preserve the old physical pull toward the visual path.  The
+                # first metric rewrite accidentally weakened it ~3.5x on the
+                # production grid and allowed clearance to dominate topology.
+                deviation_multiplier = min(3.0, 0.30 * deviation_meters)
                 step_meters = step * self.cell_meters
                 candidate = cost + step_meters * (
                     1.0 + wall_multiplier + deviation_multiplier
@@ -963,7 +967,7 @@ class FloorplanConstraintEngine:
     ) -> dict[str, Any]:
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v4_multilevel_hmm",
+            "engine": "floorplan_constraint_engine_v4_guarded",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -1103,13 +1107,21 @@ class FloorplanConstraintEngine:
         length_ratio = float(best["length_ratio"])
         rerouted_segments = int(best["rerouted_segments"])
         p95_correction = float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
+        experimental_hmm_enabled = os.getenv(
+            "TRACKAI_ENABLE_EXPERIMENTAL_MULTILEVEL_HMM", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         nonlinear_diagnostics: dict[str, Any] = {
             "attempted": False,
             "accepted": False,
             "method": "corridor_graph_multilevel_viterbi_v2",
-            "reason": "global_solution_stable",
+            "reason": (
+                "global_solution_stable"
+                if experimental_hmm_enabled
+                else "disabled_pending_production_validation"
+            ),
+            "production_enabled": experimental_hmm_enabled,
         }
-        if rerouted_segments > 0 or p95_correction > 2.0:
+        if experimental_hmm_enabled and (rerouted_segments > 0 or p95_correction > 2.0):
             nonlinear, nonlinear_diagnostics = self._multilevel_viterbi_map_match(
                 best["points"], repaired
             )
@@ -1125,14 +1137,39 @@ class FloorplanConstraintEngine:
                 nonlinear_length_ratio = _polyline_length(nonlinear) / max(
                     _polyline_length(best["points"]), 1e-9
                 )
+                observed_resampled = _resample_polyline(
+                    best["points"], np.linspace(0.0, 1.0, 64)
+                )
+                candidate_resampled = _resample_polyline(
+                    nonlinear, np.linspace(0.0, 1.0, 64)
+                )
+
+                def signed_turn(points: np.ndarray) -> float:
+                    deltas = np.diff(points[:, :2], axis=0)
+                    lengths = np.linalg.norm(deltas, axis=1)
+                    deltas = deltas[lengths > 1e-6]
+                    if len(deltas) < 2:
+                        return 0.0
+                    headings = np.unwrap(np.arctan2(deltas[:, 1], deltas[:, 0]))
+                    return math.degrees(float(headings[-1] - headings[0]))
+
+                observed_turn = signed_turn(observed_resampled)
+                candidate_turn = signed_turn(candidate_resampled)
+                chirality_preserved = (
+                    abs(observed_turn) < 20.0 and abs(candidate_turn) < 25.0
+                ) or (
+                    observed_turn * candidate_turn > 0.0
+                    and 0.60 <= abs(candidate_turn) / max(abs(observed_turn), 1e-9) <= 1.40
+                )
                 improves = (
                     nonlinear_p95 <= p95_correction * 0.97
                     or abs(math.log(max(nonlinear_length_ratio, 1e-9)))
                     < abs(math.log(max(length_ratio, 1e-9))) * 0.92
                 )
                 bounded = (
-                    nonlinear_p95 <= p95_correction + 0.75
-                    and 0.55 <= nonlinear_length_ratio <= 1.85
+                    nonlinear_p95 <= min(p95_correction + 0.25, 4.0)
+                    and 0.75 <= nonlinear_length_ratio <= 1.35
+                    and chirality_preserved
                     and not self._collision_runs(nonlinear)
                     and self._path_metrics(nonlinear)["outside_ratio"] == 0.0
                 )
@@ -1141,6 +1178,9 @@ class FloorplanConstraintEngine:
                     "correction_p95_after_meters": round(nonlinear_p95, 3),
                     "length_ratio_before": round(length_ratio, 5),
                     "length_ratio_after": round(nonlinear_length_ratio, 5),
+                    "observed_signed_turn_degrees": round(observed_turn, 3),
+                    "candidate_signed_turn_degrees": round(candidate_turn, 3),
+                    "chirality_preserved": chirality_preserved,
                 })
                 if improves and bounded:
                     repaired = nonlinear
@@ -1479,7 +1519,7 @@ def apply_floorplan_constraints(
             "accepted": False,
             "trajectory": [],
             "diagnostics": {
-                "engine": "floorplan_constraint_engine_v4_multilevel_hmm",
+                "engine": "floorplan_constraint_engine_v4_guarded",
                 "map_id": map_id,
                 "accepted": False,
                 "reason": "engine_error",

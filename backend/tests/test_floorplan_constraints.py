@@ -397,6 +397,20 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(engine._collision_runs(matched), [])
         self.assertGreater(diagnostics["corridor_graph_nodes"], 0)
 
+    def test_experimental_hmm_is_disabled_in_production_by_default(self) -> None:
+        mask = np.zeros((120, 180), dtype=bool)
+        mask[42:78, 78:102] = True
+        engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
+        result = engine.align(
+            [[0, 0], [20, 0], [40, 0], [60, 0], [80, 0]],
+            {"x": 10, "y": 50}, {"x": 30, "y": 50},
+            scale_candidates=[2.0], yaw_offsets_degrees=[0.0],
+        )
+        nonlinear = result["diagnostics"]["nonlinear_map_matching"]
+        self.assertFalse(nonlinear["attempted"])
+        self.assertFalse(nonlinear["production_enabled"])
+        self.assertEqual(nonlinear["reason"], "disabled_pending_production_validation")
+
 
 if __name__ == "__main__":
     unittest.main()
