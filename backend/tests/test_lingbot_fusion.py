@@ -175,6 +175,32 @@ class LingBotFusionTests(unittest.TestCase):
         self.assertEqual(mode, "timestamp_offset")
         self.assertTrue(np.allclose(mapped[:, 0], [0.0, 0.2, 1.8, 2.0]))
 
+    def test_divergent_duration_falls_back_to_arc_length_not_stretch(self) -> None:
+        """LingBot 250s vs R³ 305s must not invent a 1.22× time stretch."""
+        from backend.lingbot_fusion import _correspond
+
+        r3 = self._r3_path()
+        lingbot = r3.copy()
+        # Same geometry, but clocks cover different video durations (production case).
+        lb_t = np.linspace(0.0, 250.2, len(lingbot))
+        r3_t = np.linspace(0.0, 305.3, len(r3))
+        mapped, mode = _correspond(lingbot, len(r3), lb_t, r3_t)
+        self.assertEqual(mode, "arc_length")
+        self.assertEqual(len(mapped), len(r3))
+
+        result = build_lingbot_fusion_candidate(
+            {
+                "plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist(),
+                "r3_source_timestamps_seconds": r3_t.tolist(),
+            },
+            {
+                "plan_trajectory": np.column_stack((lingbot, np.zeros(len(lingbot)))).tolist(),
+                "lingbot_source_timestamps_seconds": lb_t.tolist(),
+            },
+        )
+        self.assertEqual(result["diagnostics"]["correspondence_mode"], "arc_length")
+        self.assertTrue(result["accepted"], result["diagnostics"])
+
     def test_restore_helper_keeps_independent_candidates(self) -> None:
         self.assertTrue(
             should_restore_lingbot_fusion_candidate(

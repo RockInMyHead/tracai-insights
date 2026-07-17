@@ -164,8 +164,11 @@ def _correspond(
 ) -> tuple[np.ndarray, str]:
     """Register LingBot samples onto the R3 sample count.
 
-    Prefer overlapping timestamps with a fitted offset.  Otherwise use
-    arc-length parameterization.  Index linspace is never advertised as time.
+    Prefer absolute timestamps with a constant clock offset when both tracks
+    cover nearly the same duration.  Never stretch a shorter reconstruction to
+    fill a longer one — that invents false temporal correspondence (e.g. LingBot
+    250s vs R³ 305s).  Otherwise use arc-length.  Index linspace is never
+    advertised as time.
     """
     if len(lingbot) == 0 or count <= 0:
         return np.empty((0, 2), dtype=np.float64), "unavailable"
@@ -177,16 +180,14 @@ def _correspond(
     ):
         lb = lingbot_timestamps.astype(np.float64)
         r3 = r3_timestamps.astype(np.float64)
-        # Fit a constant offset that maximises overlap of normalised intervals.
         lb_span = float(lb[-1] - lb[0])
         r3_span = float(r3[-1] - r3[0])
         if lb_span > 1e-9 and r3_span > 1e-9:
-            scale = r3_span / lb_span
-            # Keep scale near 1 when both cover the same video; otherwise fall
-            # back to pure arc-length rather than inventing a stretch model.
-            if 0.75 <= scale <= 1.35:
-                offset = float(r3[0] - lb[0] * scale)
-                mapped = lb * scale + offset
+            duration_ratio = r3_span / lb_span
+            # Same video coverage only — allow tiny clock skew, not 20%+ stretch.
+            if 0.95 <= duration_ratio <= 1.05:
+                offset = float(r3[0] - lb[0])
+                mapped = lb + offset
                 mapped = np.clip(mapped, float(r3[0]), float(r3[-1]))
                 return _resample_by_parameter(
                     lingbot, count, mapped, target_parameter=r3

@@ -26,9 +26,31 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
 };
 
+const LINGBOT_FUSION_REASON_LABELS: Record<string, string> = {
+  trajectory_disagreement_too_large: "траектории слишком расходятся",
+  turn_chirality_conflict: "разный знак поворотов",
+  trajectory_too_short: "слишком короткая траектория",
+  similarity_fit_failed: "не удалось совместить траектории",
+};
+
+const MAP_OBSERVATION_SOURCE_LABELS: Record<string, string> = {
+  r3_lingbot_fusion: "на карте: R³ + LingBot fusion",
+  lingbot_independent: "на карте: независимый LingBot",
+  r3: "на карте: R³",
+};
+
 const floorplanDiagnosticLabel = (value: unknown): string => {
   const key = String(value || "constraint_solution_not_found");
   return FLOORPLAN_DIAGNOSTIC_LABELS[key] || key;
+};
+
+const lingbotFusionReasonLabel = (value: unknown): string => {
+  const key = String(value || "");
+  return LINGBOT_FUSION_REASON_LABELS[key] || key;
+};
+
+const mapObservationSourceLabel = (value: string): string => {
+  return MAP_OBSERVATION_SOURCE_LABELS[value] || "";
 };
 
 type AnalysisData = NonNullable<VideoAnalysisResult["data"]>;
@@ -1373,16 +1395,17 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
                   → ограничения фиксированного плана Kerama Marazzi.
                 </span>
                 <Badge variant="default">Production pipeline</Badge>
-                {activeLingbotFusion.accepted === true && (
-                  <Badge variant={activeMapObservationSource === 'r3_lingbot_fusion' ? 'default' : 'outline'}>
-                    {activeMapObservationSource === 'r3_lingbot_fusion'
-                      ? 'R³ + LingBot fusion применён'
-                      : 'LingBot shadow согласован'}
+                {activeMapObservationSource && mapObservationSourceLabel(activeMapObservationSource) && (
+                  <Badge variant={activeMapObservationSource === 'r3' ? 'outline' : 'default'}>
+                    {mapObservationSourceLabel(activeMapObservationSource)}
                   </Badge>
+                )}
+                {activeLingbotFusion.accepted === true && activeMapObservationSource !== 'r3_lingbot_fusion' && (
+                  <Badge variant="outline">LingBot согласован с R³ (shadow)</Badge>
                 )}
                 {activeLingbotFusion.accepted === false && activeLingbotFusion.reason && (
                   <Badge variant="outline">
-                    LingBot fallback: R³ · {String(activeLingbotFusion.reason)}
+                    Fusion не принят: {lingbotFusionReasonLabel(activeLingbotFusion.reason)}
                   </Badge>
                 )}
                 {typeof activeFloorplanConstraint.accepted === 'boolean' && (
