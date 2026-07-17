@@ -166,6 +166,15 @@ class LingBotFusionTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["correspondence_mode"], "timestamp_offset")
         self.assertIn("lingbot_source_timestamps_seconds", result)
 
+    def test_timestamp_correspondence_uses_nonuniform_r3_clock(self) -> None:
+        from backend.lingbot_fusion import _correspond
+        lingbot = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+        mapped, mode = _correspond(
+            lingbot, 4, np.asarray([0.0, 5.0, 10.0]), np.asarray([0.0, 1.0, 9.0, 10.0])
+        )
+        self.assertEqual(mode, "timestamp_offset")
+        self.assertTrue(np.allclose(mapped[:, 0], [0.0, 0.2, 1.8, 2.0]))
+
     def test_restore_helper_keeps_independent_candidates(self) -> None:
         self.assertTrue(
             should_restore_lingbot_fusion_candidate(

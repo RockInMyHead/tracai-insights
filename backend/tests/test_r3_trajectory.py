@@ -251,14 +251,12 @@ class R3TrajectoryTests(unittest.TestCase):
 
         result = build_r3_trajectory(poses, [2.0] * len(poses))
 
-        self.assertEqual(len(result["turn_points"]), 4)
-        for turn in result["turn_points"]:
-            self.assertEqual(turn["angle_source"], "camera_orientation")
-            self.assertAlmostEqual(abs(turn["trajectory_angle_degrees"]), 20.0, delta=2.0)
-            self.assertAlmostEqual(abs(turn["angle_degrees"]), 90.0, delta=2.0)
-            self.assertEqual(turn["geometry_angle_degrees"], turn["trajectory_angle_degrees"])
-            self.assertEqual(turn["observation_angle_degrees"], turn["angle_degrees"])
-            self.assertFalse(turn["geometry_mutated"])
+        # A globally unreliable camera-heading signal may no longer promote
+        # weak 20-degree position bends to authoritative 90-degree turns.
+        self.assertEqual(result["turn_points"], [])
+        turn_quality = result["trajectory_quality"]["turn_detection"]
+        self.assertFalse(turn_quality["camera_orientation"]["reliable"])
+        self.assertEqual(turn_quality["camera_overrides"], 0)
 
         raw_plan = np.asarray(result["raw_plan_trajectory"], dtype=np.float64)
         plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
@@ -272,8 +270,8 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertFalse(correction["geometry_mutated"])
         self.assertFalse(correction["applied"])
         self.assertEqual(correction["applied_count"], 0)
-        self.assertEqual(correction["suppressed_count"], 4)
-        self.assertEqual(len(correction["observations"]), 4)
+        self.assertEqual(correction["suppressed_count"], 0)
+        self.assertEqual(correction["observations"], [])
         self.assertEqual(result["trajectory_quality"]["postprocess_version"], 5)
 
     def test_trajectory_plane_prevents_pitch_dependent_scale(self) -> None:

@@ -22,6 +22,11 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
+try:
+    from confidence_calibration import calibrated_probability
+except ImportError:  # pragma: no cover - package import path
+    from backend.confidence_calibration import calibrated_probability
+
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
@@ -247,7 +252,8 @@ class FloorplanConstraintEngine:
         padded = np.pad(
             mask,
             ((0, rows * cell - self.config.height), (0, cols * cell - self.config.width)),
-            constant_values=False,
+            # Partial grid cells outside the PDF are physical out-of-map space.
+            constant_values=True,
         )
         base = padded.reshape(rows, cell, cols, cell).any(axis=(1, 3))
         distance_to_base = ndimage.distance_transform_edt(~base)
@@ -263,6 +269,22 @@ class FloorplanConstraintEngine:
             * self.config.meters_per_pixel
             * cell
         )
+        # A compact medial-axis-like corridor graph. Nodes are local clearance
+        # maxima; collision-free Viterbi transitions become its implicit edges.
+        ridge_window = max(3, int(round(1.2 / max(self.config.meters_per_pixel * cell, 1e-9))))
+        if ridge_window % 2 == 0:
+            ridge_window += 1
+        ridge = (
+            (~occupied)
+            & (self.clearance_meters >= ndimage.maximum_filter(
+                self.clearance_meters, size=ridge_window, mode="constant"
+            ) - 1e-9)
+            & (self.clearance_meters >= max(0.20, self.config.person_radius_meters * 0.5))
+        )
+        corridor_nodes = np.argwhere(ridge)[:, ::-1] if np.any(ridge) else np.empty((0, 2), dtype=int)
+        if len(corridor_nodes) > 5000:
+            corridor_nodes = corridor_nodes[:: int(math.ceil(len(corridor_nodes) / 5000))]
+        self._corridor_nodes = corridor_nodes.astype(np.int32)
         _, nearest = ndimage.distance_transform_edt(occupied, return_indices=True)
         self._nearest_free_rows = nearest[0]
         self._nearest_free_cols = nearest[1]
@@ -322,6 +344,11 @@ class FloorplanConstraintEngine:
         return 0 <= x < self.cols and 0 <= y < self.rows
 
     def _point_occupied(self, point: Sequence[float]) -> bool:
+        if not (
+            0.0 <= float(point[0]) < self.config.width
+            and 0.0 <= float(point[1]) < self.config.height
+        ):
+            return True
         x, y = self._pixel_to_cell(point)
         return not self._inside_cell(x, y) or bool(self.occupied[y, x])
 
@@ -358,6 +385,13 @@ class FloorplanConstraintEngine:
         outside = 0
         clearance_values: list[float] = []
         for point in samples:
+            if not (
+                0.0 <= float(point[0]) < self.config.width
+                and 0.0 <= float(point[1]) < self.config.height
+            ):
+                outside += 1
+                collisions += 1
+                continue
             x, y = self._pixel_to_cell(point)
             if not self._inside_cell(x, y):
                 outside += 1
@@ -608,15 +642,24 @@ class FloorplanConstraintEngine:
                     # cells are free.
                     continue
                 clearance = float(self.clearance_meters[ny, nx])
-                wall_cost = 0.42 / max(clearance + 0.12, 0.12)
-                raw_cost = 0.055 * float(deviation[ny - min_y, nx - min_x])
-                candidate = cost + step * (1.0 + wall_cost + raw_cost)
+                deviation_meters = (
+                    float(deviation[ny - min_y, nx - min_x]) * self.cell_meters
+                )
+                # Every term is now a dimensionless multiplier of a metric
+                # step. This makes the same physical map substantially
+                # invariant to grid_cell_pixels.
+                wall_multiplier = 0.55 * math.exp(-clearance / 0.45)
+                deviation_multiplier = min(1.5, 0.08 * deviation_meters)
+                step_meters = step * self.cell_meters
+                candidate = cost + step_meters * (
+                    1.0 + wall_multiplier + deviation_multiplier
+                )
                 key = (nx, ny)
                 if candidate >= costs.get(key, float("inf")):
                     continue
                 costs[key] = candidate
                 previous[key] = current
-                heuristic = math.hypot(end[0] - nx, end[1] - ny)
+                heuristic = math.hypot(end[0] - nx, end[1] - ny) * self.cell_meters
                 heappush(queue, (candidate + heuristic, candidate, key))
         # A route around a long machine can leave the first local window.
         # Expand deterministically instead of declaring the plan disconnected.
@@ -684,6 +727,229 @@ class FloorplanConstraintEngine:
         # fraction below.
         return np.asarray(rebuilt, dtype=np.float64), len(merged)
 
+    def _adaptive_anchor_fractions(
+        self, points: np.ndarray, *, maximum: int
+    ) -> np.ndarray:
+        """Place anchors by travelled distance and retain curvature extrema."""
+        if len(points) < 3:
+            return np.linspace(0.0, 1.0, max(2, len(points)))
+        fractions = _trajectory_fractions(points)
+        deltas = np.diff(points[:, :2], axis=0)
+        headings = np.unwrap(np.arctan2(deltas[:, 1], deltas[:, 0]))
+        curvature = np.zeros(len(points), dtype=np.float64)
+        if len(headings) > 1:
+            curvature[1:-1] = np.abs(np.diff(headings))
+        base_count = max(6, min(maximum, int(math.ceil(_polyline_length(points) / max(
+            2.5 / max(self.config.meters_per_pixel, 1e-9), 1.0
+        ))) + 1))
+        selected = set(int(index) for index in np.searchsorted(
+            fractions, np.linspace(0.0, 1.0, base_count)
+        ).clip(0, len(points) - 1))
+        for index in np.argsort(curvature)[::-1]:
+            if curvature[index] < math.radians(3.0):
+                break
+            if all(abs(float(fractions[index] - fractions[item])) >= 0.018 for item in selected):
+                selected.add(int(index))
+            if len(selected) >= maximum:
+                break
+        selected.update((0, len(points) - 1))
+        if len(selected) > maximum:
+            mandatory = {0, len(points) - 1}
+            ranked = sorted(
+                selected - mandatory,
+                key=lambda index: curvature[index],
+                reverse=True,
+            )[: maximum - 2]
+            selected = mandatory | set(ranked)
+        return np.asarray([fractions[index] for index in sorted(selected)], dtype=np.float64)
+
+    def _map_state_candidates(
+        self,
+        observation: np.ndarray,
+        guide: np.ndarray,
+        *,
+        radius_meters: float,
+        limit: int,
+        fixed: bool = False,
+    ) -> np.ndarray:
+        if fixed:
+            cell = self._nearest_free(self._pixel_to_cell(guide))
+            return np.asarray([self._cell_to_pixel(cell)]) if cell is not None else np.empty((0, 2))
+        radius_cells = max(2, int(math.ceil(radius_meters / max(self.cell_meters, 1e-9))))
+        cells: set[tuple[int, int]] = set()
+        for seed in (observation, guide):
+            free = self._nearest_free(self._pixel_to_cell(seed))
+            if free is not None:
+                cells.add(free)
+        centre = np.asarray(self._pixel_to_cell(observation))
+        guide_cell = np.asarray(self._pixel_to_cell(guide))
+        for origin in (centre, guide_cell):
+            samples = np.linspace(-radius_cells, radius_cells, 9).round().astype(int)
+            for dx in samples:
+                for dy in samples:
+                    if dx * dx + dy * dy > radius_cells * radius_cells:
+                        continue
+                    x, y = int(origin[0] + dx), int(origin[1] + dy)
+                    if self._inside_cell(x, y) and not self.occupied[y, x]:
+                        cells.add((x, y))
+        if len(self._corridor_nodes):
+            delta_observation = self._corridor_nodes - centre[None, :]
+            delta_guide = self._corridor_nodes - guide_cell[None, :]
+            nearby = self._corridor_nodes[
+                (np.sum(delta_observation ** 2, axis=1) <= radius_cells ** 2)
+                | (np.sum(delta_guide ** 2, axis=1) <= radius_cells ** 2)
+            ]
+            cells.update((int(item[0]), int(item[1])) for item in nearby)
+        ranked = sorted(cells, key=lambda cell: (
+            min(
+                float(np.linalg.norm(self._cell_to_pixel(cell) - observation)),
+                float(np.linalg.norm(self._cell_to_pixel(cell) - guide)) * 0.85,
+            )
+            - 0.10 * float(self.clearance_meters[cell[1], cell[0]])
+            / max(self.config.meters_per_pixel, 1e-9)
+        ))
+        chosen: list[np.ndarray] = []
+        separation = max(self.config.grid_cell_pixels * 2.0, radius_cells * self.config.grid_cell_pixels * 0.12)
+        for cell in ranked:
+            point = self._cell_to_pixel(cell)
+            if chosen and min(float(np.linalg.norm(point - prior)) for prior in chosen) < separation:
+                continue
+            chosen.append(point)
+            if len(chosen) >= limit:
+                break
+        return np.asarray(chosen, dtype=np.float64)
+
+    def _viterbi_level(
+        self,
+        observation: np.ndarray,
+        guide: np.ndarray,
+        fractions: np.ndarray,
+        *,
+        radius_meters: float,
+        candidate_limit: int,
+    ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+        observed = _resample_polyline(observation, fractions)
+        guided = _resample_polyline(guide, fractions)
+        states = [
+            self._map_state_candidates(
+                observed[index], guided[index], radius_meters=radius_meters,
+                limit=candidate_limit, fixed=index == 0,
+            )
+            for index in range(len(fractions))
+        ]
+        if any(len(layer) == 0 for layer in states):
+            return None, {"reason": "empty_state_layer"}
+        radius_pixels = radius_meters / max(self.config.meters_per_pixel, 1e-9)
+        edge_cache: dict[tuple[int, int, int], float] = {}
+
+        def edge(layer: int, left: int, right: int) -> float:
+            key = (layer, left, right)
+            if key in edge_cache:
+                return edge_cache[key]
+            start, end = states[layer - 1][left], states[layer][right]
+            if self._segment_collides(start, end):
+                value = float("inf")
+            else:
+                visual = observed[layer] - observed[layer - 1]
+                mapped = end - start
+                visual_length = max(float(np.linalg.norm(visual)), 1e-6)
+                mapped_length = max(float(np.linalg.norm(mapped)), 1e-6)
+                cosine = float(np.clip(
+                    np.dot(visual, mapped) / (visual_length * mapped_length), -1.0, 1.0
+                ))
+                value = (
+                    1.35 * abs(math.log(mapped_length / visual_length))
+                    + 1.7 * (1.0 - cosine)
+                )
+            edge_cache[key] = value
+            return value
+
+        costs = np.asarray([
+            0.7 * (float(np.linalg.norm(point - observed[0])) / max(radius_pixels, 1.0)) ** 2
+            for point in states[0]
+        ])
+        parents: list[np.ndarray] = []
+        for layer in range(1, len(states)):
+            next_costs = np.full(len(states[layer]), float("inf"))
+            parent = np.full(len(states[layer]), -1, dtype=np.int32)
+            for right, point in enumerate(states[layer]):
+                emission = 0.7 * (
+                    float(np.linalg.norm(point - observed[layer])) / max(radius_pixels, 1.0)
+                ) ** 2
+                x, y = self._pixel_to_cell(point)
+                emission += 0.08 * math.exp(-float(self.clearance_meters[y, x]) / 0.45)
+                for left, accumulated in enumerate(costs):
+                    transition = edge(layer, left, right)
+                    value = float(accumulated) + transition + emission
+                    if value < next_costs[right]:
+                        next_costs[right] = value
+                        parent[right] = left
+            if not np.isfinite(next_costs).any():
+                return None, {"reason": "corridor_graph_disconnected", "failed_layer": layer}
+            parents.append(parent)
+            costs = next_costs
+        ranking = np.argsort(costs)
+        state_index = int(ranking[0])
+        indices = [state_index]
+        for parent in reversed(parents):
+            state_index = int(parent[state_index])
+            indices.append(state_index)
+        indices.reverse()
+        path = np.asarray([states[layer][indices[layer]] for layer in range(len(states))])
+        margin = (
+            float(costs[ranking[1]] - costs[ranking[0]]) if len(ranking) > 1 else None
+        )
+        return path, {
+            "reason": None,
+            "objective": round(float(costs[ranking[0]]), 6),
+            "margin": round(margin, 6) if margin is not None else None,
+            "anchors": len(fractions),
+            "states_min": min(len(layer) for layer in states),
+            "states_max": max(len(layer) for layer in states),
+            "implicit_edges_evaluated": len(edge_cache),
+        }
+
+    def _multilevel_viterbi_map_match(
+        self, observation: np.ndarray, baseline: np.ndarray
+    ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "attempted": True,
+            "accepted": False,
+            "method": "corridor_graph_multilevel_viterbi_v2",
+            "corridor_graph_nodes": int(len(self._corridor_nodes)),
+        }
+        coarse_fractions = self._adaptive_anchor_fractions(observation, maximum=14)
+        coarse, coarse_diag = self._viterbi_level(
+            observation, baseline, coarse_fractions,
+            radius_meters=12.0, candidate_limit=18,
+        )
+        diagnostics["coarse"] = coarse_diag
+        if coarse is None:
+            diagnostics["reason"] = coarse_diag.get("reason")
+            return None, diagnostics
+        fine_fractions = self._adaptive_anchor_fractions(observation, maximum=36)
+        fine_guide = _resample_polyline(coarse, _trajectory_fractions(baseline))
+        fine, fine_diag = self._viterbi_level(
+            observation, fine_guide, fine_fractions,
+            radius_meters=4.0, candidate_limit=14,
+        )
+        diagnostics["fine"] = fine_diag
+        if fine is None:
+            diagnostics["reason"] = fine_diag.get("reason")
+            return None, diagnostics
+        source_fraction = _trajectory_fractions(observation)
+        fine_observed = _resample_polyline(observation, fine_fractions)
+        correction = fine - fine_observed
+        warped = observation.copy()
+        warped[:, 0] += np.interp(source_fraction, fine_fractions, correction[:, 0])
+        warped[:, 1] += np.interp(source_fraction, fine_fractions, correction[:, 1])
+        repaired, reroutes = self._repair_collisions(warped)
+        if repaired is None or self._collision_runs(repaired):
+            diagnostics["reason"] = "dense_reconstruction_not_safe"
+            return None, diagnostics
+        diagnostics.update({"reason": None, "post_repair_segments": int(reroutes)})
+        return repaired, diagnostics
+
     def align(
         self,
         trajectory: Any,
@@ -697,7 +963,7 @@ class FloorplanConstraintEngine:
     ) -> dict[str, Any]:
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v2_gip",
+            "engine": "floorplan_constraint_engine_v4_multilevel_hmm",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -837,6 +1103,56 @@ class FloorplanConstraintEngine:
         length_ratio = float(best["length_ratio"])
         rerouted_segments = int(best["rerouted_segments"])
         p95_correction = float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
+        nonlinear_diagnostics: dict[str, Any] = {
+            "attempted": False,
+            "accepted": False,
+            "method": "corridor_graph_multilevel_viterbi_v2",
+            "reason": "global_solution_stable",
+        }
+        if rerouted_segments > 0 or p95_correction > 2.0:
+            nonlinear, nonlinear_diagnostics = self._multilevel_viterbi_map_match(
+                best["points"], repaired
+            )
+            if nonlinear is not None:
+                nonlinear_matched = _resample_polyline(
+                    nonlinear, _trajectory_fractions(best["points"])
+                )
+                nonlinear_displacement = (
+                    np.linalg.norm(nonlinear_matched - best["points"], axis=1)
+                    * self.config.meters_per_pixel
+                )
+                nonlinear_p95 = float(np.percentile(nonlinear_displacement, 95))
+                nonlinear_length_ratio = _polyline_length(nonlinear) / max(
+                    _polyline_length(best["points"]), 1e-9
+                )
+                improves = (
+                    nonlinear_p95 <= p95_correction * 0.97
+                    or abs(math.log(max(nonlinear_length_ratio, 1e-9)))
+                    < abs(math.log(max(length_ratio, 1e-9))) * 0.92
+                )
+                bounded = (
+                    nonlinear_p95 <= p95_correction + 0.75
+                    and 0.55 <= nonlinear_length_ratio <= 1.85
+                    and not self._collision_runs(nonlinear)
+                    and self._path_metrics(nonlinear)["outside_ratio"] == 0.0
+                )
+                nonlinear_diagnostics.update({
+                    "correction_p95_before_meters": round(p95_correction, 3),
+                    "correction_p95_after_meters": round(nonlinear_p95, 3),
+                    "length_ratio_before": round(length_ratio, 5),
+                    "length_ratio_after": round(nonlinear_length_ratio, 5),
+                })
+                if improves and bounded:
+                    repaired = nonlinear
+                    corrected_metrics = self._path_metrics(repaired)
+                    displacement_m = nonlinear_displacement
+                    p95_correction = nonlinear_p95
+                    length_ratio = nonlinear_length_ratio
+                    nonlinear_diagnostics["accepted"] = True
+                    nonlinear_diagnostics["reason"] = None
+                else:
+                    nonlinear_diagnostics["accepted"] = False
+                    nonlinear_diagnostics["reason"] = "safe_baseline_not_improved"
         allowed_correction = max(
             4.0,
             min(12.0, float(best["length_meters"]) * 0.18),
@@ -869,6 +1185,7 @@ class FloorplanConstraintEngine:
             0.0,
             1.0,
         ))
+        probability_correct, calibration = calibrated_probability(confidence)
         diagnostics = {
             **base_diagnostics,
             "accepted": True,
@@ -899,7 +1216,15 @@ class FloorplanConstraintEngine:
             "hypothesis_score": round(float(best["score"]), 6),
             "constrained_score": round(float(best["constrained_score"]), 6),
             "runner_up_margin": round(margin, 6),
+            "nonlinear_map_matching": nonlinear_diagnostics,
+            # Kept for API compatibility; semantically this is a quality score.
             "confidence": round(confidence, 4),
+            "quality_score": round(confidence, 4),
+            "probability_correct": (
+                round(probability_correct, 4)
+                if probability_correct is not None else None
+            ),
+            "confidence_calibration": calibration,
             "coordinate_convention": "plan_pixels_x_right_y_down",
         }
         output = [
@@ -924,6 +1249,9 @@ def _map_turn_points(
     turns: Any,
     source: Any,
     mapped: list[list[float]],
+    *,
+    meters_per_pixel: float,
+    timestamps: Any = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(turns, list) or not mapped:
         return []
@@ -941,11 +1269,47 @@ def _map_turn_points(
         source_index = max(0, min(len(source_points) - 1, source_index))
         turn_fraction = float(source_fractions[source_index])
         mapped_index = int(np.argmin(np.abs(mapped_fractions - turn_fraction)))
+        approach_source = max(0, min(
+            len(source_points) - 1,
+            int(round(_finite_float(item.get("approach_index"), source_index))),
+        ))
+        exit_source = max(approach_source, min(
+            len(source_points) - 1,
+            int(round(_finite_float(item.get("exit_index"), source_index))),
+        ))
+        approach_mapped = int(np.argmin(np.abs(
+            mapped_fractions - float(source_fractions[approach_source])
+        )))
+        exit_mapped = int(np.argmin(np.abs(
+            mapped_fractions - float(source_fractions[exit_source])
+        )))
+        local_length_meters = (
+            _polyline_length(mapped_points[approach_mapped:exit_mapped + 1])
+            * meters_per_pixel
+        )
+        angle = abs(_finite_float(
+            item.get("geometry_angle_degrees", item.get("angle_degrees")), 0.0
+        ))
+        duration_seconds = None
+        if isinstance(timestamps, list) and len(timestamps) == len(source_points):
+            start_time = _finite_float(timestamps[approach_source], math.nan)
+            end_time = _finite_float(timestamps[exit_source], math.nan)
+            if math.isfinite(start_time) and math.isfinite(end_time) and end_time > start_time:
+                duration_seconds = end_time - start_time
         result.append({
             **item,
             "trajectory_index": mapped_index,
             "position": mapped[mapped_index],
             "map_constrained": True,
+            "map_turn_arc_meters": round(local_length_meters, 4),
+            "map_curvature_degrees_per_meter": (
+                round(angle / local_length_meters, 4)
+                if local_length_meters > 1e-6 else None
+            ),
+            "map_yaw_rate_degrees_per_second": (
+                round(angle / duration_seconds, 4)
+                if duration_seconds is not None else None
+            ),
         })
     return result
 
@@ -1115,7 +1479,7 @@ def apply_floorplan_constraints(
             "accepted": False,
             "trajectory": [],
             "diagnostics": {
-                "engine": "floorplan_constraint_engine_v2_gip",
+                "engine": "floorplan_constraint_engine_v4_multilevel_hmm",
                 "map_id": map_id,
                 "accepted": False,
                 "reason": "engine_error",
@@ -1136,10 +1500,26 @@ def apply_floorplan_constraints(
         # R3 turn indices have no valid correspondence to an independent
         # LingBot trajectory and would create authoritative-looking false turns.
         source_turns = [] if selected_observation_source == "lingbot_independent" else result.get("turn_points")
-        map_turns = _map_turn_points(source_turns, selected_points, mapped)
+        selected_timestamps = (
+            candidate_payload.get("lingbot_source_timestamps_seconds")
+            if selected_observation_source == "lingbot_independent"
+            and isinstance(candidate_payload, dict)
+            else source_timestamps
+        )
+        map_turns = _map_turn_points(
+            source_turns,
+            selected_points,
+            mapped,
+            meters_per_pixel=engine.config.meters_per_pixel,
+            timestamps=selected_timestamps,
+        )
         updated["map_trajectory"] = mapped
         updated["map_turn_points"] = map_turns
-        updated["final_turn_points"] = map_turns or result.get("turn_points") or []
+        updated["final_turn_points"] = (
+            []
+            if selected_observation_source == "lingbot_independent"
+            else (map_turns or result.get("turn_points") or [])
+        )
         map_distance = (
             _finite_float(diagnostics.get("estimated_length_meters"))
             * _finite_float(diagnostics.get("length_ratio"), 1.0)

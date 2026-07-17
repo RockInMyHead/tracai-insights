@@ -114,17 +114,29 @@ def _lingbot_plan_projection(lingbot_result: dict[str, Any]) -> tuple[np.ndarray
     }
 
 
-def _resample_by_parameter(points: np.ndarray, count: int, parameter: np.ndarray) -> np.ndarray:
+def _resample_by_parameter(
+    points: np.ndarray,
+    count: int,
+    parameter: np.ndarray,
+    target_parameter: Optional[np.ndarray] = None,
+) -> np.ndarray:
     if len(points) == 0 or count <= 0:
         return np.empty((0, 2), dtype=np.float64)
     if len(points) == 1:
         return np.repeat(points, count, axis=0)
     source_t = np.asarray(parameter, dtype=np.float64)
+    source_start = float(source_t[0]) if len(source_t) else 0.0
+    source_end = float(source_t[-1]) if len(source_t) else 1.0
     if len(source_t) != len(points) or float(np.ptp(source_t)) <= 1e-12:
         source_t = np.linspace(0.0, 1.0, len(points))
     else:
         source_t = (source_t - source_t[0]) / max(float(source_t[-1] - source_t[0]), 1e-12)
-    target_t = np.linspace(0.0, 1.0, count)
+    if target_parameter is not None and len(target_parameter) == count:
+        target_t = np.asarray(target_parameter, dtype=np.float64)
+        target_t = (target_t - source_start) / max(source_end - source_start, 1e-12)
+        target_t = np.clip(target_t, 0.0, 1.0)
+    else:
+        target_t = np.linspace(0.0, 1.0, count)
     return np.column_stack([
         np.interp(target_t, source_t, points[:, axis])
         for axis in range(2)
@@ -176,7 +188,9 @@ def _correspond(
                 offset = float(r3[0] - lb[0] * scale)
                 mapped = lb * scale + offset
                 mapped = np.clip(mapped, float(r3[0]), float(r3[-1]))
-                return _resample_by_parameter(lingbot, count, mapped), "timestamp_offset"
+                return _resample_by_parameter(
+                    lingbot, count, mapped, target_parameter=r3
+                ), "timestamp_offset"
     return _resample_by_parameter(
         lingbot, count, _arc_length_parameter(lingbot)
     ), "arc_length"

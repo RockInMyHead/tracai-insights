@@ -869,17 +869,33 @@ def _curvature_turn_events(
     plan_points: np.ndarray,
     headings: np.ndarray,
     half_window: int,
+    source_timestamps: Sequence[float | None] | None = None,
 ) -> tuple[list[dict[str, Any]], np.ndarray, float]:
-    """Split sign-consistent curvature into distinct physical turn events."""
+    """Split turns using yaw per travelled distance and, when known, time."""
     rates = _smoothed_heading_rates(headings)
     if rates.size == 0:
         return [], rates, 0.35
+    distances = np.linalg.norm(np.diff(plan_points[:, :2], axis=0), axis=1)
+    moving = distances[np.isfinite(distances) & (distances > 1e-9)]
+    distance_unit = float(np.median(moving)) if moving.size else 1.0
+    normalized_distance = np.maximum(distances / max(distance_unit, 1e-9), 0.15)
+    curvature_rates = rates / normalized_distance
+    yaw_rates = np.full(len(rates), np.nan, dtype=np.float64)
+    if source_timestamps is not None and len(source_timestamps) == len(plan_points):
+        timestamps = np.asarray([
+            float(value) if value is not None else np.nan
+            for value in source_timestamps
+        ], dtype=np.float64)
+        dt = np.diff(timestamps)
+        valid_dt = np.isfinite(dt) & (dt > 1e-4) & (dt < 10.0)
+        yaw_rates[valid_dt] = rates[valid_dt] / dt[valid_dt]
 
-    # 0.35 degrees per selected pose still finds a 20-degree R3 arc spread
-    # over many frames.  The minimum accumulated event angle below rejects
-    # isolated sub-degree pose noise.
+    # Curvature is degrees per median travelled step, so subdividing the same
+    # physical route into more poses does not make a gradual turn disappear.
     rate_threshold = 0.35
-    signs = np.where(rates >= rate_threshold, 1, np.where(rates <= -rate_threshold, -1, 0))
+    active = np.abs(curvature_rates) >= rate_threshold
+    active |= np.isfinite(yaw_rates) & (np.abs(yaw_rates) >= 3.0)
+    signs = np.where(active, np.sign(rates).astype(np.int8), 0)
     if len(signs) >= 3:
         for index in range(1, len(signs) - 1):
             if signs[index - 1] == signs[index + 1] != 0 and signs[index] != signs[index - 1]:
@@ -889,11 +905,13 @@ def _curvature_turn_events(
     start: int | None = None
     last_active = -1
     active_sign = 0
-    allowed_gap = max(2, half_window)
+    cumulative_distance = np.concatenate(([0.0], np.cumsum(distances)))
+    allowed_gap_distance = max(2.5, float(half_window)) * distance_unit
     for index, sign_value in enumerate(signs):
         sign = int(sign_value)
         if sign == 0:
-            if start is not None and index - last_active > allowed_gap:
+            gap_distance = cumulative_distance[index] - cumulative_distance[last_active]
+            if start is not None and gap_distance > allowed_gap_distance:
                 raw_groups.append((start, last_active, active_sign))
                 start = None
                 active_sign = 0
@@ -915,12 +933,13 @@ def _curvature_turn_events(
     # Reconnect fragments of one rounded corner, while keeping real corners
     # separated by the longer low-curvature straight between them.
     merged_groups: list[tuple[int, int, int]] = []
-    merge_gap = max(3, half_window * 2)
+    merge_gap_distance = max(4.0, half_window * 2.0) * distance_unit
     for group in raw_groups:
         if (
             merged_groups
             and merged_groups[-1][2] == group[2]
-            and group[0] - merged_groups[-1][1] <= merge_gap
+            and cumulative_distance[group[0]]
+            - cumulative_distance[merged_groups[-1][1]] <= merge_gap_distance
         ):
             previous = merged_groups[-1]
             merged_groups[-1] = (previous[0], group[1], previous[2])
@@ -971,6 +990,14 @@ def _curvature_turn_events(
             "support": float(event_steps.sum()) if event_steps.size else 0.0,
             "before_concentration": before_concentration,
             "after_concentration": after_concentration,
+            "peak_curvature_degrees_per_distance_unit": float(
+                np.max(np.abs(curvature_rates[rate_start:rate_end + 1]))
+            ),
+            "peak_yaw_rate_degrees_per_second": (
+                float(np.nanmax(np.abs(yaw_rates[rate_start:rate_end + 1])))
+                if np.isfinite(yaw_rates[rate_start:rate_end + 1]).any()
+                else None
+            ),
         })
     return events, rates, rate_threshold
 
@@ -991,6 +1018,7 @@ def _detect_turns(
         plan_points,
         local_headings,
         half_window,
+        source_timestamps,
     )
     camera_headings, camera_diagnostics = _camera_heading_signal(rotations, plan_points, floor_basis)
 
@@ -1003,7 +1031,10 @@ def _detect_turns(
         candidate["event_angle"] = candidate["angle"]
         candidate["angle_source"] = "trajectory_curvature"
         candidate["orientation_angle"] = None
-        if not camera_diagnostics["available"]:
+        if not (
+            camera_diagnostics["available"]
+            and camera_diagnostics["reliable"]
+        ):
             continue
         anchor_window = max(3, half_window)
         before, before_concentration = _mean_heading(
@@ -1090,6 +1121,14 @@ def _detect_turns(
                 else None
             ),
             "span_points": int(candidate["span"]),
+            "peak_curvature_degrees_per_distance_unit": round(
+                float(candidate["peak_curvature_degrees_per_distance_unit"]), 4
+            ),
+            "peak_yaw_rate_degrees_per_second": (
+                round(float(candidate["peak_yaw_rate_degrees_per_second"]), 4)
+                if candidate["peak_yaw_rate_degrees_per_second"] is not None
+                else None
+            ),
             "approach_index": int(candidate["start"]),
             "exit_index": int(candidate["end"]),
         })

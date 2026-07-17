@@ -5,6 +5,7 @@ import numpy as np
 
 from backend.floorplan_constraints import (
     FloorplanConstraintEngine,
+    _trajectory_fractions,
     apply_floorplan_constraints,
     get_floorplan_engine,
 )
@@ -285,6 +286,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             "fragmented_r3_uses_independent_lingbot",
         )
         self.assertEqual(updated["map_turn_points"], [])
+        self.assertEqual(updated["final_turn_points"], [])
 
     def test_fragmented_r3_refuses_low_quality_independent(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
@@ -368,6 +370,32 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(len(points), 2)
         self.assertTrue(np.allclose(points[0], [1.0, 2.0]))
         self.assertTrue(np.allclose(points[1], [4.0, 5.0]))
+
+    def test_partial_grid_padding_outside_pdf_is_occupied(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((5, 5), dtype=bool), grid_cell_pixels=4, meters_per_pixel=1.0
+        )
+        self.assertTrue(engine._point_occupied([6.0, 2.0]))
+        self.assertGreater(engine._path_metrics(np.asarray([[2.0, 2.0], [6.0, 2.0]]))["outside_ratio"], 0.0)
+
+    def test_adaptive_anchors_retain_corner(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(np.zeros((100, 100), dtype=bool))
+        points = np.asarray([[float(x), 20.0] for x in range(10, 60)] + [[59.0, float(y)] for y in range(21, 80)])
+        fractions = engine._adaptive_anchor_fractions(points, maximum=12)
+        corner_fraction = float(_trajectory_fractions(points)[49])
+        self.assertLess(float(np.min(np.abs(fractions - corner_fraction))), 0.02)
+
+    def test_multilevel_viterbi_uses_doorway(self) -> None:
+        mask = np.zeros((120, 180), dtype=bool)
+        mask[:, 88:94] = True
+        mask[16:34, 88:94] = False
+        engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
+        observed = np.asarray([[20.0, 60.0], [50.0, 60.0], [80.0, 60.0], [110.0, 60.0], [140.0, 60.0], [160.0, 60.0]])
+        baseline, _ = engine._repair_collisions(observed)
+        matched, diagnostics = engine._multilevel_viterbi_map_match(observed, baseline)
+        self.assertIsNotNone(matched, diagnostics)
+        self.assertEqual(engine._collision_runs(matched), [])
+        self.assertGreater(diagnostics["corridor_graph_nodes"], 0)
 
 
 if __name__ == "__main__":
