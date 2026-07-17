@@ -1,10 +1,17 @@
-"""Guarded R3 + LingBot trajectory fusion.
+"""Guarded R3 + LingBot trajectory fusion (Geometry Integrity Stack).
 
 LingBot is an independent streaming reconstruction observer.  It is never
 allowed to overwrite R3 merely because it produced poses: both trajectories
 are first aligned by a proper (non-reflecting) 2-D similarity and compared over
 the complete video.  Only geometrically consistent observations produce a
 fusion candidate; the immutable floor plan makes the final source selection.
+
+Geometry Integrity Protocol (GIP) invariants:
+- Explicit plan coordinates never silently reflect; PCA may choose a Y-sign.
+- Chirality is evaluated on the native (unmirrored) path for explicit sources.
+- Independent fallback carries the selected polarity and a real quality gate.
+- Correspondence prefers timestamps, otherwise arc-length (never fake "time").
+- Fused endpoints stay anchored to R3.
 """
 
 from __future__ import annotations
@@ -13,6 +20,8 @@ import math
 from typing import Any, Optional
 
 import numpy as np
+
+METHOD_TAG = "robust_similarity_confidence_blend_v3_gip"
 
 
 def _finite_points(value: Any) -> np.ndarray:
@@ -52,13 +61,34 @@ def _finite_points_3d(value: Any) -> np.ndarray:
     return np.asarray(points, dtype=np.float64)
 
 
+def _finite_timestamps(value: Any) -> Optional[np.ndarray]:
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    raw = np.asarray(
+        [
+            float(item) if item is not None else math.nan
+            for item in value
+        ],
+        dtype=np.float64,
+    )
+    finite = np.flatnonzero(np.isfinite(raw))
+    if len(finite) < 2:
+        return None
+    if len(finite) < len(raw):
+        raw = np.interp(np.arange(len(raw)), finite, raw[finite])
+    if float(np.ptp(raw)) <= 1e-9:
+        return None
+    return raw
+
+
 def _lingbot_plan_projection(lingbot_result: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
     """Project a 3-D camera path onto its dominant motion plane.
 
     LingBot exports XYZ camera centres.  Its first two coordinates are not a
     guaranteed floor plane, so using them directly can collapse one direction
-    of a production route.  PCA is sign-ambiguous; the fusion stage evaluates
-    both signs of the second axis without ever reflecting the final similarity.
+    of a production route.  PCA is sign-ambiguous; only PCA provenance may
+    choose a Y-sign later.  Explicit plan trajectories keep their producer
+    handedness.
     """
     explicit = _finite_points(lingbot_result.get("plan_trajectory"))
     if len(explicit) >= 2:
@@ -84,12 +114,16 @@ def _lingbot_plan_projection(lingbot_result: dict[str, Any]) -> tuple[np.ndarray
     }
 
 
-def _resample_by_time(points: np.ndarray, count: int) -> np.ndarray:
+def _resample_by_parameter(points: np.ndarray, count: int, parameter: np.ndarray) -> np.ndarray:
     if len(points) == 0 or count <= 0:
         return np.empty((0, 2), dtype=np.float64)
     if len(points) == 1:
         return np.repeat(points, count, axis=0)
-    source_t = np.linspace(0.0, 1.0, len(points))
+    source_t = np.asarray(parameter, dtype=np.float64)
+    if len(source_t) != len(points) or float(np.ptp(source_t)) <= 1e-12:
+        source_t = np.linspace(0.0, 1.0, len(points))
+    else:
+        source_t = (source_t - source_t[0]) / max(float(source_t[-1] - source_t[0]), 1e-12)
     target_t = np.linspace(0.0, 1.0, count)
     return np.column_stack([
         np.interp(target_t, source_t, points[:, axis])
@@ -97,10 +131,118 @@ def _resample_by_time(points: np.ndarray, count: int) -> np.ndarray:
     ])
 
 
+def _arc_length_parameter(points: np.ndarray) -> np.ndarray:
+    if len(points) == 0:
+        return np.empty(0, dtype=np.float64)
+    if len(points) == 1:
+        return np.asarray([0.0], dtype=np.float64)
+    distances = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(distances)))
+    total = float(cumulative[-1])
+    if total <= 1e-12:
+        return np.linspace(0.0, 1.0, len(points))
+    return cumulative / total
+
+
+def _correspond(
+    lingbot: np.ndarray,
+    count: int,
+    lingbot_timestamps: Optional[np.ndarray],
+    r3_timestamps: Optional[np.ndarray],
+) -> tuple[np.ndarray, str]:
+    """Register LingBot samples onto the R3 sample count.
+
+    Prefer overlapping timestamps with a fitted offset.  Otherwise use
+    arc-length parameterization.  Index linspace is never advertised as time.
+    """
+    if len(lingbot) == 0 or count <= 0:
+        return np.empty((0, 2), dtype=np.float64), "unavailable"
+    if (
+        lingbot_timestamps is not None
+        and r3_timestamps is not None
+        and len(lingbot_timestamps) == len(lingbot)
+        and len(r3_timestamps) == count
+    ):
+        lb = lingbot_timestamps.astype(np.float64)
+        r3 = r3_timestamps.astype(np.float64)
+        # Fit a constant offset that maximises overlap of normalised intervals.
+        lb_span = float(lb[-1] - lb[0])
+        r3_span = float(r3[-1] - r3[0])
+        if lb_span > 1e-9 and r3_span > 1e-9:
+            scale = r3_span / lb_span
+            # Keep scale near 1 when both cover the same video; otherwise fall
+            # back to pure arc-length rather than inventing a stretch model.
+            if 0.75 <= scale <= 1.35:
+                offset = float(r3[0] - lb[0] * scale)
+                mapped = lb * scale + offset
+                mapped = np.clip(mapped, float(r3[0]), float(r3[-1]))
+                return _resample_by_parameter(lingbot, count, mapped), "timestamp_offset"
+    return _resample_by_parameter(
+        lingbot, count, _arc_length_parameter(lingbot)
+    ), "arc_length"
+
+
 def _polyline_length(points: np.ndarray) -> float:
     if len(points) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+def _spatial_span(points: np.ndarray) -> float:
+    if len(points) == 0:
+        return 0.0
+    return float(np.linalg.norm(np.ptp(points, axis=0)))
+
+
+def _effective_rank(points: np.ndarray) -> tuple[float, float]:
+    if len(points) < 2:
+        return 0.0, 0.0
+    centered = points - np.median(points, axis=0)
+    try:
+        _, singular_values, _ = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return 0.0, 0.0
+    if len(singular_values) == 0:
+        return 0.0, 0.0
+    primary = float(singular_values[0])
+    secondary = float(singular_values[1]) if len(singular_values) > 1 else 0.0
+    condition = secondary / max(primary, 1e-12)
+    rank = 2.0 if condition >= 0.02 else (1.0 if primary > 1e-9 else 0.0)
+    return rank, condition
+
+
+def _independent_quality(
+    lingbot: np.ndarray,
+    projection: dict[str, Any],
+) -> dict[str, Any]:
+    span = _spatial_span(lingbot)
+    length = _polyline_length(lingbot)
+    rank, condition = _effective_rank(lingbot)
+    plane_ratio = float(projection.get("explained_motion_plane_ratio") or 1.0)
+    method = str(projection.get("method") or "")
+    reasons: list[str] = []
+    if len(lingbot) < 6:
+        reasons.append("too_few_points")
+    if span < 1e-3:
+        reasons.append("degenerate_span")
+    if length < 1e-3:
+        reasons.append("degenerate_path_length")
+    if rank < 1.0:
+        reasons.append("rank_deficient")
+    if method == "pca_motion_plane" and plane_ratio < 0.92:
+        reasons.append("nonplanar_motion")
+    if method in {"unavailable", "pca_failed"}:
+        reasons.append("projection_unavailable")
+    return {
+        "accepted": not reasons,
+        "reasons": reasons,
+        "point_count": int(len(lingbot)),
+        "spatial_span": round(span, 8),
+        "path_length": round(length, 8),
+        "effective_rank": round(rank, 4),
+        "secondary_condition": round(condition, 8),
+        "plane_energy_ratio": round(plane_ratio, 8),
+    }
 
 
 def _weighted_similarity(
@@ -200,6 +342,27 @@ def _confidence_weights(values: Any, count: int) -> np.ndarray:
     )
 
 
+def _trajectory_list(points: np.ndarray) -> list[list[float]]:
+    return [
+        [round(float(point[0]), 8), round(float(point[1]), 8), 0.0]
+        for point in points
+    ]
+
+
+def should_restore_lingbot_fusion_candidate(
+    candidate: Any,
+    *,
+    requested_source: str,
+    saved_source: str,
+) -> bool:
+    """Persist fused *or* independent-quality candidates across API refresh."""
+    if not isinstance(candidate, dict):
+        return False
+    if requested_source != saved_source:
+        return False
+    return bool(candidate.get("accepted") or candidate.get("independent_accepted"))
+
+
 def build_lingbot_fusion_candidate(
     r3_result: dict[str, Any],
     lingbot_result: dict[str, Any],
@@ -207,48 +370,150 @@ def build_lingbot_fusion_candidate(
     """Return a guarded fusion candidate in the R3 plan coordinate system."""
     r3 = _finite_points(r3_result.get("plan_trajectory") or r3_result.get("trajectory"))
     lingbot, projection = _lingbot_plan_projection(lingbot_result)
+    quality = _independent_quality(lingbot, projection)
+    r3_timestamps = _finite_timestamps(
+        r3_result.get("r3_source_timestamps_seconds")
+        or r3_result.get("source_timestamps_seconds")
+    )
+    lingbot_timestamps = _finite_timestamps(
+        lingbot_result.get("lingbot_source_timestamps_seconds")
+        or lingbot_result.get("source_timestamps_seconds")
+    )
     diagnostics: dict[str, Any] = {
-        "method": "robust_similarity_confidence_blend_v2",
+        "method": METHOD_TAG,
         "accepted": False,
         "r3_points": int(len(r3)),
         "lingbot_points": int(len(lingbot)),
         "lingbot_projection": projection,
+        "independent_quality": quality,
+        "selected_sign": 1.0,
+        "reflection_applied": False,
+        "composite_det": 1.0,
+        "correspondence_mode": "unavailable",
     }
-    independent = [
-        [round(float(point[0]), 8), round(float(point[1]), 8), 0.0]
-        for point in lingbot
-    ]
+    selected_sign = 1.0
+    signed_lingbot = lingbot.copy() if len(lingbot) else lingbot
 
-    def rejected(reason: str) -> dict[str, Any]:
+    def emit_independent() -> tuple[bool, list[list[float]]]:
+        accepted = bool(quality["accepted"]) and len(signed_lingbot) >= 6
+        trajectory = _trajectory_list(signed_lingbot) if accepted else []
+        return accepted, trajectory
+
+    def rejected(reason: str, *, revoke_independent: bool = False) -> dict[str, Any]:
+        nonlocal quality
+        if revoke_independent:
+            quality = dict(quality)
+            quality["accepted"] = False
+            reasons = list(quality.get("reasons") or [])
+            if reason not in reasons:
+                reasons.append(reason)
+            quality["reasons"] = reasons
+            diagnostics["independent_quality"] = quality
+        independent_accepted, independent_traj = emit_independent()
         diagnostics["reason"] = reason
-        diagnostics["independent_accepted"] = len(independent) >= 6
-        return {
+        diagnostics["independent_accepted"] = independent_accepted
+        payload = {
             "accepted": False,
             "plan_trajectory": [],
-            "independent_accepted": len(independent) >= 6,
-            "independent_plan_trajectory": independent if len(independent) >= 6 else [],
+            "independent_accepted": independent_accepted,
+            "independent_plan_trajectory": independent_traj,
             "diagnostics": diagnostics,
         }
+        if lingbot_timestamps is not None and independent_accepted:
+            payload["lingbot_source_timestamps_seconds"] = [
+                round(float(value), 6) for value in lingbot_timestamps
+            ]
+        return payload
+
     if len(r3) < 6 or len(lingbot) < 6:
         return rejected("trajectory_too_short")
 
-    lingbot_resampled = _resample_by_time(lingbot, len(r3))
-    variants = (lingbot_resampled, lingbot_resampled * np.asarray([1.0, -1.0]))
-    fitted = [(variant, _robust_similarity(variant, r3)) for variant in variants]
-    fitted = [(variant, fit) for variant, fit in fitted if fit is not None]
+    lingbot_resampled, correspondence_mode = _correspond(
+        lingbot, len(r3), lingbot_timestamps, r3_timestamps
+    )
+    diagnostics["correspondence_mode"] = correspondence_mode
+
+    provenance = str(projection.get("method") or "")
+    allow_pca_sign = provenance == "pca_motion_plane"
+    variants: list[tuple[float, np.ndarray, str]] = [
+        (1.0, lingbot_resampled, "native"),
+    ]
+    if allow_pca_sign:
+        variants.append((-1.0, lingbot_resampled * np.asarray([1.0, -1.0]), "pca_y_sign"))
+    else:
+        # Declared adapter only — never selected silently for explicit coords.
+        variants.append(
+            (-1.0, lingbot_resampled * np.asarray([1.0, -1.0]), "coordinate_adapter_y_flip")
+        )
+
+    fitted: list[tuple[float, np.ndarray, str, tuple[float, np.ndarray, np.ndarray, np.ndarray]]] = []
+    for sign, variant, label in variants:
+        fit = _robust_similarity(variant, r3)
+        if fit is not None:
+            fitted.append((sign, variant, label, fit))
     if not fitted:
         return rejected("similarity_fit_failed")
-    lingbot_resampled, fit = min(
-        fitted, key=lambda item: float(np.median(item[1][3]))  # type: ignore[index]
-    )
-    if fit is None:
+
+    # Native chirality uses the unmirrored path after a proper similarity.
+    native_entries = [item for item in fitted if item[0] > 0.0]
+    if not native_entries:
         return rejected("similarity_fit_failed")
-    scale, rotation, translation, _ = fit
-    aligned = scale * (lingbot_resampled @ rotation) + translation
-    residuals = np.linalg.norm(aligned - r3, axis=1)
-    # Full polyline length can hide large disagreement on looping routes. Use
-    # the spatial extent with only a bounded contribution from travelled
-    # length so a many-lap trajectory does not make every residual look tiny.
+    native_sign, native_variant, native_label, native_fit = native_entries[0]
+    native_aligned = native_fit[0] * (native_variant @ native_fit[1]) + native_fit[2]
+    r3_turn = _signed_turn_radians(r3)
+    native_lingbot_turn = _signed_turn_radians(native_aligned)
+    chirality_conflict = (
+        abs(r3_turn) >= math.radians(25.0)
+        and abs(native_lingbot_turn) >= math.radians(25.0)
+        and r3_turn * native_lingbot_turn < 0.0
+    )
+    diagnostics.update({
+        "r3_signed_turn_degrees": round(math.degrees(r3_turn), 3),
+        "lingbot_signed_turn_degrees": round(math.degrees(native_lingbot_turn), 3),
+        "chirality_conflict": chirality_conflict,
+        "native_hypothesis": native_label,
+    })
+    adapter_entries = [item for item in fitted if item[2] == "coordinate_adapter_y_flip"]
+    if adapter_entries:
+        diagnostics["adapter_y_flip_median_residual"] = round(
+            float(np.median(adapter_entries[0][3][3])), 8
+        )
+
+    # Explicit sources: chirality veto blocks fusion and independent fallback.
+    # PCA Y-sign is gauge freedom, so chirality is evaluated after sign choice.
+    if chirality_conflict and not allow_pca_sign:
+        return rejected("turn_chirality_conflict", revoke_independent=True)
+
+    if allow_pca_sign:
+        # Choose the lower residual among native / PCA sign. Chirality on the
+        # selected signed path must still agree when both turns are large.
+        selected_sign, lingbot_resampled, selected_label, fit = min(
+            fitted,
+            key=lambda item: float(np.median(item[3][3])),
+        )
+        aligned = fit[0] * (lingbot_resampled @ fit[1]) + fit[2]
+        selected_turn = _signed_turn_radians(aligned)
+        selected_chirality_conflict = (
+            abs(r3_turn) >= math.radians(25.0)
+            and abs(selected_turn) >= math.radians(25.0)
+            and r3_turn * selected_turn < 0.0
+        )
+        diagnostics["lingbot_signed_turn_degrees"] = round(math.degrees(selected_turn), 3)
+        diagnostics["chirality_conflict"] = selected_chirality_conflict
+        if selected_chirality_conflict:
+            return rejected("turn_chirality_conflict", revoke_independent=True)
+    else:
+        # Explicit: only the native proper hypothesis may be accepted. The
+        # adapter flip remains diagnostic so silent reflection cannot invent
+        # chirality agreement.
+        selected_sign, lingbot_resampled, selected_label, fit = native_sign, native_variant, native_label, native_fit
+        aligned = native_aligned
+
+    scale, rotation, translation, residuals = fit
+    signed_lingbot = lingbot * np.asarray([1.0, selected_sign], dtype=np.float64)
+    reflection_applied = selected_sign < 0.0
+    composite_det = float(np.linalg.det(rotation)) * float(selected_sign)
+
     reference_length = max(
         _polyline_length(r3) * 0.40,
         float(np.linalg.norm(np.ptp(r3, axis=0))),
@@ -256,60 +521,66 @@ def build_lingbot_fusion_candidate(
     )
     median_ratio = float(np.median(residuals)) / reference_length
     p95_ratio = float(np.percentile(residuals, 95)) / reference_length
-    r3_turn = _signed_turn_radians(r3)
-    lingbot_turn = _signed_turn_radians(aligned)
-    chirality_conflict = (
-        abs(r3_turn) >= math.radians(25.0)
-        and abs(lingbot_turn) >= math.radians(25.0)
-        and r3_turn * lingbot_turn < 0.0
-    )
+    inlier_ratio = float(np.mean(residuals <= max(np.median(residuals) * 2.5, 1e-9)))
+    _, source_condition = _effective_rank(lingbot_resampled)
 
     diagnostics.update({
+        "selected_sign": selected_sign,
+        "selected_hypothesis": selected_label,
+        "reflection_applied": reflection_applied,
+        "composite_det": round(composite_det, 8),
         "similarity_scale": round(scale, 8),
         "similarity_rotation_degrees": round(
-            math.degrees(math.atan2(float(rotation[0, 1]), float(rotation[0, 0]))),
+            math.degrees(math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))),
             3,
         ),
         "alignment_median_ratio": round(median_ratio, 6),
         "alignment_p95_ratio": round(p95_ratio, 6),
-        "r3_signed_turn_degrees": round(math.degrees(r3_turn), 3),
-        "lingbot_signed_turn_degrees": round(math.degrees(lingbot_turn), 3),
-        "chirality_conflict": chirality_conflict,
+        "inlier_ratio": round(inlier_ratio, 6),
+        "effective_rank": round(_effective_rank(lingbot_resampled)[0], 4),
+        "secondary_condition": round(source_condition, 8),
+        "endpoint_displacement": 0.0,
     })
-    if chirality_conflict:
-        return rejected("turn_chirality_conflict")
+
     if median_ratio > 0.06 or p95_ratio > 0.12:
         return rejected("trajectory_disagreement_too_large")
 
     global_strength = float(np.clip(0.42 * (1.0 - p95_ratio / 0.12), 0.12, 0.42))
     r3_confidence = _confidence_weights(r3_result.get("r3_pose_confidence"), len(r3))
     # Preserve high-confidence R3 observations; let LingBot contribute more in
-    # visually weak intervals. Endpoints remain anchored to avoid map jumps.
+    # visually weak intervals. Both endpoints stay anchored to avoid map jumps.
     local_strength = global_strength * (1.0 - 0.60 * r3_confidence)
     local_strength[0] = 0.0
+    local_strength[-1] = 0.0
     fused = r3 + local_strength[:, None] * (aligned - r3)
+    endpoint_displacement = float(
+        max(
+            np.linalg.norm(fused[0] - r3[0]),
+            np.linalg.norm(fused[-1] - r3[-1]),
+        )
+    )
     diagnostics.update({
         "accepted": True,
         "reason": None,
         "fusion_strength_median": round(float(np.median(local_strength)), 4),
         "fusion_strength_max": round(float(np.max(local_strength)), 4),
+        "endpoint_displacement": round(endpoint_displacement, 8),
     })
-    trajectory = [
-        [round(float(point[0]), 8), round(float(point[1]), 8), 0.0]
-        for point in fused
-    ]
-    aligned_trajectory = [
-        [round(float(point[0]), 8), round(float(point[1]), 8), 0.0]
-        for point in aligned
-    ]
-    return {
+    independent_accepted, independent_traj = emit_independent()
+    diagnostics["independent_accepted"] = independent_accepted
+    payload = {
         "accepted": True,
-        "plan_trajectory": trajectory,
-        "independent_accepted": True,
-        "independent_plan_trajectory": independent,
-        "aligned_lingbot_trajectory": aligned_trajectory,
+        "plan_trajectory": _trajectory_list(fused),
+        "independent_accepted": independent_accepted,
+        "independent_plan_trajectory": independent_traj,
+        "aligned_lingbot_trajectory": _trajectory_list(aligned),
         "diagnostics": diagnostics,
     }
+    if lingbot_timestamps is not None:
+        payload["lingbot_source_timestamps_seconds"] = [
+            round(float(value), 6) for value in lingbot_timestamps
+        ]
+    return payload
 
 
 def attach_lingbot_fusion_candidate(

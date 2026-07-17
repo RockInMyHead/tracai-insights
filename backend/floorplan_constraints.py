@@ -36,17 +36,25 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
 
 
 def _normalise_points(value: Any) -> np.ndarray:
+    """Keep only finite samples. Never fabricate (0,0) for bad input."""
     if not isinstance(value, list):
         return np.empty((0, 2), dtype=np.float64)
     points: list[list[float]] = []
     for item in value:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            points.append([_finite_float(item[0]), _finite_float(item[1])])
-        elif isinstance(item, dict):
-            points.append([
-                _finite_float(item.get("x", item.get(0, 0.0))),
-                _finite_float(item.get("y", item.get(1, 0.0))),
-            ])
+        raw: Any = item
+        if isinstance(item, dict):
+            raw = [
+                item.get("x", item.get(0)),
+                item.get("y", item.get(1)),
+            ]
+        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+            continue
+        try:
+            point = [float(raw[0]), float(raw[1])]
+        except (TypeError, ValueError):
+            continue
+        if all(math.isfinite(component) for component in point):
+            points.append(point)
     return np.asarray(points, dtype=np.float64)
 
 
@@ -258,6 +266,10 @@ class FloorplanConstraintEngine:
         _, nearest = ndimage.distance_transform_edt(occupied, return_indices=True)
         self._nearest_free_rows = nearest[0]
         self._nearest_free_cols = nearest[1]
+        free = ~occupied
+        labeled, component_count = ndimage.label(free)
+        self._component_ids = labeled
+        self._component_count = int(component_count)
         annotation = mask if annotation_mask is None else annotation_mask
         annotation_padded = np.pad(
             annotation,
@@ -271,6 +283,24 @@ class FloorplanConstraintEngine:
             if len(xs)
             else (0, 0, cols - 1, rows - 1)
         )
+        # Walkable support/free extent drives the map-scale prior. Annotation
+        # ink alone only covers marked machines and underestimates the plant.
+        free_ys, free_xs = np.where(free)
+        if len(free_xs):
+            # Prefer the largest connected free component diameter.
+            if component_count > 0:
+                sizes = ndimage.sum(free, labeled, index=np.arange(1, component_count + 1))
+                largest = int(np.argmax(sizes)) + 1
+                component_mask = labeled == largest
+                free_ys, free_xs = np.where(component_mask)
+            self.walkable_bbox = (
+                int(free_xs.min()),
+                int(free_ys.min()),
+                int(free_xs.max()),
+                int(free_ys.max()),
+            )
+        else:
+            self.walkable_bbox = self.annotation_bbox
 
     @property
     def cell_meters(self) -> float:
@@ -383,9 +413,9 @@ class FloorplanConstraintEngine:
     def _scale_candidates(self, relative: np.ndarray, duration: Optional[float]) -> list[float]:
         raw_length = max(_polyline_length(relative), 1e-9)
         raw_span = max(float(np.ptp(relative[:, 0])), float(np.ptp(relative[:, 1])), 1e-9)
-        bbox_width = max(self.annotation_bbox[2] - self.annotation_bbox[0], 1)
-        bbox_height = max(self.annotation_bbox[3] - self.annotation_bbox[1], 1)
-        map_base = max(bbox_width, bbox_height) * self.config.grid_cell_pixels * 0.72 / raw_span
+        walk_width = max(self.walkable_bbox[2] - self.walkable_bbox[0], 1)
+        walk_height = max(self.walkable_bbox[3] - self.walkable_bbox[1], 1)
+        map_base = max(walk_width, walk_height) * self.config.grid_cell_pixels * 0.72 / raw_span
         bases = [map_base]
         if duration is not None:
             metric_distance = self.config.walking_speed_mps * duration
@@ -398,6 +428,36 @@ class FloorplanConstraintEngine:
             if math.isfinite(base * factor) and base * factor > 1e-7
         }
         return sorted(values)
+
+    @staticmethod
+    def _select_diverse_beam(
+        hypotheses: list[dict[str, Any]],
+        *,
+        per_yaw: int = 2,
+        global_top: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Repair a yaw-diverse beam instead of freezing on the first raw winners."""
+        if not hypotheses:
+            return []
+        selected: list[dict[str, Any]] = []
+        seen: set[tuple[float, float]] = set()
+
+        def add(item: dict[str, Any]) -> None:
+            key = (round(float(item["scale"]), 9), round(float(item["yaw"]), 3))
+            if key in seen:
+                return
+            seen.add(key)
+            selected.append(item)
+
+        by_yaw: dict[float, list[dict[str, Any]]] = {}
+        for item in hypotheses:
+            by_yaw.setdefault(round(float(item["yaw"]), 3), []).append(item)
+        for group in by_yaw.values():
+            for item in group[:per_yaw]:
+                add(item)
+        for item in hypotheses[:global_top]:
+            add(item)
+        return selected
 
     @staticmethod
     def _initial_heading(relative: np.ndarray) -> float:
@@ -470,6 +530,10 @@ class FloorplanConstraintEngine:
             return None
         if start == end:
             return np.vstack((self._cell_to_pixel(start), self._cell_to_pixel(end)))
+        start_component = int(self._component_ids[start[1], start[0]])
+        end_component = int(self._component_ids[end[1], end[0]])
+        if start_component == 0 or end_component == 0 or start_component != end_component:
+            return None
 
         raw_cells = np.asarray([self._pixel_to_cell(point) for point in raw_segment], dtype=np.int32)
         # Large production machines can require a detour around their entire
@@ -633,7 +697,7 @@ class FloorplanConstraintEngine:
     ) -> dict[str, Any]:
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v1",
+            "engine": "floorplan_constraint_engine_v2_gip",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -646,6 +710,8 @@ class FloorplanConstraintEngine:
                 round(float(np.mean(self._support_mask)), 8)
                 if self._support_mask is not None else None
             ),
+            "walkable_bbox_cells": list(self.walkable_bbox),
+            "annotation_bbox_cells": list(self.annotation_bbox),
         }
         if len(raw) < 2:
             return {"accepted": False, "trajectory": [], "diagnostics": {**base_diagnostics, "reason": "trajectory_too_short"}}
@@ -691,66 +757,62 @@ class FloorplanConstraintEngine:
         hypotheses.sort(key=lambda item: item["score"])
 
         # The plan is part of estimation, not a post-hoc accept/reject gate.
-        # Compare candidate similarities after enforcing the walkable mask and
-        # select the feasible route which needs the least spatial distortion.
+        # Repair a yaw-diverse beam and rank only after the walkable mask is
+        # enforced so raw collision scores cannot freeze the wrong homotopy.
         feasible: list[dict[str, Any]] = []
+        beam = self._select_diverse_beam(hypotheses)
         attempted = 0
-        shortlist_size = min(16, len(hypotheses))
-        batches = (hypotheses[:shortlist_size], hypotheses[shortlist_size:])
-        for batch_index, batch in enumerate(batches):
-            if batch_index == 1 and feasible:
-                break
-            for hypothesis in batch:
-                attempted += 1
-                repaired, rerouted_segments = self._repair_collisions(hypothesis["points"])
-                if repaired is None:
+        for hypothesis in beam:
+            attempted += 1
+            repaired, rerouted_segments = self._repair_collisions(hypothesis["points"])
+            if repaired is None:
+                continue
+            corrected_metrics = self._path_metrics(repaired)
+            # Dense sample metrics can still report a single-pixel nick after
+            # A* + line-of-sight simplify, even when every polyline segment
+            # is collision-free.  The hard contract is segment safety.
+            if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
+                repaired_again, extra_segments = self._repair_collisions(repaired)
+                if repaired_again is None:
                     continue
+                repaired = repaired_again
+                rerouted_segments += extra_segments
                 corrected_metrics = self._path_metrics(repaired)
-                # Dense sample metrics can still report a single-pixel nick after
-                # A* + line-of-sight simplify, even when every polyline segment
-                # is collision-free.  The hard contract is segment safety.
                 if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
-                    repaired_again, extra_segments = self._repair_collisions(repaired)
-                    if repaired_again is None:
-                        continue
-                    repaired = repaired_again
-                    rerouted_segments += extra_segments
-                    corrected_metrics = self._path_metrics(repaired)
-                    if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
-                        continue
-                matched = _resample_polyline(
-                    repaired,
-                    _trajectory_fractions(hypothesis["points"]),
-                )
-                displacement_m = (
-                    np.linalg.norm(matched - hypothesis["points"], axis=1)
-                    * self.config.meters_per_pixel
-                )
-                source_length = max(_polyline_length(hypothesis["points"]), 1e-9)
-                corrected_length = _polyline_length(repaired)
-                length_ratio = corrected_length / source_length
-                median_correction = (
-                    float(np.median(displacement_m)) if len(displacement_m) else 0.0
-                )
-                p95_correction = (
-                    float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
-                )
-                constrained_score = (
-                    float(hypothesis["score"])
-                    + 0.02 * median_correction
-                    + 0.005 * p95_correction
-                    + 0.30 * abs(math.log(max(length_ratio, 1e-9)))
-                    + 0.02 * rerouted_segments
-                )
-                feasible.append({
-                    **hypothesis,
-                    "repaired": repaired,
-                    "rerouted_segments": rerouted_segments,
-                    "corrected_metrics": corrected_metrics,
-                    "displacement_m": displacement_m,
-                    "length_ratio": length_ratio,
-                    "constrained_score": constrained_score,
-                })
+                    continue
+            matched = _resample_polyline(
+                repaired,
+                _trajectory_fractions(hypothesis["points"]),
+            )
+            displacement_m = (
+                np.linalg.norm(matched - hypothesis["points"], axis=1)
+                * self.config.meters_per_pixel
+            )
+            source_length = max(_polyline_length(hypothesis["points"]), 1e-9)
+            corrected_length = _polyline_length(repaired)
+            length_ratio = corrected_length / source_length
+            median_correction = (
+                float(np.median(displacement_m)) if len(displacement_m) else 0.0
+            )
+            p95_correction = (
+                float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
+            )
+            constrained_score = (
+                float(hypothesis["score"])
+                + 0.02 * median_correction
+                + 0.005 * p95_correction
+                + 0.30 * abs(math.log(max(length_ratio, 1e-9)))
+                + 0.02 * rerouted_segments
+            )
+            feasible.append({
+                **hypothesis,
+                "repaired": repaired,
+                "rerouted_segments": rerouted_segments,
+                "corrected_metrics": corrected_metrics,
+                "displacement_m": displacement_m,
+                "length_ratio": length_ratio,
+                "constrained_score": constrained_score,
+            })
 
         if not feasible:
             return {
@@ -761,6 +823,7 @@ class FloorplanConstraintEngine:
                     "reason": "constraint_solution_not_found",
                     "rejection_reasons": ["no_collision_free_route"],
                     "hypothesis_count": len(hypotheses),
+                    "beam_size": len(beam),
                     "constrained_hypotheses_attempted": attempted,
                     "raw_collision_ratio": round(float(hypotheses[0]["collision_ratio"]), 6),
                 },
@@ -817,6 +880,7 @@ class FloorplanConstraintEngine:
                 if self._support_mask is not None else "hard_walkable_mask"
             ),
             "hypothesis_count": len(hypotheses),
+            "beam_size": len(beam),
             "constrained_hypotheses_attempted": attempted,
             "feasible_hypotheses": len(feasible),
             "selected_scale_pixels_per_unit": round(float(best["scale"]), 8),
@@ -919,11 +983,23 @@ def apply_floorplan_constraints(
     candidate_payload = result.get("lingbot_fusion_candidate")
     candidate_points: Any = []
     independent_points: Any = []
+    independent_quality_ok = False
     if isinstance(candidate_payload, dict) and candidate_payload.get("accepted"):
         candidate_points = candidate_payload.get("plan_trajectory") or []
     if isinstance(candidate_payload, dict) and candidate_payload.get("independent_accepted"):
         independent_points = candidate_payload.get("independent_plan_trajectory") or []
+        diagnostics = candidate_payload.get("diagnostics") or {}
+        independent_quality = (
+            diagnostics.get("independent_quality") if isinstance(diagnostics, dict) else None
+        )
+        if isinstance(independent_quality, dict):
+            independent_quality_ok = bool(independent_quality.get("accepted", True))
+        else:
+            independent_quality_ok = True
     fragmented_r3 = method.startswith("r3") and _r3_is_severely_fragmented(result)
+    use_independent = bool(
+        fragmented_r3 and independent_points and independent_quality_ok
+    )
     primary_observation_source = (
         "r3"
         if method.startswith("r3")
@@ -934,7 +1010,7 @@ def apply_floorplan_constraints(
     source_selection: dict[str, Any] = {
         "primary": primary_observation_source,
         "candidate": (
-            "lingbot_independent" if fragmented_r3 and independent_points
+            "lingbot_independent" if use_independent
             else ("r3_lingbot_fusion" if candidate_points else None)
         ),
         "selected": primary_observation_source,
@@ -946,14 +1022,24 @@ def apply_floorplan_constraints(
             result.get("r3_source_timestamps_seconds")
             or result.get("source_timestamps_seconds")
         )
-        if fragmented_r3 and independent_points:
+        if use_independent:
             selected_points = independent_points
             selected_observation_source = "lingbot_independent"
+            independent_timestamps = None
+            if isinstance(candidate_payload, dict):
+                independent_timestamps = (
+                    candidate_payload.get("lingbot_source_timestamps_seconds")
+                    or candidate_payload.get("source_timestamps_seconds")
+                )
+            if not isinstance(independent_timestamps, list) or len(independent_timestamps) < 2:
+                independent_timestamps = _resample_timestamps(
+                    source_timestamps, len(independent_points)
+                )
             alignment = engine.align(
                 independent_points,
                 context.get("reference_point"),
                 context.get("direction_point"),
-                timestamps=_resample_timestamps(source_timestamps, len(independent_points)),
+                timestamps=independent_timestamps,
                 coordinate_convention="x_right_y_down",
             )
             source_selection.update({
@@ -962,6 +1048,8 @@ def apply_floorplan_constraints(
                 "r3_severely_fragmented": True,
             })
         else:
+            if fragmented_r3 and independent_points and not independent_quality_ok:
+                source_selection["independent_rejected_reason"] = "independent_quality_failed"
             alignment = engine.align(
                 points,
                 context.get("reference_point"),
@@ -969,7 +1057,7 @@ def apply_floorplan_constraints(
                 timestamps=source_timestamps,
                 coordinate_convention=convention,
             )
-        if candidate_points and not (fragmented_r3 and independent_points):
+        if candidate_points and not use_independent:
             candidate_alignment = engine.align(
                 candidate_points,
                 context.get("reference_point"),
@@ -1027,7 +1115,7 @@ def apply_floorplan_constraints(
             "accepted": False,
             "trajectory": [],
             "diagnostics": {
-                "engine": "floorplan_constraint_engine_v1",
+                "engine": "floorplan_constraint_engine_v2_gip",
                 "map_id": map_id,
                 "accepted": False,
                 "reason": "engine_error",

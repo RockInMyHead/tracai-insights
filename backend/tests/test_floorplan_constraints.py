@@ -260,7 +260,11 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 "accepted": False,
                 "independent_accepted": True,
                 "independent_plan_trajectory": independent,
-                "diagnostics": {"reason": "turn_chirality_conflict"},
+                "lingbot_source_timestamps_seconds": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+                "diagnostics": {
+                    "reason": "trajectory_disagreement_too_large",
+                    "independent_quality": {"accepted": True, "reasons": []},
+                },
             },
         }
         with patch(
@@ -281,6 +285,89 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             "fragmented_r3_uses_independent_lingbot",
         )
         self.assertEqual(updated["map_turn_points"], [])
+
+    def test_fragmented_r3_refuses_low_quality_independent(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((120, 180), dtype=bool), meters_per_pixel=0.1
+        )
+        source = {
+            "method": "r3_reconstruction_scale_aware",
+            "plan_trajectory": [
+                [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [20.0, 0.0, 0.0],
+                [30.0, 0.0, 0.0], [40.0, 0.0, 0.0], [50.0, 0.0, 0.0],
+            ],
+            "processing_stats": {
+                "pose_graph": {
+                    "component_count": 12,
+                    "largest_component_coverage": 0.2,
+                }
+            },
+            "lingbot_fusion_candidate": {
+                "accepted": False,
+                "independent_accepted": True,
+                "independent_plan_trajectory": [[0.0, 0.0, 0.0]] * 8,
+                "diagnostics": {
+                    "reason": "turn_chirality_conflict",
+                    "independent_quality": {
+                        "accepted": False,
+                        "reasons": ["turn_chirality_conflict"],
+                    },
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine", return_value=engine
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+        self.assertNotEqual(
+            updated["processing_stats"].get("map_observation_source"),
+            "lingbot_independent",
+        )
+        self.assertEqual(
+            updated["floorplan_constraint"]["observation_source_selection"].get(
+                "independent_rejected_reason"
+            ),
+            "independent_quality_failed",
+        )
+
+    def test_scale_prior_uses_walkable_extent_not_annotation_bbox(self) -> None:
+        mask = np.zeros((100, 200), dtype=bool)
+        # Tiny annotation island vs large walkable free space.
+        mask[10:12, 10:12] = True
+        engine = FloorplanConstraintEngine.from_mask(
+            mask, meters_per_pixel=0.1, grid_cell_pixels=1
+        )
+        relative = np.asarray([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]])
+        scales = engine._scale_candidates(relative, duration=None)
+        walk_width = engine.walkable_bbox[2] - engine.walkable_bbox[0]
+        ann_width = engine.annotation_bbox[2] - engine.annotation_bbox[0]
+        self.assertGreater(walk_width, ann_width * 5)
+        expected_base = max(walk_width, engine.walkable_bbox[3] - engine.walkable_bbox[1]) * 0.72 / 20.0
+        self.assertTrue(any(abs(scale - expected_base) < 1e-6 for scale in scales))
+
+    def test_diverse_beam_includes_multiple_yaw_bins(self) -> None:
+        hypotheses = [
+            {"score": float(index), "scale": 1.0 + index * 0.01, "yaw": yaw}
+            for index, yaw in enumerate([-10.0, -10.0, -5.0, 0.0, 0.0, 5.0, 10.0, 10.0])
+        ]
+        beam = FloorplanConstraintEngine._select_diverse_beam(
+            sorted(hypotheses, key=lambda item: item["score"]),
+            per_yaw=1,
+            global_top=3,
+        )
+        yaws = {item["yaw"] for item in beam}
+        self.assertGreaterEqual(len(yaws), 4)
+
+    def test_malformed_points_are_dropped_not_zeroed(self) -> None:
+        from backend.floorplan_constraints import _normalise_points
+        points = _normalise_points([[1.0, 2.0], [float("nan"), 3.0], {"x": 4.0, "y": 5.0}, "bad"])
+        self.assertEqual(len(points), 2)
+        self.assertTrue(np.allclose(points[0], [1.0, 2.0]))
+        self.assertTrue(np.allclose(points[1], [4.0, 5.0]))
 
 
 if __name__ == "__main__":

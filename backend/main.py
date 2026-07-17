@@ -37,9 +37,15 @@ except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     )
 
 try:
-    from lingbot_fusion import attach_lingbot_fusion_candidate
+    from lingbot_fusion import (
+        attach_lingbot_fusion_candidate,
+        should_restore_lingbot_fusion_candidate,
+    )
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
-    from backend.lingbot_fusion import attach_lingbot_fusion_candidate
+    from backend.lingbot_fusion import (
+        attach_lingbot_fusion_candidate,
+        should_restore_lingbot_fusion_candidate,
+    )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1161,6 +1167,34 @@ def _merge_r3_production_trajectory(base: dict, selected: dict) -> dict:
         "r3_pose_graph_candidate": selected.get("pose_graph_candidate"),
         "r3_scale_aware_candidate": selected.get("scale_aware_candidate"),
     })
+    # Keep confidence samples index-aligned with the promoted plan. Prefer the
+    # selected source's own confidence; otherwise resample/clear the base array.
+    selected_confidence = selected.get("r3_pose_confidence") or selected.get("pose_confidence")
+    if isinstance(selected_confidence, list) and len(selected_confidence) == len(plan):
+        updated["r3_pose_confidence"] = selected_confidence
+    else:
+        base_confidence = base.get("r3_pose_confidence")
+        if isinstance(base_confidence, list) and len(base_confidence) >= 2 and len(plan) >= 2:
+            import numpy as _np
+            source = _np.asarray(
+                [
+                    float(value) if value is not None else _math.nan
+                    for value in base_confidence
+                ],
+                dtype=float,
+            )
+            finite = _np.flatnonzero(_np.isfinite(source))
+            if len(finite) >= 2:
+                source = _np.interp(_np.arange(len(source)), finite, source[finite])
+                updated["r3_pose_confidence"] = _np.interp(
+                    _np.linspace(0.0, 1.0, len(plan)),
+                    _np.linspace(0.0, 1.0, len(source)),
+                    source,
+                ).tolist()
+            else:
+                updated["r3_pose_confidence"] = []
+        else:
+            updated["r3_pose_confidence"] = []
     quality = selected.get("trajectory_quality") or {}
     stats = dict(base.get("processing_stats") or {})
     stats.update({
@@ -1522,7 +1556,11 @@ def _lingbot_to_trackai_result(
     trajectory: List[List[float]] = []
     raw_trajectory_3d: List[List[float]] = []
     pose_confidence: List[Optional[float]] = []
+    source_timestamps_seconds: List[Optional[float]] = []
     camera_poses: List[Dict[str, Any]] = []
+
+    target_frames = int(metadata.get("target_frames") or 0)
+    fps = float(metadata.get("fps") or 0.0)
 
     if isinstance(poses, list):
         for pose in poses:
@@ -1559,11 +1597,33 @@ def _lingbot_to_trackai_result(
                 except (TypeError, ValueError):
                     confidence_value = None
                 pose_confidence.append(confidence_value)
+                timestamp_value: Optional[float] = None
+                if isinstance(pose, dict):
+                    for key in ("timestamp", "timestamp_seconds", "time_seconds", "t"):
+                        if pose.get(key) is None:
+                            continue
+                        try:
+                            candidate = float(pose.get(key))
+                        except (TypeError, ValueError):
+                            candidate = float("nan")
+                        if _math.isfinite(candidate):
+                            timestamp_value = candidate
+                            break
+                    if timestamp_value is None and fps > 1e-9:
+                        frame_idx = pose.get("frame_idx", len(trajectory) - 1)
+                        try:
+                            frame_value = float(frame_idx)
+                        except (TypeError, ValueError):
+                            frame_value = float("nan")
+                        if _math.isfinite(frame_value):
+                            timestamp_value = frame_value / fps
+                source_timestamps_seconds.append(timestamp_value)
                 if isinstance(pose, dict) and isinstance(pose.get("c2w"), list):
                     camera_poses.append({
                         "frame_idx": pose.get("frame_idx", len(trajectory) - 1),
                         "c2w": pose.get("c2w"),
                         "confidence": confidence_value,
+                        "timestamp": timestamp_value,
                     })
 
     estimated_distance = 0.0
@@ -1589,6 +1649,14 @@ def _lingbot_to_trackai_result(
             total_seconds = float(output_timings.get("total_seconds") or 0.0)
     total_seconds = total_seconds or float(timings.get("total_seconds") or 0.0)
     processing_fps = (len(trajectory) / total_seconds) if total_seconds > 0 else 0.0
+    if (
+        all(value is None for value in source_timestamps_seconds)
+        and len(trajectory) >= 2
+        and fps > 1e-9
+    ):
+        source_timestamps_seconds = [
+            round(index / fps, 6) for index in range(len(trajectory))
+        ]
 
     return {
         "method": "lingbot_map",
@@ -1604,6 +1672,8 @@ def _lingbot_to_trackai_result(
         "lingbot_trajectory": trajectory_payload,
         "lingbot_camera_poses": camera_poses,
         "lingbot_pose_confidence": pose_confidence,
+        "lingbot_source_timestamps_seconds": source_timestamps_seconds,
+        "source_timestamps_seconds": source_timestamps_seconds,
         "processing_stats": {
             "algorithm": "LingBot-Map",
             "session_id": session_id,
@@ -4136,10 +4206,10 @@ async def r3_trajectory_proxy(
                                 or "scale_aware_candidate"
                             )
                             candidate = saved_result.get("lingbot_fusion_candidate")
-                            if (
-                                isinstance(candidate, dict)
-                                and candidate.get("accepted")
-                                and requested_source == saved_source
+                            if should_restore_lingbot_fusion_candidate(
+                                candidate,
+                                requested_source=requested_source,
+                                saved_source=saved_source,
                             ):
                                 worker_result["lingbot_fusion_candidate"] = candidate
                                 worker_result["lingbot_shadow"] = saved_result.get("lingbot_shadow")
