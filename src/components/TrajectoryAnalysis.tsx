@@ -24,6 +24,8 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   start_projected_to_walkable_area: "старт перенесён в проходимую зону",
   no_collision_free_route: "между точками нет связного прохода",
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
+  topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
+  map_correction_exceeds_observation_budget: "коррекция плана превышает бюджет наблюдения",
 };
 
 const LINGBOT_FUSION_REASON_LABELS: Record<string, string> = {

@@ -84,34 +84,50 @@ def _finite_timestamps(value: Any) -> Optional[np.ndarray]:
 def _lingbot_plan_projection(lingbot_result: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
     """Project a 3-D camera path onto its dominant motion plane.
 
-    LingBot exports XYZ camera centres.  Its first two coordinates are not a
-    guaranteed floor plane, so using them directly can collapse one direction
-    of a production route.  PCA is sign-ambiguous; only PCA provenance may
-    choose a Y-sign later.  Explicit plan trajectories keep their producer
-    handedness.
+    LingBot exports XYZ camera centres.  Prefer ``raw_trajectory_3d`` when
+    present: the TrackAI adapter also writes an XZ ``plan_trajectory`` that is
+    *not* an immutable floor frame, and treating it as explicit incorrectly
+    disables PCA Y-sign gauge freedom then chirality-revokes the independent
+    observer.  True explicit plan trajectories (no raw 3-D) keep producer
+    handedness.  PCA is sign-ambiguous; only PCA provenance may choose a
+    Y-sign later.
     """
+    points = _finite_points_3d(
+        lingbot_result.get("raw_trajectory_3d") or lingbot_result.get("trajectory")
+    )
+    if len(points) >= 2:
+        # Adapter often stores remapped [x, z, y] in trajectory; only trust it
+        # as 3-D when a dedicated raw_trajectory_3d exists or Z span is real.
+        has_raw = _finite_points_3d(lingbot_result.get("raw_trajectory_3d")).shape[0] >= 2
+        z_span = float(np.ptp(points[:, 2])) if points.shape[1] >= 3 else 0.0
+        if has_raw or z_span > 1e-3:
+            centered = points - np.median(points, axis=0)
+            try:
+                _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
+            except np.linalg.LinAlgError:
+                return np.empty((0, 2), dtype=np.float64), {"method": "pca_failed"}
+            projected = centered @ vt[:2].T
+            total = max(float(np.sum(singular_values ** 2)), 1e-12)
+            return projected, {
+                "method": "pca_motion_plane",
+                "singular_values": [round(float(value), 8) for value in singular_values],
+                "explained_motion_plane_ratio": round(
+                    float(np.sum(singular_values[:2] ** 2)) / total, 8
+                ),
+                "basis": [[round(float(value), 8) for value in row] for row in vt[:2]],
+                "normal": (
+                    [round(float(value), 8) for value in vt[2]] if len(vt) > 2 else None
+                ),
+            }
+
     explicit = _finite_points(lingbot_result.get("plan_trajectory"))
     if len(explicit) >= 2:
         return explicit, {"method": "explicit_plan_trajectory"}
-    points = _finite_points_3d(lingbot_result.get("trajectory"))
-    if len(points) < 2:
-        return np.empty((0, 2), dtype=np.float64), {"method": "unavailable"}
-    centered = points - np.median(points, axis=0)
-    try:
-        _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
-    except np.linalg.LinAlgError:
-        return np.empty((0, 2), dtype=np.float64), {"method": "pca_failed"}
-    projected = centered @ vt[:2].T
-    total = max(float(np.sum(singular_values ** 2)), 1e-12)
-    return projected, {
-        "method": "pca_motion_plane",
-        "singular_values": [round(float(value), 8) for value in singular_values],
-        "explained_motion_plane_ratio": round(
-            float(np.sum(singular_values[:2] ** 2)) / total, 8
-        ),
-        "basis": [[round(float(value), 8) for value in row] for row in vt[:2]],
-        "normal": [round(float(value), 8) for value in vt[2]] if len(vt) > 2 else None,
-    }
+    # Last resort: first two axes of trajectory (may be adapter XZ).
+    planar = _finite_points(lingbot_result.get("trajectory"))
+    if len(planar) >= 2:
+        return planar, {"method": "explicit_plan_trajectory"}
+    return np.empty((0, 2), dtype=np.float64), {"method": "unavailable"}
 
 
 def _resample_by_parameter(
@@ -516,7 +532,15 @@ def build_lingbot_fusion_candidate(
         diagnostics["lingbot_signed_turn_degrees"] = round(math.degrees(selected_turn), 3)
         diagnostics["chirality_conflict"] = selected_chirality_conflict
         if selected_chirality_conflict:
-            return rejected("turn_chirality_conflict", revoke_independent=True)
+            # PCA Y-sign is gauge freedom: block fusion into R³, but keep the
+            # independent observer for fragmented-R³ map matching.
+            signed_lingbot = lingbot * np.asarray([1.0, selected_sign], dtype=np.float64)
+            diagnostics.update({
+                "selected_sign": selected_sign,
+                "selected_hypothesis": selected_label,
+                "reflection_applied": selected_sign < 0.0,
+            })
+            return rejected("turn_chirality_conflict", revoke_independent=False)
     else:
         # Explicit: only the native proper hypothesis may be accepted. The
         # adapter flip remains diagnostic so silent reflection cannot invent
@@ -608,6 +632,7 @@ def attach_lingbot_fusion_candidate(
     updated["lingbot_shadow"] = {
         "method": lingbot_result.get("method", "lingbot_map"),
         "trajectory": lingbot_result.get("trajectory") or [],
+        "raw_trajectory_3d": lingbot_result.get("raw_trajectory_3d") or [],
         "session_id": lingbot_result.get("lingbot_session_id"),
         "metadata": lingbot_result.get("lingbot_metadata") or {},
     }

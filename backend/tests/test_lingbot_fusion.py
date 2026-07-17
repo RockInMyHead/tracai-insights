@@ -80,7 +80,7 @@ class LingBotFusionTests(unittest.TestCase):
         xyz = np.column_stack((r3[:, 0], np.full(len(r3), 3.0), r3[:, 1]))
         result = build_lingbot_fusion_candidate(
             {"plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist()},
-            {"trajectory": xyz.tolist()},
+            {"trajectory": xyz.tolist(), "raw_trajectory_3d": xyz.tolist()},
         )
         independent = np.asarray(result["independent_plan_trajectory"])
         self.assertGreater(float(np.ptp(independent[:, 0])), 4.0)
@@ -89,6 +89,48 @@ class LingBotFusionTests(unittest.TestCase):
             result["diagnostics"]["lingbot_projection"]["method"],
             "pca_motion_plane",
         )
+
+    def test_raw_trajectory_3d_is_preferred_over_adapter_xz_plan(self) -> None:
+        """Adapter XZ in plan_trajectory must not disable PCA gauge freedom."""
+        r3 = self._r3_path()
+        xyz = np.column_stack((r3[:, 0], np.full(len(r3), 1.5), r3[:, 1]))
+        # Deliberately mirrored adapter plane — must be ignored when raw 3-D exists.
+        mirrored = r3.copy()
+        mirrored[:, 1] *= -1.0
+        result = build_lingbot_fusion_candidate(
+            {"plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist()},
+            {
+                "plan_trajectory": np.column_stack((mirrored, np.zeros(len(mirrored)))).tolist(),
+                "trajectory": np.column_stack((mirrored, np.zeros(len(mirrored)))).tolist(),
+                "raw_trajectory_3d": xyz.tolist(),
+            },
+        )
+        self.assertEqual(
+            result["diagnostics"]["lingbot_projection"]["method"],
+            "pca_motion_plane",
+        )
+        self.assertTrue(result["independent_accepted"], result["diagnostics"])
+
+    def test_pca_chirality_conflict_keeps_independent_observer(self) -> None:
+        r3 = self._r3_left_hook()
+        # Motion in X/Z with opposite Z so residual-best PCA sign fights chirality.
+        xyz = np.column_stack((r3[:, 0], np.full(len(r3), 1.2), -r3[:, 1]))
+        result = build_lingbot_fusion_candidate(
+            {"plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist()},
+            {"raw_trajectory_3d": xyz.tolist(), "trajectory": xyz.tolist()},
+        )
+        self.assertEqual(
+            result["diagnostics"]["lingbot_projection"]["method"],
+            "pca_motion_plane",
+        )
+        if result["diagnostics"].get("chirality_conflict"):
+            self.assertFalse(result["accepted"])
+            self.assertEqual(result["diagnostics"]["reason"], "turn_chirality_conflict")
+            self.assertTrue(result["independent_accepted"], result["diagnostics"])
+            self.assertGreater(len(result["independent_plan_trajectory"]), 5)
+        else:
+            self.assertTrue(result["independent_accepted"], result["diagnostics"])
+
 
     def test_explicit_opposite_chirality_rejects_fusion_and_independent(self) -> None:
         r3 = self._r3_left_hook()
