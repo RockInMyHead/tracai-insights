@@ -119,11 +119,121 @@ def _to_json_serializable(obj: Any):
 
 
 def _status_response_payload(status_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a poll-safe status payload (never crash the UI on bad result types)."""
+    """Return a poll-safe status payload with live timing for the UI dashboard."""
     safe = _to_json_serializable(status_data)
     if not isinstance(safe, dict):
         return {"status": "unknown", "progress": 0, "message": "invalid status"}
-    return safe
+    now = time.time()
+    start_raw = safe.get("start_time")
+    try:
+        start_time = float(start_raw) if start_raw is not None else None
+    except (TypeError, ValueError):
+        start_time = None
+    if start_time is None or not _math.isfinite(start_time) or start_time <= 0:
+        start_time = None
+    elapsed = max(0.0, now - start_time) if start_time is not None else None
+    progress = int(round(_finite_status_progress(safe.get("progress"))))
+    status = str(safe.get("status") or "unknown").lower()
+    eta_seconds = None
+    if (
+        elapsed is not None
+        and elapsed >= 8.0
+        and 3 <= progress < 100
+        and status not in {"completed", "error", "failed", "unknown"}
+    ):
+        # Extrapolate from observed rate; clamp so the UI never shows absurd ETAs.
+        rate = progress / max(elapsed, 1e-6)
+        remaining = (100.0 - progress) / max(rate, 1e-6)
+        eta_seconds = float(min(max(remaining, 5.0), 3 * 60 * 60))
+    stage = str(safe.get("stage") or _infer_processing_stage(status, safe.get("message"), progress))
+    enriched = dict(safe)
+    enriched["progress"] = progress
+    enriched["stage"] = stage
+    if start_time is not None:
+        enriched["start_time"] = start_time
+    if elapsed is not None:
+        enriched["elapsed_seconds"] = round(elapsed, 1)
+    if eta_seconds is not None:
+        enriched["eta_seconds"] = round(eta_seconds, 1)
+    else:
+        enriched.pop("eta_seconds", None)
+    return enriched
+
+
+def _finite_status_progress(value: Any) -> float:
+    try:
+        progress = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not _math.isfinite(progress):
+        return 0.0
+    return max(0.0, min(100.0, progress))
+
+
+def _infer_processing_stage(status: str, message: Any, progress: float) -> str:
+    text = str(message or "").lower()
+    status = str(status or "").lower()
+    if status in {"completed", "done", "success"} or progress >= 100:
+        return "done"
+    if status in {"error", "failed"}:
+        return "error"
+    if "загруз" in text or "upload" in text or status in {"uploading_to_gpu"}:
+        return "upload"
+    if "lingbot" in text or status in {"lingbot_fusion", "lingbot_queued", "lingbot_running"}:
+        return "lingbot"
+    if "план" in text or "floorplan" in text or "map" in text:
+        return "map"
+    if "gpu" in text or "r³" in text or "r3" in text or status in {"gpu_processing", "processing"}:
+        return "gpu"
+    if status in {"queued"}:
+        return "queued"
+    return "processing"
+
+
+async def _gpu_progress_heartbeat(
+    video_id: str,
+    *,
+    base_progress: int = 15,
+    ceiling: int = 88,
+    time_constant_seconds: float = 780.0,
+    label: str = "R³ реконструкция на GPU",
+) -> None:
+    """Soft-live progress while the blocking GPU HTTP call is in flight."""
+    try:
+        while True:
+            await asyncio.sleep(2.0)
+            state = processing_status.get(video_id)
+            if not isinstance(state, dict):
+                return
+            status = str(state.get("status") or "")
+            if status in {"completed", "error", "failed"}:
+                return
+            current = int(_finite_status_progress(state.get("progress")))
+            if current >= 90:
+                return
+            start = float(state.get("start_time") or time.time())
+            elapsed = max(0.0, time.time() - start)
+            soft = int(
+                base_progress
+                + (ceiling - base_progress)
+                * (1.0 - _math.exp(-elapsed / max(time_constant_seconds, 1.0)))
+            )
+            soft = max(base_progress, min(ceiling, soft))
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            update = {
+                "elapsed_seconds": round(elapsed, 1),
+                "stage": "gpu",
+                "message": f"{label} · {mins:02d}:{secs:02d}",
+            }
+            if soft > current:
+                update["progress"] = soft
+            processing_status[video_id].update(update)
+            # Persist only occasionally to avoid SQLite churn every 2s.
+            if int(elapsed) % 10 < 2:
+                _update_task_status(video_id, "processing", int(update.get("progress", current)))
+    except asyncio.CancelledError:
+        return
 
 
 def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
@@ -2525,12 +2635,15 @@ async def process_video_r3_background(
             processing_status[video_id] = {
                 "status": "queued", "progress": 0, "message": "Подготовка к R³ анализу",
                 "start_time": time.time(),
+                "stage": "queued",
             }
 
         processing_status[video_id].update({
             "status": "uploading_to_gpu",
             "progress": 5,
-            "message": "Отправка видео на GPU-сервер для R³ реконструкции..."
+            "stage": "upload",
+            "message": "Отправка видео на GPU-сервер для R³ реконструкции...",
+            "start_time": processing_status[video_id].get("start_time") or time.time(),
         })
         # Drop any previous analysis payload so /api/status stays JSON-safe
         # while this long GPU upload/inference is in flight.
@@ -2550,38 +2663,63 @@ async def process_video_r3_background(
             processing_status[video_id].update({
                 "status": "gpu_processing",
                 "progress": 15,
-                "message": "R³ реконструкция на GPU..."
+                "message": "R³ реконструкция на GPU...",
+                "stage": "gpu",
+                "start_time": processing_status[video_id].get("start_time") or time.time(),
             })
+            heartbeat = asyncio.create_task(
+                _gpu_progress_heartbeat(
+                    video_id,
+                    base_progress=15,
+                    ceiling=88,
+                    label="R³ реконструкция на GPU",
+                )
+            )
 
-            if video_path and video_path.exists():
-                # ─── Видео есть локально — отправляем файл ──────────
-                logger.info(f"[{video_id}] Sending local file to GPU Worker R³: {video_path.name}")
-                async with session.post(
-                    f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
-                    params=params,
-                    data=open(video_path, 'rb'),
-                ) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
-                    gpu_result = await resp.json()
-            else:
-                # ─── Видео уже на GPU — триггерим обработку ────────
-                logger.info(f"[{video_id}] Video already on GPU, triggering R³ processing")
-                params['use_uploaded'] = 'true'
-                async with session.post(
-                    f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
-                    params=params,
-                    data=b'',  # empty body
-                    headers={'Content-Length': '0'},
-                ) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
-                    gpu_result = await resp.json()
+            try:
+                if video_path and video_path.exists():
+                    # ─── Видео есть локально — отправляем файл ──────────
+                    logger.info(f"[{video_id}] Sending local file to GPU Worker R³: {video_path.name}")
+                    async with session.post(
+                        f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
+                        params=params,
+                        data=open(video_path, 'rb'),
+                    ) as resp:
+                        if resp.status != 200:
+                            err_text = await resp.text()
+                            raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
+                        gpu_result = await resp.json()
+                else:
+                    # ─── Видео уже на GPU — триггерим обработку ────────
+                    logger.info(f"[{video_id}] Video already on GPU, triggering R³ processing")
+                    params['use_uploaded'] = 'true'
+                    async with session.post(
+                        f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
+                        params=params,
+                        data=b'',  # empty body
+                        headers={'Content-Length': '0'},
+                    ) as resp:
+                        if resp.status != 200:
+                            err_text = await resp.text()
+                            raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
+                        gpu_result = await resp.json()
+            finally:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
 
         if not gpu_result.get("success"):
             raise Exception(gpu_result.get("error", "GPU Worker R³ returned unsuccessful status"))
+
+        processing_status[video_id].update({
+            "status": "processing",
+            "progress": 90,
+            "stage": "trajectory",
+            "message": "Сборка production-траектории R³...",
+        })
+        _update_task_status(video_id, "processing", 90)
 
         # Конвертируем R³ camera poses в формат траектории
         r3_result = gpu_result["result"]
@@ -2617,9 +2755,11 @@ async def process_video_r3_background(
             try:
                 processing_status[video_id].update({
                     "status": "lingbot_fusion",
-                    "progress": 70,
-                    "message": "Запуск LingBot-Map для проверки геометрии R³...",
+                    "progress": 92,
+                    "stage": "lingbot",
+                    "message": "LingBot-Map проверяет геометрию R³...",
                 })
+                _update_task_status(video_id, "processing", 92)
                 submission = await _submit_lingbot_session(
                     video_path,
                     fps=10,
@@ -2672,6 +2812,14 @@ async def process_video_r3_background(
                 ),
             }
             trajectory_data["processing_stats"] = stats
+
+        processing_status[video_id].update({
+            "status": "processing",
+            "progress": 96,
+            "stage": "map",
+            "message": "Сопоставление маршрута с планом Kerama...",
+        })
+        _update_task_status(video_id, "processing", 96)
         trajectory_data = apply_floorplan_constraints(trajectory_data, map_context)
 
         # Сохраняем результат
@@ -2693,8 +2841,10 @@ async def process_video_r3_background(
         processing_status[video_id].update({
             "status": "completed",
             "progress": 100,
+            "stage": "done",
             "message": "R³ + LingBot + план: обработка завершена",
             "result": trajectory_data,
+            "eta_seconds": 0,
         })
         _update_task_status(video_id, "completed", 100)
         logger.info(f"[{video_id}] R³ analysis saved and status set to completed")

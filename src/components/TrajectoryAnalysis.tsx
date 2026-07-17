@@ -4,7 +4,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
-import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -13,6 +12,7 @@ import { toast } from "sonner";
 import { apiClient, R3TrajectorySource, VideoAnalysisResult, VideoListItem } from "@/lib/api";
 import { finiteNum } from "@/lib/numbers";
 import RealTimeR3Visualization from "./RealTimeR3Visualization";
+import ProcessingDashboard from "./ProcessingDashboard";
 
 /** Временно скрыть в UI: масштаб, detect/turn/ml roi, подсказки и переключатель стабилизации (значения по умолчанию в коде сохраняются). */
 const SHOW_ADVANCED_ANALYSIS_SETTINGS = false;
@@ -234,6 +234,15 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState(0);
   const [currentStep, setCurrentStep] = useState('');
+  const [liveProgress, setLiveProgress] = useState(0);
+  const [liveStatus, setLiveStatus] = useState('queued');
+  const [liveStage, setLiveStage] = useState('queued');
+  const [liveElapsedSeconds, setLiveElapsedSeconds] = useState<number | null>(null);
+  const [liveEtaSeconds, setLiveEtaSeconds] = useState<number | null>(null);
+  const [liveOwnerName, setLiveOwnerName] = useState('');
+  const [analysisStartedAtMs, setAnalysisStartedAtMs] = useState<number | null>(null);
+  const [batchIndex, setBatchIndex] = useState(0);
+  const [batchTotal, setBatchTotal] = useState(1);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [serverVideos, setServerVideos] = useState<VideoListItem[]>([]);
   const [selectedServerVideos, setSelectedServerVideos] = useState<VideoListItem[]>([]);
@@ -627,6 +636,41 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
     setIsAnalyzing(true);
     setAnalysisProgress(0);
+    setLiveProgress(0);
+    setLiveStatus("queued");
+    setLiveStage("queued");
+    setLiveElapsedSeconds(0);
+    setLiveEtaSeconds(null);
+    setLiveOwnerName("");
+    setAnalysisStartedAtMs(Date.now());
+    setCurrentStep("Подготовка production-пайплайна...");
+
+    const applyLiveStatus = (
+      status: Awaited<ReturnType<typeof apiClient.getProcessingStatus>>,
+      ownerName: string,
+      completedBefore: number,
+      totalCount: number,
+    ) => {
+      const serverProgress = Math.max(0, Math.min(100, Number(status.progress) || 0));
+      const unit = 100 / Math.max(totalCount, 1);
+      const blended = Math.min(99, completedBefore * unit + (serverProgress / 100) * unit);
+      setLiveProgress(serverProgress);
+      setLiveStatus(status.status || "processing");
+      setLiveStage(status.stage || "processing");
+      setLiveOwnerName(ownerName);
+      if (typeof status.elapsed_seconds === "number") {
+        setLiveElapsedSeconds(status.elapsed_seconds);
+      }
+      if (typeof status.eta_seconds === "number") {
+        setLiveEtaSeconds(status.eta_seconds);
+      } else if (serverProgress >= 100) {
+        setLiveEtaSeconds(0);
+      }
+      if (status.message) {
+        setCurrentStep(`[${ownerName}] ${status.message}`);
+      }
+      setAnalysisProgress(Math.round(blended));
+    };
 
     try {
       const startTime = Date.now();
@@ -635,13 +679,20 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       const videosToAnalyze = [...videos];
       const batchId = (typeof crypto !== "undefined" && (crypto as any).randomUUID) ? (crypto as any).randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
       const batchSize = videosToAnalyze.length;
+      setBatchTotal(batchSize);
 
       // Загрузка и анализ по очереди (одно видео за раз)
       const finalizedVideos: VideoWithOwner[] = [];
+      let completedBefore = 0;
 
-      for (const video of videosToAnalyze) {
+      for (let videoIndex = 0; videoIndex < videosToAnalyze.length; videoIndex++) {
+        const video = videosToAnalyze[videoIndex];
+        setBatchIndex(videoIndex);
+        setLiveOwnerName(video.ownerName);
         if (video.analysisResult) {
-          setAnalysisProgress((prev) => prev + 100 / videosToAnalyze.length);
+          completedBefore += 1;
+          setAnalysisProgress(Math.round((completedBefore / batchSize) * 100));
+          setLiveProgress(100);
           finalizedVideos.push(video);
           continue;
         }
@@ -677,12 +728,22 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               .catch(() => {});
           } else if (video.file) {
             setCurrentStep(`Загрузка ${video.file.name} на сервер...`);
+            setLiveStage("upload");
+            setLiveStatus("uploading");
             const uploadResult = await apiClient.uploadVideo(
               video.file,
               (progress) => {
                 setVideos((prev) =>
                   prev.map((v) =>
                     v.id === video.id ? { ...v, uploadProgress: progress } : v
+                  )
+                );
+                const uploadPct = Math.max(0, Math.min(100, progress));
+                setLiveProgress(Math.max(1, Math.round(uploadPct * 0.08)));
+                setAnalysisProgress(
+                  Math.round(
+                    completedBefore * (100 / batchSize)
+                    + (uploadPct * 0.08 / 100) * (100 / batchSize)
                   )
                 );
                 setCurrentStep(`Загрузка ${video.file.name}: ${progress.toFixed(0)}%`);
@@ -716,8 +777,8 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             if (!processingId) return;
             try {
               const status = await apiClient.getProcessingStatus(processingId);
-              if (status && status.progress > 0 && status.message) {
-                setCurrentStep(`[${video.ownerName}] ${status.message} (${status.progress}%)`);
+              if (status) {
+                applyLiveStatus(status, video.ownerName, completedBefore, batchSize);
               }
             } catch {
               /* ignore */
@@ -756,14 +817,18 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
               if (status.status === "completed" && status.result) {
                 result = { success: true, data: status.result, message: "Success" };
+                applyLiveStatus(
+                  { ...status, progress: 100, stage: "done", eta_seconds: 0 },
+                  video.ownerName,
+                  completedBefore,
+                  batchSize,
+                );
                 break;
               } else if (status.status === "error") {
                 throw new Error(status.message || "Ошибка при обработке на сервере");
               }
 
-              if (status.progress > 0) {
-                setCurrentStep(`[${video.ownerName}] ${status.message || "Обработка"} (${status.progress}%)`);
-              }
+              applyLiveStatus(status, video.ownerName, completedBefore, batchSize);
 
               attempts++;
               await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -785,6 +850,8 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           if (analysisMethod === "r3" && uploadedVideoId && analysisData) {
             try {
               setCurrentStep(`[${video.ownerName}] Перенос R³ траектории на план...`);
+              setLiveStage("map");
+              setLiveProgress((prev) => Math.max(prev, 96));
               const [filtered, selectedTrajectory] = await Promise.all([
                 apiClient.getR3PointCloudFiltered(uploadedVideoId, {
                   maxPoints: 100000,
@@ -837,7 +904,11 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           };
 
           setVideos((prev) => prev.map((v) => (v.id === video.id ? analyzedVideo : v)));
-          setAnalysisProgress((prev) => prev + 100 / videosToAnalyze.length);
+          completedBefore += 1;
+          setLiveProgress(100);
+          setLiveStage("done");
+          setLiveEtaSeconds(0);
+          setAnalysisProgress(Math.round((completedBefore / batchSize) * 100));
           finalizedVideos.push(analyzedVideo);
         } catch (err: unknown) {
           if (pollInterval) {
@@ -850,13 +921,19 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
           const errorVideo: VideoWithOwner = { ...video, isAnalyzing: false };
           setVideos((prev) => prev.map((v) => (v.id === video.id ? errorVideo : v)));
-          setAnalysisProgress((prev) => prev + 100 / videosToAnalyze.length);
+          completedBefore += 1;
+          setLiveStatus("error");
+          setLiveStage("error");
+          setAnalysisProgress(Math.round((completedBefore / batchSize) * 100));
           finalizedVideos.push(errorVideo);
         }
       }
 
       setVideos(finalizedVideos);
       setAnalysisProgress(100);
+      setLiveProgress(100);
+      setLiveStage("done");
+      setLiveEtaSeconds(0);
       setCurrentStep('Анализ всех видео завершен');
 
       const totalTime = (Date.now() - startTime) / 1000;
@@ -896,6 +973,10 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       setTimeout(() => {
         setAnalysisProgress(0);
         setCurrentStep('');
+        setLiveProgress(0);
+        setLiveElapsedSeconds(null);
+        setLiveEtaSeconds(null);
+        setAnalysisStartedAtMs(null);
       }, 2000);
     }
   };
@@ -1246,54 +1327,21 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         </div>
         )}
 
-        {/* Progress bar */}
+        {/* Live processing dashboard */}
         {isAnalyzing && (
-          <div className="space-y-4 p-6 bg-gradient-to-r from-secondary/50 to-secondary/30 rounded-xl border border-primary/10">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="relative">
-                  <Loader2 className="h-5 w-5 animate-spin text-primary" />
-                  <div className="absolute inset-0 h-5 w-5 rounded-full bg-primary/20 animate-ping" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-semibold">Обработка видео</h3>
-                  <p className="text-xs text-muted-foreground">ИИ анализирует траекторию движения</p>
-                </div>
-              </div>
-              <div className="text-right">
-                <div className="text-lg font-bold text-primary">{analysisProgress}%</div>
-                <div className="text-xs text-muted-foreground">завершено</div>
-              </div>
-            </div>
-
-            <Progress value={analysisProgress} className="w-full h-2" />
-
-            <div className="flex items-center gap-2 text-sm">
-              <Activity className="h-4 w-4 text-primary" />
-              <span className="font-medium">{currentStep}</span>
-            </div>
-
-            {/* Progress steps */}
-            <div className={`grid gap-2 text-xs ${
-              analysisMethod === 'r3' ? 'grid-cols-3' :
-              stabilizationEnabled ? 'grid-cols-4' : 'grid-cols-3'
-            }`}>
-              <div className={`text-center p-2 rounded ${analysisProgress >= 20 ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
-                Загрузка
-              </div>
-              {analysisMethod !== 'r3' && stabilizationEnabled && (
-                <div className={`text-center p-2 rounded ${analysisProgress >= 50 ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
-                  Стабилизация
-                </div>
-              )}
-              <div className={`text-center p-2 rounded ${analysisProgress >= (analysisMethod === 'r3' || analysisMethod === 'lingbot' ? 60 : (stabilizationEnabled ? 75 : 70)) ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
-                {analysisMethod === 'r3' ? 'R³ реконструкция' : analysisMethod === 'lingbot' ? 'LingBot-Map' : 'SLAM анализ'}
-              </div>
-              <div className={`text-center p-2 rounded ${analysisProgress >= 100 ? 'bg-primary/10 text-primary' : 'text-muted-foreground'}`}>
-                Готово
-              </div>
-            </div>
-          </div>
+          <ProcessingDashboard
+            ownerName={liveOwnerName || undefined}
+            method={analysisMethod}
+            progress={Math.max(analysisProgress, liveProgress)}
+            message={currentStep}
+            status={liveStatus}
+            stage={liveStage}
+            elapsedSeconds={liveElapsedSeconds}
+            etaSeconds={liveEtaSeconds}
+            batchIndex={batchIndex}
+            batchTotal={batchTotal}
+            startedAtMs={analysisStartedAtMs}
+          />
         )}
 
         {SHOW_ADVANCED_ANALYSIS_SETTINGS && (

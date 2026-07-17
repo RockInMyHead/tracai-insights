@@ -566,6 +566,10 @@ export class ApiClient {
     status: string;
     progress: number;
     message: string;
+    stage?: string;
+    start_time?: number;
+    elapsed_seconds?: number;
+    eta_seconds?: number;
     result?: VideoAnalysisResult["data"];
   }> {
     const response = await agentFetch(`${this.baseUrl}/api/status/${videoId}`);
