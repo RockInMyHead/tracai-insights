@@ -393,6 +393,7 @@ def should_restore_lingbot_fusion_candidate(
     *,
     requested_source: str,
     saved_source: str,
+    saved_source_requested: Any = None,
 ) -> bool:
     """Persist fused *or* independent-quality candidates across API refresh."""
     if not isinstance(candidate, dict):
@@ -401,13 +402,24 @@ def should_restore_lingbot_fusion_candidate(
         return False
     requested = str(requested_source or "").strip()
     saved = str(saved_source or "").strip()
+    saved_requested = str(saved_source_requested or "").strip()
     # Corrupted saves once stored pose-confidence arrays in r3_trajectory_source.
     # Treat only known labels as a real source gate; otherwise restore anyway.
     if saved not in _R3_TRAJECTORY_SOURCE_LABELS:
         return True
     if requested not in _R3_TRAJECTORY_SOURCE_LABELS:
         return True
-    return requested == saved
+    if requested == saved:
+        return True
+    # Recomputes / merges may leave the effective label as "raw" while the
+    # analysis was produced for scale_aware_candidate (UI default). Restore
+    # when the saved *requested* source matches the refresh request.
+    if (
+        saved_requested in _R3_TRAJECTORY_SOURCE_LABELS
+        and requested == saved_requested
+    ):
+        return True
+    return False
 
 
 def build_lingbot_fusion_candidate(
