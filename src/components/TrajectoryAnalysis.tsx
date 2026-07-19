@@ -28,6 +28,8 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   local_search_exhausted: "локальный поиск не нашёл безопасный обход",
   detour_spike_rejected: "найденный обход отклонён как аномальная петля",
   short_residual_collision_kept: "сохранена короткая коллизия для защиты формы маршрута",
+  residual_micro_collisions_kept_to_preserve_shape: "сохранена коллизия до 0,75 м из-за погрешности маски",
+  independent_residual_collision: "независимый LingBot пересекает запрещённую область",
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
   topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
   map_correction_exceeds_observation_budget: "коррекция плана превышает бюджет наблюдения",
