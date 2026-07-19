@@ -569,6 +569,24 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             updated["floorplan_constraint"]["trajectory_observation_source"]
         )
 
+    def test_unrepairable_segment_reports_disconnected_mask_components(self) -> None:
+        mask = np.zeros((80, 120), dtype=bool)
+        mask[:, 58:62] = True
+        engine = FloorplanConstraintEngine.from_mask(
+            mask,
+            meters_per_pixel=0.1,
+            grid_cell_pixels=1,
+            person_radius_meters=0.0,
+        )
+        failures: list[str] = []
+        repaired, _ = engine._repair_collisions(
+            np.asarray([[20.0, 40.0], [100.0, 40.0]]),
+            failure_reasons=failures,
+        )
+
+        self.assertIsNone(repaired)
+        self.assertIn("different_walkable_components", failures)
+
     def test_scale_prior_uses_walkable_extent_not_annotation_bbox(self) -> None:
         mask = np.zeros((100, 200), dtype=bool)
         # Tiny annotation island vs large walkable free space.
