@@ -236,10 +236,7 @@ async def _gpu_progress_heartbeat(
         return
 
 
-def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
-    """If analysis is already on disk / DB-completed, expose it even after restart."""
-    analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
-    db_completed = False
+def _load_task_status_row(video_id: str) -> Optional[tuple[str, int]]:
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
@@ -247,10 +244,20 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
             (video_id,),
         ).fetchone()
         conn.close()
-        if row and str(row[0]).lower() in {"completed", "done", "success"}:
-            db_completed = True
+        if not row:
+            return None
+        return str(row[0] or ""), int(row[1] or 0)
     except Exception:
-        db_completed = False
+        return None
+
+
+def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
+    """If analysis is already on disk / DB-completed, expose it even after restart."""
+    analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
+    db_row = _load_task_status_row(video_id)
+    db_completed = bool(
+        db_row and str(db_row[0]).lower() in {"completed", "done", "success"}
+    )
     if not analysis_file.exists() and not db_completed:
         return None
     if not analysis_file.exists():
@@ -2014,11 +2021,33 @@ async def get_video_status(video_id: str):
         "lingbot_queued",
         "lingbot_running",
     }
+    db_row = _load_task_status_row(video_id)
+    db_status = str(db_row[0]).lower() if db_row else ""
+    db_progress = int(db_row[1]) if db_row else 0
+    db_busy = db_status in {
+        "queued",
+        "processing",
+        "uploading_to_gpu",
+        "gpu_processing",
+        "running",
+        "lingbot_queued",
+        "lingbot_running",
+    }
     # A stale in-memory payload (often with a non-serializable prior result)
     # must not block a finished analysis after restart / re-open.
+    # Conversely: never serve a previous analysis.json as "completed" while a
+    # live job is still running — that made the UI show ЗАВЕРШЕНО + «в процессе».
     if not live_busy:
         completed = _load_completed_analysis_status(video_id)
         if completed is not None:
+            if db_busy:
+                # Restart left DB in processing while the analysis artifact
+                # already exists and no live worker owns the job.
+                _update_task_status(video_id, "completed", 100)
+            elif not db_busy and db_status and db_status not in {
+                "completed", "done", "success"
+            }:
+                _update_task_status(video_id, "completed", 100)
             processing_status[video_id] = {
                 "status": "completed",
                 "progress": 100,
@@ -2026,6 +2055,14 @@ async def get_video_status(video_id: str):
                 "start_time": (live or {}).get("start_time") or time.time(),
             }
             return JSONResponse(_status_response_payload(completed))
+        if db_busy:
+            return JSONResponse(_status_response_payload({
+                "id": video_id,
+                "status": "processing",
+                "progress": max(1, min(99, db_progress or 1)),
+                "message": "Обработка продолжается",
+                "stage": "gpu",
+            }))
 
     if video_id not in processing_status:
         lingbot_session_id = _load_lingbot_session_id(video_id)
