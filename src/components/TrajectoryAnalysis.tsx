@@ -29,6 +29,7 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   detour_spike_rejected: "найденный обход отклонён как аномальная петля",
   short_residual_collision_kept: "сохранена короткая коллизия для защиты формы маршрута",
   residual_micro_collisions_kept_to_preserve_shape: "сохранена коллизия до 0,75 м из-за погрешности маски",
+  authoritative_safe_map_fallback: "использован безопасный графовый маршрут по фиксированному плану",
   independent_residual_collision: "независимый LingBot пересекает запрещённую область",
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
   topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
@@ -879,19 +880,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
           let analysisData = result.data;
           if (analysisMethod === "r3" && uploadedVideoId && analysisData) {
-            const stats = (analysisData.processing_stats || {}) as Record<string, unknown>;
-            const existingMap = Array.isArray((analysisData as AnalysisData).map_trajectory)
-              ? (analysisData as AnalysisData).map_trajectory
-              : [];
-            const mapAlreadyApplied =
-              Boolean(stats.map_matching_applied)
-              && Array.isArray(existingMap)
-              && existingMap.length >= 2;
-            if (mapAlreadyApplied) {
-              setCurrentStep(`[${video.ownerName}] Карта уже в сохранённом результате`);
-              setLiveStage("done");
-              setLiveProgress(100);
-            } else {
             try {
               setCurrentStep(`[${video.ownerName}] Перенос R³ траектории на план...`);
               setLiveStage("map");
@@ -925,7 +913,6 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               }
             } catch (err) {
               console.warn("Failed to fetch filtered R3 trajectory for plan:", err);
-            }
             }
           }
 
@@ -1498,9 +1485,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             {isAnalyzing ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                {liveStatus === "completed" || liveStage === "done" || liveStage === "map"
-                  ? "Финализация результата..."
-                  : "Анализ в процессе..."}
+                Анализ в процессе...
               </>
             ) : (
               <>
