@@ -23,6 +23,11 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   walking_speed_prior_inconsistent: "масштаб уточнён без опоры на скорость",
   start_projected_to_walkable_area: "старт перенесён в проходимую зону",
   no_collision_free_route: "между точками нет связного прохода",
+  different_walkable_components: "точки попали в разные связные зоны маски",
+  no_walkable_segment_endpoint: "конец сегмента не попал в проходимую область",
+  local_search_exhausted: "локальный поиск не нашёл безопасный обход",
+  detour_spike_rejected: "найденный обход отклонён как аномальная петля",
+  short_residual_collision_kept: "сохранена короткая коллизия для защиты формы маршрута",
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
   topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
   map_correction_exceeds_observation_budget: "коррекция плана превышает бюджет наблюдения",
@@ -1403,7 +1408,10 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
                   </Badge>
                 )}
                 {activeLingbotFusion.accepted === true && activeMapObservationSource !== 'r3_lingbot_fusion' && (
-                  <Badge variant="outline">LingBot согласован с R³ (shadow)</Badge>
+                  <Badge variant="outline">
+                    LingBot согласован с R³ (shadow)
+                    {activeFloorplanConstraint.accepted === false ? ', но карта не приняла маршрут' : ''}
+                  </Badge>
                 )}
                 {activeLingbotFusion.accepted === false && activeLingbotFusion.reason && (
                   <Badge variant="outline">
