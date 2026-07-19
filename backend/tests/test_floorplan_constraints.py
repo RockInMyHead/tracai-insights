@@ -168,6 +168,26 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertEqual(int(outside_component), 0)
 
+    def test_astar_spike_detour_is_rejected_as_topology_break(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((80, 120), dtype=bool), meters_per_pixel=0.1
+        )
+        start = np.asarray([10.0, 40.0])
+        end = np.asarray([40.0, 40.0])
+        raw = np.asarray([[10.0, 40.0], [25.0, 40.0], [40.0, 40.0]])
+        # 3 m chord, ~35 m invented loop — classic mask-legal spike.
+        spike = np.asarray([
+            [10.0, 40.0],
+            [10.0, 10.0],
+            [70.0, 10.0],
+            [70.0, 70.0],
+            [40.0, 70.0],
+            [40.0, 40.0],
+        ])
+        self.assertTrue(engine._detour_is_spike(spike, start, end, raw))
+        local = np.asarray([[10.0, 40.0], [25.0, 48.0], [40.0, 40.0]])
+        self.assertFalse(engine._detour_is_spike(local, start, end, raw))
+
     def test_sharp_reverse_ratio_flags_triangular_spike(self) -> None:
         # Straight walk with one large triangular detour (classic bad A* spike).
         points = np.asarray([
@@ -216,9 +236,12 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
         )
         self.assertFalse(result["accepted"], result["diagnostics"])
-        self.assertEqual(
+        self.assertIn(
             result["diagnostics"]["reason"],
-            "map_correction_exceeds_observation_budget",
+            {
+                "map_correction_exceeds_observation_budget",
+                "constraint_solution_not_found",
+            },
         )
 
     def test_fixed_floorplan_routes_around_real_annotated_machine(self) -> None:

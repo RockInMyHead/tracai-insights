@@ -716,17 +716,45 @@ class FloorplanConstraintEngine:
                 previous[key] = current
                 heuristic = math.hypot(end[0] - nx, end[1] - ny) * self.cell_meters
                 heappush(queue, (candidate + heuristic, candidate, key))
-        # A route around a long machine can leave the first local window.
-        # Expand deterministically instead of declaring the plan disconnected.
-        full_margin = max(self.rows, self.cols)
-        if margin < full_margin:
+        # Expand locally for large machines, but never to the whole plant:
+        # full-map search invents mask-legal spikes through distant CAD gaps.
+        max_margin = max(initial_margin, int(round(50.0 / max(self.cell_meters, 1e-9))))
+        if margin < max_margin:
             return self._astar(
                 start_point,
                 end_point,
                 raw_segment,
-                _search_margin_cells=min(full_margin, margin * 2),
+                _search_margin_cells=min(max_margin, margin * 2),
             )
         return None
+
+    def _detour_is_spike(
+        self,
+        route: np.ndarray,
+        start_point: np.ndarray,
+        end_point: np.ndarray,
+        raw_segment: np.ndarray,
+    ) -> bool:
+        """Reject A* shortcuts that invent a long loop far from the observation."""
+        chord_m = float(np.linalg.norm(end_point - start_point)) * self.config.meters_per_pixel
+        route_m = _polyline_length(route) * self.config.meters_per_pixel
+        if route_m > max(3.5 * max(chord_m, 1e-6), chord_m + 12.0):
+            return True
+        if len(raw_segment) < 2 or len(route) < 2:
+            return False
+        max_dev = 0.0
+        for point in route:
+            best = float("inf")
+            for left, right in zip(raw_segment[:-1], raw_segment[1:]):
+                delta = right - left
+                length = float(np.linalg.norm(delta))
+                if length <= 1e-9:
+                    best = min(best, float(np.linalg.norm(point - left)))
+                    continue
+                t = float(np.clip(np.dot(point - left, delta) / (length * length), 0.0, 1.0))
+                best = min(best, float(np.linalg.norm(point - (left + t * delta))))
+            max_dev = max(max_dev, best * self.config.meters_per_pixel)
+        return max_dev > 10.0
 
     def _collision_runs(self, points: np.ndarray) -> list[tuple[int, int]]:
         bad = np.asarray([
@@ -763,13 +791,28 @@ class FloorplanConstraintEngine:
 
         rebuilt: list[np.ndarray] = []
         cursor = 0
+        rerouted = 0
         for left, right in merged:
             if left == 0 and self._point_occupied(points[0]):
                 return None, len(merged)
             rebuilt.extend(points[cursor:left])
-            route = self._astar(points[left], points[right], points[left:right + 1])
+            raw_segment = points[left:right + 1]
+            segment_m = _polyline_length(raw_segment) * self.config.meters_per_pixel
+            route = self._astar(points[left], points[right], raw_segment)
+            if route is not None and self._detour_is_spike(
+                route, points[left], points[right], raw_segment
+            ):
+                # A 3 m observation nick must not become a 30 m plant loop.
+                route = None
             if route is None:
+                # Keep short observation nicks instead of inventing topology.
+                # Longer unrepairable collisions still fail the hypothesis.
+                if segment_m <= 6.0:
+                    rebuilt.extend(raw_segment)
+                    cursor = right + 1
+                    continue
                 return None, len(merged)
+            rerouted += 1
             if rebuilt and np.linalg.norm(rebuilt[-1] - route[0]) < 1e-6:
                 route = route[1:]
             rebuilt.extend(route)
@@ -780,7 +823,7 @@ class FloorplanConstraintEngine:
         # chord through the obstacle.  Consumers already accept a polyline of
         # arbitrary length, and source-frame/turn mapping is handled by arc
         # fraction below.
-        return np.asarray(rebuilt, dtype=np.float64), len(merged)
+        return np.asarray(rebuilt, dtype=np.float64), rerouted
 
     def _adaptive_anchor_fractions(
         self, points: np.ndarray, *, maximum: int
@@ -1093,15 +1136,23 @@ class FloorplanConstraintEngine:
             corrected_metrics = self._path_metrics(repaired)
             # Dense sample metrics can still report a single-pixel nick after
             # A* + line-of-sight simplify, even when every polyline segment
-            # is collision-free.  The hard contract is segment safety.
-            if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
+            # is collision-free.  Prefer another local repair, but allow a small
+            # residual collision budget when the only alternative is a spike.
+            residual_collision_budget = 0.035
+            if corrected_metrics["outside_ratio"] > 0.0 or (
+                self._collision_runs(repaired)
+                and corrected_metrics["collision_ratio"] > residual_collision_budget
+            ):
                 repaired_again, extra_segments = self._repair_collisions(repaired)
                 if repaired_again is None:
                     continue
                 repaired = repaired_again
                 rerouted_segments += extra_segments
                 corrected_metrics = self._path_metrics(repaired)
-                if self._collision_runs(repaired) or corrected_metrics["outside_ratio"] > 0.0:
+                if corrected_metrics["outside_ratio"] > 0.0 or (
+                    self._collision_runs(repaired)
+                    and corrected_metrics["collision_ratio"] > residual_collision_budget
+                ):
                     continue
             matched = _resample_polyline(
                 repaired,
@@ -1321,6 +1372,8 @@ class FloorplanConstraintEngine:
             quality_warnings.append("route_length_changed_significantly")
         if p95_correction > allowed_correction:
             quality_warnings.append("large_map_correction_applied")
+        if float(corrected_metrics.get("collision_ratio", 0.0)) > 0.0:
+            quality_warnings.append("residual_micro_collisions_kept_to_preserve_shape")
         speed = float(best["speed_mps"])
         if math.isfinite(speed) and not 0.20 <= speed <= 3.20:
             quality_warnings.append("walking_speed_prior_inconsistent")
