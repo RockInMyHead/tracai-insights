@@ -70,6 +70,42 @@ def _polyline_length(points: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
 
 
+def _polyline_sharp_reverse_ratio(
+    points: np.ndarray,
+    *,
+    meters_per_pixel: float,
+    min_segment_meters: float = 0.25,
+    reverse_degrees: float = 135.0,
+) -> float:
+    """Fraction of meaningful turns that are near-U-turns.
+
+    Mask-legal A* spikes through drawing gaps often show as a chain of
+    ~180° corners even when length_ratio and collision checks still pass.
+    """
+    if len(points) < 3 or meters_per_pixel <= 1e-12:
+        return 0.0
+    segments = np.linalg.norm(np.diff(points, axis=0), axis=1) * float(meters_per_pixel)
+    keep = np.where(segments >= float(min_segment_meters))[0]
+    if len(keep) < 2:
+        return 0.0
+    compact = np.vstack([points[0], points[keep + 1]])
+    vectors = np.diff(compact, axis=0)
+    if len(vectors) < 2:
+        return 0.0
+    left = vectors[:-1]
+    right = vectors[1:]
+    left_norm = np.linalg.norm(left, axis=1)
+    right_norm = np.linalg.norm(right, axis=1)
+    valid = (left_norm > 1e-9) & (right_norm > 1e-9)
+    if not np.any(valid):
+        return 0.0
+    cosine = np.sum(left[valid] * right[valid], axis=1) / (
+        left_norm[valid] * right_norm[valid]
+    )
+    angles = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+    return float(np.mean(angles >= float(reverse_degrees)))
+
+
 def _resample_polyline(points: np.ndarray, fractions: np.ndarray) -> np.ndarray:
     if len(points) < 2:
         return np.repeat(points[:1], len(fractions), axis=0)
@@ -666,10 +702,9 @@ class FloorplanConstraintEngine:
                 # step. This makes the same physical map substantially
                 # invariant to grid_cell_pixels.
                 wall_multiplier = 0.55 * math.exp(-clearance / 0.45)
-                # Preserve the old physical pull toward the visual path.  The
-                # first metric rewrite accidentally weakened it ~3.5x on the
-                # production grid and allowed clearance to dominate topology.
-                deviation_multiplier = min(4.5, 0.55 * deviation_meters)
+                # Stronger pull toward the visual observation so A* prefers
+                # local aisle snaps over long spikes through blank CAD gaps.
+                deviation_multiplier = min(8.0, 0.90 * deviation_meters)
                 step_meters = step * self.cell_meters
                 candidate = cost + step_meters * (
                     1.0 + wall_multiplier + deviation_multiplier
@@ -1090,25 +1125,30 @@ class FloorplanConstraintEngine:
             # production weights made a 12 m displacement almost free
             # (0.005 * p95), so a geometrically absurd route could outrank a
             # faithful observation merely because it had more clearance.
-            # Budget scales with path length: a hard 6 m cap rejected faithful
-            # ~200 m warehouse routes (~13 m aisle snaps) while length_ratio
-            # already blocks topology-destroying shrinks (e.g. 0.34).
+            # Cap stays below the ~13–15 m "mask-legal spike" regime that still
+            # looked wrong on Kerama despite length_ratio ≈ 1.17.
             correction_budget = max(
                 2.5,
-                min(15.0, float(hypothesis["length_meters"]) * 0.12),
+                min(11.0, float(hypothesis["length_meters"]) * 0.09),
             )
-            # Mild aisle repairs are OK; long invented detours (1.7x+) look
-            # "collision-free" in drawing gaps but are not the real walk.
+            sharp_reverse_ratio = _polyline_sharp_reverse_ratio(
+                repaired,
+                meters_per_pixel=self.config.meters_per_pixel,
+            )
+            # Mild aisle repairs are OK; long invented detours and zig-zag
+            # spikes through drawing gaps are not the real walk.
             shape_preserved = (
                 p95_correction <= correction_budget
                 and 0.70 <= length_ratio <= 1.50
+                and sharp_reverse_ratio <= 0.08
             )
             constrained_score = (
                 float(hypothesis["score"])
                 + 0.15 * median_correction
-                + 0.06 * p95_correction
+                + 0.08 * p95_correction
                 + 0.75 * abs(math.log(max(length_ratio, 1e-9)))
                 + 0.08 * rerouted_segments
+                + 4.0 * sharp_reverse_ratio
             )
             feasible.append({
                 **hypothesis,
@@ -1118,6 +1158,7 @@ class FloorplanConstraintEngine:
                 "displacement_m": displacement_m,
                 "length_ratio": length_ratio,
                 "correction_budget_meters": correction_budget,
+                "sharp_reverse_ratio": sharp_reverse_ratio,
                 "shape_preserved": shape_preserved,
                 "constrained_score": constrained_score,
             })
@@ -1167,6 +1208,9 @@ class FloorplanConstraintEngine:
                     "correction_p95_meters": round(closest_p95, 3),
                     "correction_budget_meters": round(
                         float(closest["correction_budget_meters"]), 3
+                    ),
+                    "sharp_reverse_ratio": round(
+                        float(closest.get("sharp_reverse_ratio", 0.0)), 4
                     ),
                     "length_ratio": round(float(closest["length_ratio"]), 5),
                 },
@@ -1326,6 +1370,7 @@ class FloorplanConstraintEngine:
             "correction_median_meters": round(float(np.median(displacement_m)), 3),
             "correction_p95_meters": round(p95_correction, 3),
             "correction_budget_meters": round(allowed_correction, 3),
+            "sharp_reverse_ratio": round(float(best.get("sharp_reverse_ratio", 0.0)), 4),
             "length_ratio": round(length_ratio, 5),
             "hypothesis_score": round(float(best["score"]), 6),
             "constrained_score": round(float(best["constrained_score"]), 6),

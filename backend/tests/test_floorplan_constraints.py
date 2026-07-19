@@ -6,6 +6,7 @@ import numpy as np
 from backend.floorplan_constraints import (
     FloorplanConfig,
     FloorplanConstraintEngine,
+    _polyline_sharp_reverse_ratio,
     _trajectory_fractions,
     apply_floorplan_constraints,
     get_floorplan_engine,
@@ -166,6 +167,25 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             1.0,
         )
         self.assertEqual(int(outside_component), 0)
+
+    def test_sharp_reverse_ratio_flags_triangular_spike(self) -> None:
+        # Straight walk with one large triangular detour (classic bad A* spike).
+        points = np.asarray([
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [20.0, 0.0],
+            [22.0, 18.0],
+            [24.0, 0.0],
+            [40.0, 0.0],
+            [50.0, 0.0],
+        ], dtype=float)
+        ratio = _polyline_sharp_reverse_ratio(points, meters_per_pixel=1.0)
+        self.assertGreater(ratio, 0.08)
+        straight = np.asarray([[float(x), 0.0] for x in range(0, 51, 5)], dtype=float)
+        self.assertLess(
+            _polyline_sharp_reverse_ratio(straight, meters_per_pixel=1.0),
+            0.01,
+        )
 
     def test_positive_support_rejects_topology_destroying_repair(self) -> None:
         height, width = 100, 220
