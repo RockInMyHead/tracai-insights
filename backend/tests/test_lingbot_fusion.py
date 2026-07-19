@@ -276,6 +276,15 @@ class LingBotFusionTests(unittest.TestCase):
                 saved_source=str([34.9, 34.9, 37.0]),
             )
         )
+        # Recompute left effective source as "raw" while UI asks for scale_aware.
+        self.assertTrue(
+            should_restore_lingbot_fusion_candidate(
+                {"accepted": True, "independent_accepted": True},
+                requested_source="scale_aware_candidate",
+                saved_source="raw",
+                saved_source_requested="scale_aware_candidate",
+            )
+        )
 
     def test_saved_upstream_extrinsic_is_kept_as_c2w(self) -> None:
         adapter = LingBotMapAdapter(repo_path=Path("."), model_path=Path("model.pt"))

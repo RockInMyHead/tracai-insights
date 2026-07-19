@@ -879,6 +879,19 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
           let analysisData = result.data;
           if (analysisMethod === "r3" && uploadedVideoId && analysisData) {
+            const stats = (analysisData.processing_stats || {}) as Record<string, unknown>;
+            const existingMap = Array.isArray((analysisData as AnalysisData).map_trajectory)
+              ? (analysisData as AnalysisData).map_trajectory
+              : [];
+            const mapAlreadyApplied =
+              Boolean(stats.map_matching_applied)
+              && Array.isArray(existingMap)
+              && existingMap.length >= 2;
+            if (mapAlreadyApplied) {
+              setCurrentStep(`[${video.ownerName}] Карта уже в сохранённом результате`);
+              setLiveStage("done");
+              setLiveProgress(100);
+            } else {
             try {
               setCurrentStep(`[${video.ownerName}] Перенос R³ траектории на план...`);
               setLiveStage("map");
@@ -912,6 +925,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               }
             } catch (err) {
               console.warn("Failed to fetch filtered R3 trajectory for plan:", err);
+            }
             }
           }
 
@@ -1484,7 +1498,9 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             {isAnalyzing ? (
               <>
                 <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                Анализ в процессе...
+                {liveStatus === "completed" || liveStage === "done" || liveStage === "map"
+                  ? "Финализация результата..."
+                  : "Анализ в процессе..."}
               </>
             ) : (
               <>
