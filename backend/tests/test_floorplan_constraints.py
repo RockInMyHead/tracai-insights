@@ -276,6 +276,10 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertTrue(result["accepted"], result["diagnostics"])
         self.assertTrue(result["diagnostics"]["shape_fallback_used"])
+        self.assertEqual(
+            result["diagnostics"]["shape_fallback_policy"],
+            "authoritative_plan_connectivity_v2",
+        )
         self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
         self.assertIn(
             "authoritative_safe_map_fallback",
