@@ -468,7 +468,10 @@ class FloorplanConstraintEngine:
         if duration is not None:
             metric_distance = self.config.walking_speed_mps * duration
             bases.append(metric_distance / self.config.meters_per_pixel / raw_length)
-        factors = (0.45, 0.58, 0.72, 0.86, 1.0, 1.16, 1.35, 1.60, 1.95, 2.35)
+        factors = (
+            0.38, 0.45, 0.52, 0.58, 0.66, 0.72, 0.80, 0.86, 0.93,
+            1.0, 1.08, 1.16, 1.25, 1.35, 1.48, 1.60, 1.78, 1.95, 2.15, 2.35,
+        )
         values = {
             round(base * factor, 9)
             for base in bases
@@ -481,8 +484,8 @@ class FloorplanConstraintEngine:
     def _select_diverse_beam(
         hypotheses: list[dict[str, Any]],
         *,
-        per_yaw: int = 2,
-        global_top: int = 12,
+        per_yaw: int = 3,
+        global_top: int = 18,
     ) -> list[dict[str, Any]]:
         """Repair a yaw-diverse beam instead of freezing on the first raw winners."""
         if not hypotheses:
@@ -976,7 +979,9 @@ class FloorplanConstraintEngine:
         timestamps: Any = None,
         coordinate_convention: str = "x_forward_y_left_z_up",
         scale_candidates: Optional[Iterable[float]] = None,
-        yaw_offsets_degrees: Sequence[float] = (-10.0, -5.0, 0.0, 5.0, 10.0),
+        yaw_offsets_degrees: Sequence[float] = (
+            -20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0
+        ),
     ) -> dict[str, Any]:
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {

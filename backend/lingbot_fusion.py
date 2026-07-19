@@ -547,16 +547,11 @@ def build_lingbot_fusion_candidate(
         )
         diagnostics["lingbot_signed_turn_degrees"] = round(math.degrees(selected_turn), 3)
         diagnostics["chirality_conflict"] = selected_chirality_conflict
+        # Cumulative micro-turn chirality is unreliable on long wiggly routes.
+        # For PCA, residual gates remain authoritative; keep going so a
+        # residual-good blend is not discarded solely on noisy turn sums.
         if selected_chirality_conflict:
-            # PCA Y-sign is gauge freedom: block fusion into R³, but keep the
-            # independent observer for fragmented-R³ map matching.
-            signed_lingbot = lingbot * np.asarray([1.0, selected_sign], dtype=np.float64)
-            diagnostics.update({
-                "selected_sign": selected_sign,
-                "selected_hypothesis": selected_label,
-                "reflection_applied": selected_sign < 0.0,
-            })
-            return rejected("turn_chirality_conflict", revoke_independent=False)
+            diagnostics["chirality_soft_conflict"] = True
     else:
         # Explicit: only the native proper hypothesis may be accepted. The
         # adapter flip remains diagnostic so silent reflection cannot invent

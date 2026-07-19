@@ -123,13 +123,16 @@ class LingBotFusionTests(unittest.TestCase):
             result["diagnostics"]["lingbot_projection"]["method"],
             "pca_motion_plane",
         )
+        # Noisy cumulative-turn chirality must not revoke the independent observer
+        # or hard-reject residual-gated PCA fusion on its own.
+        self.assertTrue(result["independent_accepted"], result["diagnostics"])
+        self.assertGreater(len(result["independent_plan_trajectory"]), 5)
         if result["diagnostics"].get("chirality_conflict"):
-            self.assertFalse(result["accepted"])
-            self.assertEqual(result["diagnostics"]["reason"], "turn_chirality_conflict")
-            self.assertTrue(result["independent_accepted"], result["diagnostics"])
-            self.assertGreater(len(result["independent_plan_trajectory"]), 5)
-        else:
-            self.assertTrue(result["independent_accepted"], result["diagnostics"])
+            self.assertTrue(result["diagnostics"].get("chirality_soft_conflict"))
+            self.assertNotEqual(
+                result["diagnostics"].get("reason"),
+                "turn_chirality_conflict",
+            )
 
 
     def test_explicit_opposite_chirality_rejects_fusion_and_independent(self) -> None:
