@@ -245,6 +245,43 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             },
         )
 
+    def test_authoritative_safe_fallback_returns_bounded_collision_free_route(self) -> None:
+        height, width = 100, 220
+        support = np.zeros((height, width), dtype=bool)
+        support[44:57, 5:215] = True
+        engine = FloorplanConstraintEngine(
+            FloorplanConfig(
+                map_id="supported_fallback_test",
+                width=width,
+                height=height,
+                meters_per_pixel=1.0,
+                grid_cell_pixels=1,
+                person_radius_meters=0.0,
+                obstacle_mask_file="",
+            ),
+            np.zeros_like(support),
+            support,
+        )
+        trajectory = []
+        trajectory.extend([[float(x), 0.0] for x in range(20)])
+        trajectory.extend([[19.0, float(y)] for y in range(1, 16)])
+        trajectory.extend([[float(x), 15.0] for x in range(20, 101)])
+        result = engine.align(
+            trajectory,
+            {"x": 10.0, "y": 50.0},
+            {"x": 30.0, "y": 50.0},
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+            allow_safe_shape_fallback=True,
+        )
+        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertTrue(result["diagnostics"]["shape_fallback_used"])
+        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
+        self.assertIn(
+            "authoritative_safe_map_fallback",
+            result["diagnostics"]["quality_warnings"],
+        )
+
     def test_fixed_floorplan_routes_around_real_annotated_machine(self) -> None:
         engine = get_floorplan_engine()
         result = engine.align(
