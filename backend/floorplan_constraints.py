@@ -111,6 +111,19 @@ def _resample_timestamps(values: Any, count: int) -> Any:
     ).tolist()
 
 
+def _flip_polyline_y(points: Any) -> list[list[float]]:
+    """Mirror plan Y — used to resolve PCA sign gauge for independent LingBot."""
+    array = _normalise_points(points)
+    if len(array) == 0:
+        return []
+    mirrored = array.copy()
+    mirrored[:, 1] *= -1.0
+    return [
+        [round(float(point[0]), 8), round(float(point[1]), 8), 0.0]
+        for point in mirrored
+    ]
+
+
 def _r3_is_severely_fragmented(result: dict[str, Any]) -> bool:
     """Recognise graph failures without depending on one worker schema."""
     containers = [
@@ -653,7 +666,7 @@ class FloorplanConstraintEngine:
                 # Preserve the old physical pull toward the visual path.  The
                 # first metric rewrite accidentally weakened it ~3.5x on the
                 # production grid and allowed clearance to dominate topology.
-                deviation_multiplier = min(3.0, 0.30 * deviation_meters)
+                deviation_multiplier = min(4.5, 0.55 * deviation_meters)
                 step_meters = step * self.cell_meters
                 candidate = cost + step_meters * (
                     1.0 + wall_multiplier + deviation_multiplier
@@ -1079,12 +1092,11 @@ class FloorplanConstraintEngine:
                 2.5,
                 min(15.0, float(hypothesis["length_meters"]) * 0.12),
             )
-            # Aisle repairs on Kerama routinely lengthen a shortcut observation
-            # by ~50-80%.  Keep the lower bound tight (blocks shrinks like 0.34)
-            # but allow longer collision-free detours when p95 stays in budget.
+            # Mild aisle repairs are OK; long invented detours (1.7x+) look
+            # "collision-free" in drawing gaps but are not the real walk.
             shape_preserved = (
                 p95_correction <= correction_budget
-                and 0.70 <= length_ratio <= 1.85
+                and 0.70 <= length_ratio <= 1.50
             )
             constrained_score = (
                 float(hypothesis["score"])
@@ -1496,17 +1508,64 @@ def apply_floorplan_constraints(
                 independent_timestamps = _resample_timestamps(
                     source_timestamps, len(independent_points)
                 )
-            alignment = engine.align(
-                independent_points,
-                context.get("reference_point"),
-                context.get("direction_point"),
-                timestamps=independent_timestamps,
-                coordinate_convention="x_right_y_down",
-            )
+            # PCA Y-sign is gauge freedom.  When R³ is fragmented it cannot
+            # adjudicate chirality, so score both polarities on the floor plan.
+            independent_variants: list[tuple[str, Any]] = [
+                ("native", independent_points),
+            ]
+            flipped = _flip_polyline_y(independent_points)
+            if flipped:
+                independent_variants.append(("y_flip", flipped))
+
+            def _independent_rank(payload: dict[str, Any]) -> tuple[float, float, float, float]:
+                diag = payload.get("diagnostics") or {}
+                accepted_rank = 0.0 if payload.get("accepted") else 1.0
+                length_ratio = max(_finite_float(diag.get("length_ratio"), 1e9), 1e-9)
+                p95 = _finite_float(diag.get("correction_p95_meters"), 1e9)
+                score = _finite_float(diag.get("constrained_score"), 1e9)
+                return (
+                    accepted_rank,
+                    abs(math.log(length_ratio)),
+                    p95,
+                    score,
+                )
+
+            alignment = {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {"reason": "independent_polarity_unavailable"},
+            }
+            best_label = "native"
+            best_rank = (1.0, float("inf"), float("inf"), float("inf"))
+            polarity_diagnostics: list[dict[str, Any]] = []
+            for label, variant_points in independent_variants:
+                candidate_alignment = engine.align(
+                    variant_points,
+                    context.get("reference_point"),
+                    context.get("direction_point"),
+                    timestamps=independent_timestamps,
+                    coordinate_convention="x_right_y_down",
+                )
+                diag = candidate_alignment.get("diagnostics") or {}
+                polarity_diagnostics.append({
+                    "label": label,
+                    "accepted": bool(candidate_alignment.get("accepted")),
+                    "length_ratio": diag.get("length_ratio"),
+                    "correction_p95_meters": diag.get("correction_p95_meters"),
+                    "constrained_score": diag.get("constrained_score"),
+                })
+                rank = _independent_rank(candidate_alignment)
+                if rank < best_rank:
+                    best_rank = rank
+                    best_label = label
+                    alignment = candidate_alignment
+                    selected_points = variant_points
             source_selection.update({
                 "selected": selected_observation_source,
                 "reason": "fragmented_r3_uses_independent_lingbot",
                 "r3_severely_fragmented": True,
+                "independent_polarity": best_label,
+                "independent_polarity_candidates": polarity_diagnostics,
             })
         else:
             if fragmented_r3 and independent_points and not independent_quality_ok:
