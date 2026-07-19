@@ -1079,9 +1079,12 @@ class FloorplanConstraintEngine:
                 2.5,
                 min(15.0, float(hypothesis["length_meters"]) * 0.12),
             )
+            # Aisle repairs on Kerama routinely lengthen a shortcut observation
+            # by ~50-80%.  Keep the lower bound tight (blocks shrinks like 0.34)
+            # but allow longer collision-free detours when p95 stays in budget.
             shape_preserved = (
                 p95_correction <= correction_budget
-                and 0.70 <= length_ratio <= 1.45
+                and 0.70 <= length_ratio <= 1.85
             )
             constrained_score = (
                 float(hypothesis["score"])
