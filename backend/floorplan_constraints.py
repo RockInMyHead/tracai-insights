@@ -774,7 +774,12 @@ class FloorplanConstraintEngine:
             index += 1
         return runs
 
-    def _repair_collisions(self, points: np.ndarray) -> tuple[Optional[np.ndarray], int]:
+    def _repair_collisions(
+        self,
+        points: np.ndarray,
+        *,
+        failure_reasons: Optional[list[str]] = None,
+    ) -> tuple[Optional[np.ndarray], int]:
         runs = self._collision_runs(points)
         if not runs:
             return points.copy(), 0
@@ -798,19 +803,41 @@ class FloorplanConstraintEngine:
             rebuilt.extend(points[cursor:left])
             raw_segment = points[left:right + 1]
             segment_m = _polyline_length(raw_segment) * self.config.meters_per_pixel
-            route = self._astar(points[left], points[right], raw_segment)
-            if route is not None and self._detour_is_spike(
-                route, points[left], points[right], raw_segment
+            start_cell = self._nearest_free(self._pixel_to_cell(points[left]))
+            end_cell = self._nearest_free(self._pixel_to_cell(points[right]))
+            connectivity_reason = None
+            if start_cell is None or end_cell is None:
+                connectivity_reason = "no_walkable_segment_endpoint"
+            elif (
+                int(self._component_ids[start_cell[1], start_cell[0]]) == 0
+                or int(self._component_ids[end_cell[1], end_cell[0]]) == 0
+                or int(self._component_ids[start_cell[1], start_cell[0]])
+                != int(self._component_ids[end_cell[1], end_cell[0]])
             ):
+                connectivity_reason = "different_walkable_components"
+
+            route = self._astar(points[left], points[right], raw_segment)
+            spike_rejected = route is not None and self._detour_is_spike(
+                route, points[left], points[right], raw_segment
+            )
+            if spike_rejected:
                 # A 3 m observation nick must not become a 30 m plant loop.
                 route = None
             if route is None:
+                reason = (
+                    connectivity_reason
+                    or ("detour_spike_rejected" if spike_rejected else "local_search_exhausted")
+                )
                 # Keep short observation nicks instead of inventing topology.
                 # Longer unrepairable collisions still fail the hypothesis.
                 if segment_m <= 6.0:
+                    if failure_reasons is not None:
+                        failure_reasons.append("short_residual_collision_kept")
                     rebuilt.extend(raw_segment)
                     cursor = right + 1
                     continue
+                if failure_reasons is not None:
+                    failure_reasons.append(reason)
                 return None, len(merged)
             rerouted += 1
             if rebuilt and np.linalg.norm(rebuilt[-1] - route[0]) < 1e-6:
@@ -1128,9 +1155,19 @@ class FloorplanConstraintEngine:
         feasible: list[dict[str, Any]] = []
         beam = self._select_diverse_beam(hypotheses)
         attempted = 0
+        route_failure_counts: dict[str, int] = {}
+
+        def record_route_failures(reasons: list[str]) -> None:
+            for reason in reasons:
+                route_failure_counts[reason] = route_failure_counts.get(reason, 0) + 1
+
         for hypothesis in beam:
             attempted += 1
-            repaired, rerouted_segments = self._repair_collisions(hypothesis["points"])
+            route_failures: list[str] = []
+            repaired, rerouted_segments = self._repair_collisions(
+                hypothesis["points"], failure_reasons=route_failures
+            )
+            record_route_failures(route_failures)
             if repaired is None:
                 continue
             corrected_metrics = self._path_metrics(repaired)
@@ -1143,7 +1180,11 @@ class FloorplanConstraintEngine:
                 self._collision_runs(repaired)
                 and corrected_metrics["collision_ratio"] > residual_collision_budget
             ):
-                repaired_again, extra_segments = self._repair_collisions(repaired)
+                route_failures = []
+                repaired_again, extra_segments = self._repair_collisions(
+                    repaired, failure_reasons=route_failures
+                )
+                record_route_failures(route_failures)
                 if repaired_again is None:
                     continue
                 repaired = repaired_again
@@ -1221,7 +1262,14 @@ class FloorplanConstraintEngine:
                 "diagnostics": {
                     **base_diagnostics,
                     "reason": "constraint_solution_not_found",
-                    "rejection_reasons": ["no_collision_free_route"],
+                    "rejection_reasons": (
+                        sorted(
+                            route_failure_counts,
+                            key=lambda reason: (-route_failure_counts[reason], reason),
+                        )
+                        or ["no_collision_free_route"]
+                    ),
+                    "route_failure_counts": route_failure_counts,
                     "hypothesis_count": len(hypotheses),
                     "beam_size": len(beam),
                     "constrained_hypotheses_attempted": attempted,
@@ -1588,7 +1636,7 @@ def apply_floorplan_constraints(
         "coordinate_convention": primary_convention,
         # Fragmentation lowers trust, but never removes a geometrically valid R3
         # route from competition.
-        "source_prior": 0.45 if fragmented_r3 else 0.0,
+        "source_prior": 0.45 if fragmented_r3 else 0.05,
     }]
 
     fusion_points = (
@@ -1603,7 +1651,10 @@ def apply_floorplan_constraints(
             "points": fusion_points,
             "timestamps": source_timestamps,
             "coordinate_convention": primary_convention,
-            "source_prior": 0.10,
+            # A fusion candidate has already passed the independent geometry
+            # agreement gate.  Prefer it on a map-cost tie, while still
+            # allowing a materially better raw R3 alignment to win.
+            "source_prior": 0.0,
         })
 
     diagnostics_payload = candidate_payload.get("diagnostics") or {}
