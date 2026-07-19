@@ -1162,6 +1162,7 @@ class FloorplanConstraintEngine:
         yaw_offsets_degrees: Sequence[float] = (
             -20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0
         ),
+        allow_safe_shape_fallback: bool = False,
     ) -> dict[str, Any]:
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {
@@ -1374,6 +1375,49 @@ class FloorplanConstraintEngine:
             if self._support_mask is not None
             else feasible
         )
+        shape_fallback_used = False
+        shape_fallback_budget = None
+        if (
+            not production_feasible
+            and self._support_mask is not None
+            and allow_safe_shape_fallback
+        ):
+            # An authoritative R3/fusion observation may disagree moderately
+            # with an immutable CAD mask.  Returning no route is worse than
+            # publishing the already computed, collision-free graph solution,
+            # provided it remains globally bounded.  This escape hatch is
+            # deliberately unavailable to independent LingBot observations.
+            # It cannot revive the former wall-crossing/U-turn regression.
+            safe_fallbacks: list[dict[str, Any]] = []
+            for item in feasible:
+                fallback_budget = max(
+                    6.0,
+                    min(18.0, float(item["length_meters"]) * 0.18),
+                )
+                p95 = float(np.percentile(item["displacement_m"], 95))
+                metrics = item["corrected_metrics"]
+                if (
+                    float(metrics["collision_ratio"]) == 0.0
+                    and float(metrics["outside_ratio"]) == 0.0
+                    and self._max_collision_run_meters(item["repaired"]) == 0.0
+                    and p95 <= fallback_budget
+                    and 0.60 <= float(item["length_ratio"]) <= 1.60
+                    and float(item["sharp_reverse_ratio"]) <= 0.05
+                ):
+                    safe_fallbacks.append({
+                        **item,
+                        "safe_shape_fallback_budget_meters": fallback_budget,
+                    })
+            if safe_fallbacks:
+                safe_fallbacks.sort(key=lambda item: (
+                    float(item["constrained_score"]),
+                    float(np.percentile(item["displacement_m"], 95)),
+                ))
+                production_feasible = safe_fallbacks
+                shape_fallback_used = True
+                shape_fallback_budget = float(
+                    safe_fallbacks[0]["safe_shape_fallback_budget_meters"]
+                )
         if not production_feasible:
             closest = feasible[0]
             closest_displacement = closest["displacement_m"]
@@ -1508,6 +1552,8 @@ class FloorplanConstraintEngine:
             quality_warnings.append("route_length_changed_significantly")
         if p95_correction > allowed_correction:
             quality_warnings.append("large_map_correction_applied")
+        if shape_fallback_used:
+            quality_warnings.append("authoritative_safe_map_fallback")
         if float(corrected_metrics.get("collision_ratio", 0.0)) > 0.0:
             quality_warnings.append("residual_micro_collisions_kept_to_preserve_shape")
         speed = float(best["speed_mps"])
@@ -1546,6 +1592,11 @@ class FloorplanConstraintEngine:
             "constrained_hypotheses_attempted": attempted,
             "feasible_hypotheses": len(feasible),
             "shape_preserving_hypotheses": len(production_feasible),
+            "shape_fallback_used": shape_fallback_used,
+            "shape_fallback_budget_meters": (
+                round(shape_fallback_budget, 3)
+                if shape_fallback_budget is not None else None
+            ),
             "selected_scale_pixels_per_unit": round(float(best["scale"]), 8),
             "selected_yaw_offset_degrees": round(float(best["yaw"]), 3),
             "estimated_length_meters": round(float(best["length_meters"]), 3),
@@ -1842,6 +1893,7 @@ def apply_floorplan_constraints(
                     context.get("direction_point"),
                     timestamps=observation.get("timestamps"),
                     coordinate_convention=str(observation["coordinate_convention"]),
+                    allow_safe_shape_fallback=(tier == 0),
                 )
                 diag = dict(candidate_alignment.get("diagnostics") or {})
                 if (
