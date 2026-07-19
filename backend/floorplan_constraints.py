@@ -1382,32 +1382,26 @@ class FloorplanConstraintEngine:
             and self._support_mask is not None
             and allow_safe_shape_fallback
         ):
-            # An authoritative R3/fusion observation may disagree moderately
-            # with an immutable CAD mask.  Returning no route is worse than
-            # publishing the already computed, collision-free graph solution,
-            # provided it remains globally bounded.  This escape hatch is
-            # deliberately unavailable to independent LingBot observations.
-            # It cannot revive the former wall-crossing/U-turn regression.
+            # An authoritative R3/fusion observation may disagree with an
+            # immutable CAD mask.  At this stage every item in ``feasible``
+            # has already passed local A* detour-spike rejection plus the hard
+            # outside/collision budgets.  A second global shape veto used to
+            # erase that valid route and left production with no trajectory.
+            # Prefer plan connectivity here and report degraded fidelity as a
+            # warning.  This escape hatch is deliberately unavailable to an
+            # independent LingBot observation, so it cannot revive the former
+            # wall-crossing/U-turn regression.
             safe_fallbacks: list[dict[str, Any]] = []
             for item in feasible:
-                fallback_budget = max(
-                    6.0,
-                    min(18.0, float(item["length_meters"]) * 0.18),
-                )
-                p95 = float(np.percentile(item["displacement_m"], 95))
                 metrics = item["corrected_metrics"]
                 if (
-                    float(metrics["collision_ratio"]) == 0.0
-                    and float(metrics["outside_ratio"]) == 0.0
-                    and self._max_collision_run_meters(item["repaired"]) == 0.0
-                    and p95 <= fallback_budget
-                    and 0.60 <= float(item["length_ratio"]) <= 1.60
-                    and float(item["sharp_reverse_ratio"]) <= 0.05
+                    float(metrics["outside_ratio"]) == 0.0
+                    and float(metrics["collision_ratio"])
+                    <= residual_collision_budget
+                    and self._max_collision_run_meters(item["repaired"])
+                    <= residual_segment_budget_meters
                 ):
-                    safe_fallbacks.append({
-                        **item,
-                        "safe_shape_fallback_budget_meters": fallback_budget,
-                    })
+                    safe_fallbacks.append(item)
             if safe_fallbacks:
                 safe_fallbacks.sort(key=lambda item: (
                     float(item["constrained_score"]),
@@ -1415,9 +1409,7 @@ class FloorplanConstraintEngine:
                 ))
                 production_feasible = safe_fallbacks
                 shape_fallback_used = True
-                shape_fallback_budget = float(
-                    safe_fallbacks[0]["safe_shape_fallback_budget_meters"]
-                )
+                shape_fallback_budget = float("inf")
         if not production_feasible:
             closest = feasible[0]
             closest_displacement = closest["displacement_m"]
@@ -1595,7 +1587,13 @@ class FloorplanConstraintEngine:
             "shape_fallback_used": shape_fallback_used,
             "shape_fallback_budget_meters": (
                 round(shape_fallback_budget, 3)
-                if shape_fallback_budget is not None else None
+                if shape_fallback_budget is not None
+                and math.isfinite(shape_fallback_budget)
+                else None
+            ),
+            "shape_fallback_policy": (
+                "authoritative_plan_connectivity_v2"
+                if shape_fallback_used else None
             ),
             "selected_scale_pixels_per_unit": round(float(best["scale"]), 8),
             "selected_yaw_offset_degrees": round(float(best["yaw"]), 3),
