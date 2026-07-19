@@ -1352,20 +1352,25 @@ def _merge_r3_production_trajectory(base: dict, selected: dict) -> dict:
         base_confidence = base.get("r3_pose_confidence")
         if isinstance(base_confidence, list) and len(base_confidence) >= 2 and len(plan) >= 2:
             import numpy as _np
-            source = _np.asarray(
+            # Keep name distinct from trajectory `source` below — rebinding it
+            # previously wrote pose-confidence arrays into r3_trajectory_source
+            # and broke LingBot restore on /api/r3-trajectory refresh.
+            confidence_series = _np.asarray(
                 [
                     float(value) if value is not None else _math.nan
                     for value in base_confidence
                 ],
                 dtype=float,
             )
-            finite = _np.flatnonzero(_np.isfinite(source))
+            finite = _np.flatnonzero(_np.isfinite(confidence_series))
             if len(finite) >= 2:
-                source = _np.interp(_np.arange(len(source)), finite, source[finite])
+                confidence_series = _np.interp(
+                    _np.arange(len(confidence_series)), finite, confidence_series[finite]
+                )
                 updated["r3_pose_confidence"] = _np.interp(
                     _np.linspace(0.0, 1.0, len(plan)),
-                    _np.linspace(0.0, 1.0, len(source)),
-                    source,
+                    _np.linspace(0.0, 1.0, len(confidence_series)),
+                    confidence_series,
                 ).tolist()
             else:
                 updated["r3_pose_confidence"] = []
@@ -4452,21 +4457,49 @@ async def r3_trajectory_proxy(
                             saved_result = saved_payload.get("analysis_result") or {}
                             saved_stats = saved_result.get("processing_stats") or {}
                             requested_source = str(trajectory_source or "raw")
-                            saved_source = str(
-                                saved_stats.get("r3_trajectory_source")
-                                or "scale_aware_candidate"
-                            )
+                            saved_source = saved_stats.get("r3_trajectory_source")
+                            if not isinstance(saved_source, str) or not saved_source.strip():
+                                saved_source = str(
+                                    saved_stats.get("r3_trajectory_source_requested")
+                                    or "scale_aware_candidate"
+                                )
                             candidate = saved_result.get("lingbot_fusion_candidate")
                             if should_restore_lingbot_fusion_candidate(
                                 candidate,
                                 requested_source=requested_source,
-                                saved_source=saved_source,
+                                saved_source=str(saved_source),
                             ):
                                 worker_result["lingbot_fusion_candidate"] = candidate
                                 worker_result["lingbot_shadow"] = saved_result.get("lingbot_shadow")
+                                # Fragmentation lives on the saved VPS result; the
+                                # GPU worker payload alone would skip independent.
+                                if saved_result.get("r3_pose_graph") is not None:
+                                    worker_result["r3_pose_graph"] = saved_result.get(
+                                        "r3_pose_graph"
+                                    )
+                                if saved_result.get("pose_graph") is not None:
+                                    worker_result["pose_graph"] = saved_result.get(
+                                        "pose_graph"
+                                    )
                                 stats = dict(worker_result.get("processing_stats") or {})
-                                stats["lingbot_fusion"] = saved_stats.get("lingbot_fusion") or {}
+                                stats["lingbot_fusion"] = (
+                                    (candidate.get("diagnostics") if isinstance(candidate, dict) else None)
+                                    or saved_stats.get("lingbot_fusion")
+                                    or {}
+                                )
                                 stats["lingbot_shadow_available"] = True
+                                for graph_key in (
+                                    "component_count",
+                                    "largest_component_coverage",
+                                    "largest_component_ratio",
+                                    "connected_pose_count",
+                                    "connected_poses",
+                                ):
+                                    if graph_key in saved_stats:
+                                        stats[graph_key] = saved_stats[graph_key]
+                                # Repair corrupted historical saves.
+                                if not isinstance(stats.get("r3_trajectory_source"), str):
+                                    stats["r3_trajectory_source"] = str(saved_source)
                                 worker_result["processing_stats"] = stats
                         except Exception as saved_error:
                             logger.warning(

@@ -1077,7 +1077,7 @@ class FloorplanConstraintEngine:
             # already blocks topology-destroying shrinks (e.g. 0.34).
             correction_budget = max(
                 2.5,
-                min(15.0, float(hypothesis["length_meters"]) * 0.10),
+                min(15.0, float(hypothesis["length_meters"]) * 0.12),
             )
             shape_preserved = (
                 p95_correction <= correction_budget

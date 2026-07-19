@@ -380,6 +380,14 @@ def _trajectory_list(points: np.ndarray) -> list[list[float]]:
     ]
 
 
+_R3_TRAJECTORY_SOURCE_LABELS = {
+    "raw",
+    "scale_aware_candidate",
+    "robust_candidate",
+    "pose_graph_candidate",
+}
+
+
 def should_restore_lingbot_fusion_candidate(
     candidate: Any,
     *,
@@ -389,9 +397,17 @@ def should_restore_lingbot_fusion_candidate(
     """Persist fused *or* independent-quality candidates across API refresh."""
     if not isinstance(candidate, dict):
         return False
-    if requested_source != saved_source:
+    if not bool(candidate.get("accepted") or candidate.get("independent_accepted")):
         return False
-    return bool(candidate.get("accepted") or candidate.get("independent_accepted"))
+    requested = str(requested_source or "").strip()
+    saved = str(saved_source or "").strip()
+    # Corrupted saves once stored pose-confidence arrays in r3_trajectory_source.
+    # Treat only known labels as a real source gate; otherwise restore anyway.
+    if saved not in _R3_TRAJECTORY_SOURCE_LABELS:
+        return True
+    if requested not in _R3_TRAJECTORY_SOURCE_LABELS:
+        return True
+    return requested == saved
 
 
 def build_lingbot_fusion_candidate(
