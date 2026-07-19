@@ -7,6 +7,7 @@ from backend.floorplan_constraints import (
     FloorplanConfig,
     FloorplanConstraintEngine,
     _polyline_sharp_reverse_ratio,
+    _stabilize_independent_observation,
     _trajectory_fractions,
     apply_floorplan_constraints,
     get_floorplan_engine,
@@ -320,7 +321,14 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             "lingbot_fusion_candidate": {
                 "accepted": True,
                 "plan_trajectory": fused_path,
-                "diagnostics": {"accepted": True},
+                "independent_accepted": True,
+                "independent_plan_trajectory": [
+                    [0, 0, 0], [120, 20, 0], [250, -20, 0], [500, 0, 0],
+                ],
+                "diagnostics": {
+                    "accepted": True,
+                    "independent_quality": {"accepted": True, "reasons": []},
+                },
             },
         }
         updated = apply_floorplan_constraints(source, {
@@ -336,8 +344,15 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             updated["floorplan_constraint"]["observation_source_selection"]["reason"],
-            "lowest_accepted_floorplan_cost",
+            "authoritative_candidate_accepted",
         )
+        selection = updated["floorplan_constraint"]["observation_source_selection"]
+        independent = next(
+            item for item in selection["candidate_results"]
+            if item["source"] == "lingbot_independent"
+        )
+        self.assertTrue(independent["skipped"])
+        self.assertEqual(independent["reason"], "authoritative_candidate_accepted")
 
     def test_fragmented_r3_selects_independent_lingbot_even_after_fusion_veto(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
@@ -346,8 +361,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         independent = [[float(x), 0.0, 0.0] for x in range(0, 61, 10)]
         source = {
             "method": "r3_reconstruction_scale_aware",
-            "plan_trajectory": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            "source_timestamps_seconds": [0.0, 60.0],
+            "plan_trajectory": [[0.0, 0.0, 0.0]],
+            "source_timestamps_seconds": [0.0],
             "turn_points": [{"trajectory_index": 1, "angle_degrees": 90.0}],
             "processing_stats": {
                 "pose_graph": {
@@ -381,7 +396,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             updated["floorplan_constraint"]["observation_source_selection"]["reason"],
-            "lowest_accepted_floorplan_cost",
+            "independent_fallback_after_authoritative_rejection",
         )
         self.assertEqual(updated["map_turn_points"], [])
         self.assertEqual(updated["final_turn_points"], [])
@@ -586,6 +601,42 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
 
         self.assertIsNone(repaired)
         self.assertIn("different_walkable_components", failures)
+
+    def test_three_meter_collision_is_never_kept_as_micro_collision(self) -> None:
+        mask = np.zeros((80, 120), dtype=bool)
+        mask[:, 58:62] = True
+        engine = FloorplanConstraintEngine.from_mask(
+            mask,
+            meters_per_pixel=0.1,
+            grid_cell_pixels=1,
+            person_radius_meters=0.0,
+        )
+        failures: list[str] = []
+        repaired, _ = engine._repair_collisions(
+            np.asarray([[42.0, 40.0], [76.0, 40.0]]),
+            failure_reasons=failures,
+        )
+
+        self.assertIsNone(repaired)
+        self.assertIn("different_walkable_components", failures)
+
+    def test_independent_stabilization_removes_length_inflating_jitter(self) -> None:
+        count = 600
+        x = np.linspace(0.0, 120.0, count)
+        y = np.sin(np.linspace(0.0, np.pi, count)) * 20.0
+        jitter = np.where(np.arange(count) % 2 == 0, -0.45, 0.45)
+        noisy = np.column_stack((x + jitter, y - jitter, np.zeros(count))).tolist()
+
+        stabilized, diagnostics = _stabilize_independent_observation(noisy)
+        raw = np.asarray(noisy)[:, :2]
+        stable = np.asarray(stabilized)[:, :2]
+        raw_length = np.linalg.norm(np.diff(raw, axis=0), axis=1).sum()
+        stable_length = np.linalg.norm(np.diff(stable, axis=0), axis=1).sum()
+
+        self.assertTrue(diagnostics["applied"], diagnostics)
+        self.assertEqual(len(stabilized), count)
+        self.assertTrue(np.allclose(stable[[0, -1]], raw[[0, -1]]))
+        self.assertLess(stable_length, raw_length * 0.65)
 
     def test_scale_prior_uses_walkable_extent_not_annotation_bbox(self) -> None:
         mask = np.zeros((100, 200), dtype=bool)
