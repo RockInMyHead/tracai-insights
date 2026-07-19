@@ -336,7 +336,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             updated["floorplan_constraint"]["observation_source_selection"]["reason"],
-            "fusion_supported_by_floorplan",
+            "lowest_accepted_floorplan_cost",
         )
 
     def test_fragmented_r3_selects_independent_lingbot_even_after_fusion_veto(self) -> None:
@@ -381,7 +381,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertEqual(
             updated["floorplan_constraint"]["observation_source_selection"]["reason"],
-            "fragmented_r3_uses_independent_lingbot",
+            "lowest_accepted_floorplan_cost",
         )
         self.assertEqual(updated["map_turn_points"], [])
         self.assertEqual(updated["final_turn_points"], [])
@@ -427,12 +427,165 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             updated["processing_stats"].get("map_observation_source"),
             "lingbot_independent",
         )
-        self.assertEqual(
-            updated["floorplan_constraint"]["observation_source_selection"].get(
-                "independent_rejected_reason"
-            ),
-            "independent_quality_failed",
+        selection = updated["floorplan_constraint"]["observation_source_selection"]
+        self.assertFalse(any(
+            item["source"] == "lingbot_independent"
+            for item in selection["candidate_results"]
+        ))
+
+    def test_fragmentation_is_soft_prior_and_cannot_veto_valid_r3(self) -> None:
+        class StubConfig:
+            meters_per_pixel = 0.1
+            plan_width = 100
+            plan_height = 100
+            person_radius_meters = 0.0
+
+        class StubEngine:
+            config = StubConfig()
+
+            def align(self, trajectory, *args, **kwargs):
+                points = np.asarray(trajectory, dtype=float)
+                is_primary = float(np.ptp(points[:, 0])) < 5.0
+                if is_primary:
+                    return {
+                        "accepted": True,
+                        "trajectory": [[10.0, 50.0], [20.0, 50.0]],
+                        "diagnostics": {
+                            "accepted": True,
+                            "reason": None,
+                            "constrained_score": 1.0,
+                            "correction_p95_meters": 0.1,
+                            "length_ratio": 1.0,
+                            "estimated_length_meters": 1.0,
+                            "plan_width": 100,
+                            "plan_height": 100,
+                            "meters_per_pixel": 0.1,
+                            "person_radius_meters": 0.0,
+                            "confidence": 0.9,
+                        },
+                    }
+                return {
+                    "accepted": False,
+                    "trajectory": [],
+                    "diagnostics": {
+                        "accepted": False,
+                        "reason": "constraint_solution_not_found",
+                        "rejection_reasons": ["different_walkable_components"],
+                    },
+                }
+
+        source = {
+            "method": "r3_reconstruction_scale_aware",
+            "plan_trajectory": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            "turn_points": [],
+            "processing_stats": {
+                "pose_graph": {
+                    "component_count": 25,
+                    "largest_component_coverage": 0.01,
+                }
+            },
+            "lingbot_fusion_candidate": {
+                "accepted": False,
+                "independent_accepted": True,
+                "independent_plan_trajectory": [
+                    [0.0, 0.0, 0.0], [50.0, 0.0, 0.0],
+                ],
+                "diagnostics": {
+                    "independent_quality": {"accepted": True, "reasons": []},
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine",
+            return_value=StubEngine(),
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
+        self.assertEqual(updated["processing_stats"]["map_observation_source"], "r3")
+        selection = updated["floorplan_constraint"]["observation_source_selection"]
+        self.assertTrue(selection["r3_severely_fragmented"])
+        self.assertEqual(selection["fragmentation_policy"], "soft_prior_not_veto")
+        self.assertEqual(selection["selected"], "r3")
+        independent_result = next(
+            item for item in selection["candidate_results"]
+            if item["source"] == "lingbot_independent" and item["variant"] == "native"
         )
+        self.assertFalse(independent_result["accepted"])
+
+    def test_rejected_independent_is_never_published_as_map_source(self) -> None:
+        class StubEngine:
+            def align(self, *args, **kwargs):
+                return {
+                    "accepted": False,
+                    "trajectory": [],
+                    "diagnostics": {
+                        "accepted": False,
+                        "reason": "constraint_solution_not_found",
+                        "rejection_reasons": ["different_walkable_components"],
+                    },
+                }
+
+        source = {
+            "method": "r3_reconstruction_scale_aware",
+            "plan_trajectory": [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]],
+            "processing_stats": {
+                "pose_graph": {
+                    "component_count": 20,
+                    "largest_component_coverage": 0.02,
+                }
+            },
+            "lingbot_fusion_candidate": {
+                "accepted": True,
+                "plan_trajectory": [[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
+                "independent_accepted": True,
+                "independent_plan_trajectory": [[0.0, 0.0, 0.0], [12.0, 0.0, 0.0]],
+                "diagnostics": {
+                    "independent_quality": {"accepted": True, "reasons": []},
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine",
+            return_value=StubEngine(),
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+
+        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
+        self.assertNotIn("map_observation_source", updated["processing_stats"])
+        self.assertNotIn("map_trajectory", updated)
+        selection = updated["floorplan_constraint"]["observation_source_selection"]
+        self.assertIsNone(selection["selected"])
+        self.assertEqual(selection["reason"], "no_candidate_satisfied_floorplan")
+        self.assertIsNone(
+            updated["floorplan_constraint"]["trajectory_observation_source"]
+        )
+
+    def test_unrepairable_segment_reports_disconnected_mask_components(self) -> None:
+        mask = np.zeros((80, 120), dtype=bool)
+        mask[:, 58:62] = True
+        engine = FloorplanConstraintEngine.from_mask(
+            mask,
+            meters_per_pixel=0.1,
+            grid_cell_pixels=1,
+            person_radius_meters=0.0,
+        )
+        failures: list[str] = []
+        repaired, _ = engine._repair_collisions(
+            np.asarray([[20.0, 40.0], [100.0, 40.0]]),
+            failure_reasons=failures,
+        )
+
+        self.assertIsNone(repaired)
+        self.assertIn("different_walkable_components", failures)
 
     def test_scale_prior_uses_walkable_extent_not_annotation_bbox(self) -> None:
         mask = np.zeros((100, 200), dtype=bool)

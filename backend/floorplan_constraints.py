@@ -774,7 +774,12 @@ class FloorplanConstraintEngine:
             index += 1
         return runs
 
-    def _repair_collisions(self, points: np.ndarray) -> tuple[Optional[np.ndarray], int]:
+    def _repair_collisions(
+        self,
+        points: np.ndarray,
+        *,
+        failure_reasons: Optional[list[str]] = None,
+    ) -> tuple[Optional[np.ndarray], int]:
         runs = self._collision_runs(points)
         if not runs:
             return points.copy(), 0
@@ -798,19 +803,41 @@ class FloorplanConstraintEngine:
             rebuilt.extend(points[cursor:left])
             raw_segment = points[left:right + 1]
             segment_m = _polyline_length(raw_segment) * self.config.meters_per_pixel
-            route = self._astar(points[left], points[right], raw_segment)
-            if route is not None and self._detour_is_spike(
-                route, points[left], points[right], raw_segment
+            start_cell = self._nearest_free(self._pixel_to_cell(points[left]))
+            end_cell = self._nearest_free(self._pixel_to_cell(points[right]))
+            connectivity_reason = None
+            if start_cell is None or end_cell is None:
+                connectivity_reason = "no_walkable_segment_endpoint"
+            elif (
+                int(self._component_ids[start_cell[1], start_cell[0]]) == 0
+                or int(self._component_ids[end_cell[1], end_cell[0]]) == 0
+                or int(self._component_ids[start_cell[1], start_cell[0]])
+                != int(self._component_ids[end_cell[1], end_cell[0]])
             ):
+                connectivity_reason = "different_walkable_components"
+
+            route = self._astar(points[left], points[right], raw_segment)
+            spike_rejected = route is not None and self._detour_is_spike(
+                route, points[left], points[right], raw_segment
+            )
+            if spike_rejected:
                 # A 3 m observation nick must not become a 30 m plant loop.
                 route = None
             if route is None:
+                reason = (
+                    connectivity_reason
+                    or ("detour_spike_rejected" if spike_rejected else "local_search_exhausted")
+                )
                 # Keep short observation nicks instead of inventing topology.
                 # Longer unrepairable collisions still fail the hypothesis.
                 if segment_m <= 6.0:
+                    if failure_reasons is not None:
+                        failure_reasons.append("short_residual_collision_kept")
                     rebuilt.extend(raw_segment)
                     cursor = right + 1
                     continue
+                if failure_reasons is not None:
+                    failure_reasons.append(reason)
                 return None, len(merged)
             rerouted += 1
             if rebuilt and np.linalg.norm(rebuilt[-1] - route[0]) < 1e-6:
@@ -1128,9 +1155,19 @@ class FloorplanConstraintEngine:
         feasible: list[dict[str, Any]] = []
         beam = self._select_diverse_beam(hypotheses)
         attempted = 0
+        route_failure_counts: dict[str, int] = {}
+
+        def record_route_failures(reasons: list[str]) -> None:
+            for reason in reasons:
+                route_failure_counts[reason] = route_failure_counts.get(reason, 0) + 1
+
         for hypothesis in beam:
             attempted += 1
-            repaired, rerouted_segments = self._repair_collisions(hypothesis["points"])
+            route_failures: list[str] = []
+            repaired, rerouted_segments = self._repair_collisions(
+                hypothesis["points"], failure_reasons=route_failures
+            )
+            record_route_failures(route_failures)
             if repaired is None:
                 continue
             corrected_metrics = self._path_metrics(repaired)
@@ -1143,7 +1180,11 @@ class FloorplanConstraintEngine:
                 self._collision_runs(repaired)
                 and corrected_metrics["collision_ratio"] > residual_collision_budget
             ):
-                repaired_again, extra_segments = self._repair_collisions(repaired)
+                route_failures = []
+                repaired_again, extra_segments = self._repair_collisions(
+                    repaired, failure_reasons=route_failures
+                )
+                record_route_failures(route_failures)
                 if repaired_again is None:
                     continue
                 repaired = repaired_again
@@ -1221,7 +1262,14 @@ class FloorplanConstraintEngine:
                 "diagnostics": {
                     **base_diagnostics,
                     "reason": "constraint_solution_not_found",
-                    "rejection_reasons": ["no_collision_free_route"],
+                    "rejection_reasons": (
+                        sorted(
+                            route_failure_counts,
+                            key=lambda reason: (-route_failure_counts[reason], reason),
+                        )
+                        or ["no_collision_free_route"]
+                    ),
+                    "route_failure_counts": route_failure_counts,
                     "hypothesis_count": len(hypotheses),
                     "beam_size": len(beam),
                     "constrained_hypotheses_attempted": attempted,
@@ -1530,23 +1578,36 @@ def apply_floorplan_constraints(
     result: dict[str, Any],
     map_context: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Attach an accepted map trajectory without mutating visual-source data."""
+    """Evaluate every trustworthy observer and attach only an accepted map route.
+
+    Pose-graph fragmentation is evidence, not a veto.  R3, guarded R3/LingBot
+    fusion, and both PCA polarities of an independent LingBot observation are
+    evaluated against the same immutable floor plan.  The selected source is
+    published only after its map alignment passes all production gates.
+    """
     if not isinstance(result, dict):
         return result
     context = map_context or {}
     map_id = str(context.get("floorplan_id") or DEFAULT_FLOORPLAN_ID)
-    points = result.get("plan_trajectory") or result.get("trajectory") or []
+    primary_points = result.get("plan_trajectory") or result.get("trajectory") or []
     stats = dict(result.get("processing_stats") or {})
     for stale_key in (
         "map_matching_applied",
         "map_trajectory_points",
         "map_confidence",
         "map_distance_meters",
+        "map_observation_source",
         "floorplan_constraint",
     ):
         stats.pop(stale_key, None)
+
     method = str(result.get("method") or "").lower()
-    convention = (
+    primary_source = (
+        "r3"
+        if method.startswith("r3")
+        else ("lingbot" if method.startswith("lingbot") else (method or "visual_odometry"))
+    )
+    primary_convention = (
         "x_forward_y_left_z_up"
         if method.startswith("r3")
         else "x_right_y_down"
@@ -1555,184 +1616,219 @@ def apply_floorplan_constraints(
     if isinstance(quality, dict):
         projection = quality.get("projection") or {}
         if isinstance(projection, dict):
-            convention = str(projection.get("plan_coordinate_convention") or convention)
-    candidate_payload = result.get("lingbot_fusion_candidate")
-    candidate_points: Any = []
-    independent_points: Any = []
-    independent_quality_ok = False
-    if isinstance(candidate_payload, dict) and candidate_payload.get("accepted"):
-        candidate_points = candidate_payload.get("plan_trajectory") or []
-    if isinstance(candidate_payload, dict) and candidate_payload.get("independent_accepted"):
-        independent_points = candidate_payload.get("independent_plan_trajectory") or []
-        diagnostics = candidate_payload.get("diagnostics") or {}
-        independent_quality = (
-            diagnostics.get("independent_quality") if isinstance(diagnostics, dict) else None
-        )
-        if isinstance(independent_quality, dict):
-            independent_quality_ok = bool(independent_quality.get("accepted", True))
-        else:
-            independent_quality_ok = True
+            primary_convention = str(
+                projection.get("plan_coordinate_convention") or primary_convention
+            )
+
+    source_timestamps = (
+        result.get("r3_source_timestamps_seconds")
+        or result.get("source_timestamps_seconds")
+    )
     fragmented_r3 = method.startswith("r3") and _r3_is_severely_fragmented(result)
-    use_independent = bool(
-        fragmented_r3 and independent_points and independent_quality_ok
+    candidate_payload = result.get("lingbot_fusion_candidate")
+    candidate_payload = candidate_payload if isinstance(candidate_payload, dict) else {}
+
+    observations: list[dict[str, Any]] = [{
+        "source": primary_source,
+        "variant": "primary",
+        "points": primary_points,
+        "timestamps": source_timestamps,
+        "coordinate_convention": primary_convention,
+        # Fragmentation lowers trust, but never removes a geometrically valid R3
+        # route from competition.
+        "source_prior": 0.45 if fragmented_r3 else 0.05,
+    }]
+
+    fusion_points = (
+        candidate_payload.get("plan_trajectory") or []
+        if candidate_payload.get("accepted")
+        else []
     )
-    primary_observation_source = (
-        "r3"
-        if method.startswith("r3")
-        else ("lingbot" if method.startswith("lingbot") else (method or "visual_odometry"))
+    if fusion_points:
+        observations.append({
+            "source": "r3_lingbot_fusion",
+            "variant": "guarded_fusion",
+            "points": fusion_points,
+            "timestamps": source_timestamps,
+            "coordinate_convention": primary_convention,
+            # A fusion candidate has already passed the independent geometry
+            # agreement gate.  Prefer it on a map-cost tie, while still
+            # allowing a materially better raw R3 alignment to win.
+            "source_prior": 0.0,
+        })
+
+    diagnostics_payload = candidate_payload.get("diagnostics") or {}
+    independent_quality = (
+        diagnostics_payload.get("independent_quality")
+        if isinstance(diagnostics_payload, dict)
+        else None
     )
-    selected_points = points
-    selected_observation_source = primary_observation_source
+    independent_quality_ok = bool(candidate_payload.get("independent_accepted")) and (
+        not isinstance(independent_quality, dict)
+        or bool(independent_quality.get("accepted", True))
+    )
+    independent_points = (
+        candidate_payload.get("independent_plan_trajectory") or []
+        if independent_quality_ok
+        else []
+    )
+    independent_timestamps = (
+        candidate_payload.get("lingbot_source_timestamps_seconds")
+        or candidate_payload.get("source_timestamps_seconds")
+    )
+    if independent_points:
+        if not isinstance(independent_timestamps, list) or len(independent_timestamps) < 2:
+            independent_timestamps = _resample_timestamps(
+                source_timestamps, len(independent_points)
+            )
+        independent_prior = 0.20 if fragmented_r3 else 0.80
+        observations.append({
+            "source": "lingbot_independent",
+            "variant": "native",
+            "points": independent_points,
+            "timestamps": independent_timestamps,
+            "coordinate_convention": "x_right_y_down",
+            "source_prior": independent_prior,
+        })
+        flipped = _flip_polyline_y(independent_points)
+        if flipped:
+            observations.append({
+                "source": "lingbot_independent",
+                "variant": "y_flip",
+                "points": flipped,
+                "timestamps": independent_timestamps,
+                "coordinate_convention": "x_right_y_down",
+                "source_prior": independent_prior + 0.02,
+            })
+
     source_selection: dict[str, Any] = {
-        "primary": primary_observation_source,
-        "candidate": (
-            "lingbot_independent" if use_independent
-            else ("r3_lingbot_fusion" if candidate_points else None)
-        ),
-        "selected": primary_observation_source,
-        "reason": "no_fusion_candidate" if not candidate_points else "primary_preferred",
+        "primary": primary_source,
+        "selected": None,
+        "reason": "no_candidate_satisfied_floorplan",
+        "r3_severely_fragmented": bool(fragmented_r3),
+        "fragmentation_policy": "soft_prior_not_veto",
+        "candidate_results": [],
     }
+    selected_observation: Optional[dict[str, Any]] = None
+    alignment: dict[str, Any] = {
+        "accepted": False,
+        "trajectory": [],
+        "diagnostics": {
+            "engine": "floorplan_constraint_engine_v5_exterior_guarded",
+            "map_id": map_id,
+            "accepted": False,
+            "reason": "no_candidates_evaluated",
+        },
+    }
+
     try:
         engine = get_floorplan_engine(map_id)
-        source_timestamps = (
-            result.get("r3_source_timestamps_seconds")
-            or result.get("source_timestamps_seconds")
-        )
-        if use_independent:
-            selected_points = independent_points
-            selected_observation_source = "lingbot_independent"
-            independent_timestamps = None
-            if isinstance(candidate_payload, dict):
-                independent_timestamps = (
-                    candidate_payload.get("lingbot_source_timestamps_seconds")
-                    or candidate_payload.get("source_timestamps_seconds")
-                )
-            if not isinstance(independent_timestamps, list) or len(independent_timestamps) < 2:
-                independent_timestamps = _resample_timestamps(
-                    source_timestamps, len(independent_points)
-                )
-            # PCA Y-sign is gauge freedom.  When R³ is fragmented it cannot
-            # adjudicate chirality, so score both polarities on the floor plan.
-            independent_variants: list[tuple[str, Any]] = [
-                ("native", independent_points),
-            ]
-            flipped = _flip_polyline_y(independent_points)
-            if flipped:
-                independent_variants.append(("y_flip", flipped))
-
-            def _independent_rank(payload: dict[str, Any]) -> tuple[float, float, float, float]:
-                diag = payload.get("diagnostics") or {}
-                accepted_rank = 0.0 if payload.get("accepted") else 1.0
-                length_ratio = max(_finite_float(diag.get("length_ratio"), 1e9), 1e-9)
-                p95 = _finite_float(diag.get("correction_p95_meters"), 1e9)
-                score = _finite_float(diag.get("constrained_score"), 1e9)
-                return (
-                    accepted_rank,
-                    abs(math.log(length_ratio)),
-                    p95,
-                    score,
-                )
-
-            alignment = {
-                "accepted": False,
-                "trajectory": [],
-                "diagnostics": {"reason": "independent_polarity_unavailable"},
-            }
-            best_label = "native"
-            best_rank = (1.0, float("inf"), float("inf"), float("inf"))
-            polarity_diagnostics: list[dict[str, Any]] = []
-            for label, variant_points in independent_variants:
-                candidate_alignment = engine.align(
-                    variant_points,
-                    context.get("reference_point"),
-                    context.get("direction_point"),
-                    timestamps=independent_timestamps,
-                    coordinate_convention="x_right_y_down",
-                )
-                diag = candidate_alignment.get("diagnostics") or {}
-                polarity_diagnostics.append({
-                    "label": label,
-                    "accepted": bool(candidate_alignment.get("accepted")),
-                    "length_ratio": diag.get("length_ratio"),
-                    "correction_p95_meters": diag.get("correction_p95_meters"),
-                    "constrained_score": diag.get("constrained_score"),
-                })
-                rank = _independent_rank(candidate_alignment)
-                if rank < best_rank:
-                    best_rank = rank
-                    best_label = label
-                    alignment = candidate_alignment
-                    selected_points = variant_points
-            source_selection.update({
-                "selected": selected_observation_source,
-                "reason": "fragmented_r3_uses_independent_lingbot",
-                "r3_severely_fragmented": True,
-                "independent_polarity": best_label,
-                "independent_polarity_candidates": polarity_diagnostics,
-            })
-        else:
-            if fragmented_r3 and independent_points and not independent_quality_ok:
-                source_selection["independent_rejected_reason"] = "independent_quality_failed"
-            alignment = engine.align(
-                points,
-                context.get("reference_point"),
-                context.get("direction_point"),
-                timestamps=source_timestamps,
-                coordinate_convention=convention,
-            )
-        if candidate_points and not use_independent:
+        evaluated: list[dict[str, Any]] = []
+        for observation in observations:
             candidate_alignment = engine.align(
-                candidate_points,
+                observation["points"],
                 context.get("reference_point"),
                 context.get("direction_point"),
-                timestamps=result.get("r3_source_timestamps_seconds") or result.get("source_timestamps_seconds"),
-                coordinate_convention=convention,
+                timestamps=observation.get("timestamps"),
+                coordinate_convention=str(observation["coordinate_convention"]),
             )
-            primary_diag = alignment.get("diagnostics") or {}
-            candidate_diag = candidate_alignment.get("diagnostics") or {}
-            primary_score = _finite_float(primary_diag.get("constrained_score"), float("inf"))
-            candidate_score = _finite_float(candidate_diag.get("constrained_score"), float("inf"))
-            primary_correction = _finite_float(
-                primary_diag.get("correction_p95_meters"), float("inf")
+            diag = candidate_alignment.get("diagnostics") or {}
+            constrained_score = _finite_float(
+                diag.get("constrained_score"), float("inf")
             )
-            candidate_correction = _finite_float(
-                candidate_diag.get("correction_p95_meters"), float("inf")
+            correction_p95 = _finite_float(
+                diag.get("correction_p95_meters"), float("inf")
             )
-            candidate_is_preferred = bool(candidate_alignment.get("accepted")) and (
-                not alignment.get("accepted")
-                or (
-                    candidate_score <= primary_score + 0.10
-                    and candidate_correction <= primary_correction * 1.10 + 0.25
-                )
+            length_ratio = max(
+                _finite_float(diag.get("length_ratio"), 1.0), 1e-9
             )
-            source_selection.update({
-                "primary_constrained_score": (
-                    round(primary_score, 6) if math.isfinite(primary_score) else None
+            source_prior = float(observation["source_prior"])
+            selection_score = (
+                constrained_score + source_prior
+                if candidate_alignment.get("accepted")
+                else float("inf")
+            )
+            evaluated_item = {
+                **observation,
+                "alignment": candidate_alignment,
+                "selection_score": selection_score,
+                "correction_p95": correction_p95,
+                "length_ratio": length_ratio,
+            }
+            evaluated.append(evaluated_item)
+            source_selection["candidate_results"].append({
+                "source": observation["source"],
+                "variant": observation["variant"],
+                "accepted": bool(candidate_alignment.get("accepted")),
+                "reason": diag.get("reason"),
+                "rejection_reasons": diag.get("rejection_reasons") or [],
+                "constrained_score": (
+                    round(constrained_score, 6)
+                    if math.isfinite(constrained_score)
+                    else None
                 ),
-                "candidate_constrained_score": (
-                    round(candidate_score, 6) if math.isfinite(candidate_score) else None
+                "source_prior": round(source_prior, 4),
+                "selection_score": (
+                    round(selection_score, 6)
+                    if math.isfinite(selection_score)
+                    else None
                 ),
-                "primary_correction_p95_meters": (
-                    round(primary_correction, 3) if math.isfinite(primary_correction) else None
+                "correction_p95_meters": (
+                    round(correction_p95, 3)
+                    if math.isfinite(correction_p95)
+                    else None
                 ),
-                "candidate_correction_p95_meters": (
-                    round(candidate_correction, 3) if math.isfinite(candidate_correction) else None
+                "length_ratio": (
+                    round(length_ratio, 5)
+                    if math.isfinite(length_ratio)
+                    else None
                 ),
             })
-            if candidate_is_preferred:
-                alignment = candidate_alignment
-                selected_points = candidate_points
-                selected_observation_source = "r3_lingbot_fusion"
-                source_selection.update({
-                    "selected": selected_observation_source,
-                    "reason": (
-                        "primary_constraint_failed"
-                        if not primary_diag.get("accepted")
-                        else "fusion_supported_by_floorplan"
-                    ),
-                })
-            else:
-                source_selection["reason"] = "primary_has_lower_map_cost"
+
+        accepted = [item for item in evaluated if item["alignment"].get("accepted")]
+        if accepted:
+            accepted.sort(key=lambda item: (
+                float(item["selection_score"]),
+                float(item["correction_p95"]),
+                abs(math.log(max(float(item["length_ratio"]), 1e-9))),
+                str(item["source"]),
+                str(item["variant"]),
+            ))
+            selected_observation = accepted[0]
+            alignment = selected_observation["alignment"]
+            selected_source = str(selected_observation["source"])
+            source_selection.update({
+                "selected": selected_source,
+                "selected_variant": selected_observation["variant"],
+                "reason": "lowest_accepted_floorplan_cost",
+                "selection_score": round(
+                    float(selected_observation["selection_score"]), 6
+                ),
+            })
+        elif evaluated:
+            # Preserve the most informative rejection diagnostics, but do not
+            # claim that its observer was selected for the map.
+            rejection_priority = {
+                "map_correction_exceeds_observation_budget": 0,
+                "constraint_solution_not_found": 1,
+                "no_walkable_start": 2,
+                "missing_start_or_direction": 3,
+            }
+            evaluated.sort(key=lambda item: (
+                rejection_priority.get(
+                    str((item["alignment"].get("diagnostics") or {}).get("reason")),
+                    10,
+                ),
+                float(item["correction_p95"]),
+            ))
+            alignment = evaluated[0]["alignment"]
+            source_selection["best_rejected_candidate"] = {
+                "source": evaluated[0]["source"],
+                "variant": evaluated[0]["variant"],
+                "reason": (
+                    evaluated[0]["alignment"].get("diagnostics") or {}
+                ).get("reason"),
+            }
     except Exception as exc:
         alignment = {
             "accepted": False,
@@ -1745,25 +1841,30 @@ def apply_floorplan_constraints(
                 "error": str(exc),
             },
         }
+        source_selection["reason"] = "floorplan_engine_error"
 
     updated = dict(result)
-    diagnostics = dict(alignment["diagnostics"])
-    diagnostics["trajectory_observation_source"] = selected_observation_source
+    diagnostics = dict(alignment.get("diagnostics") or {})
+    selected_source = (
+        str(selected_observation["source"])
+        if selected_observation is not None and alignment.get("accepted")
+        else None
+    )
+    diagnostics["trajectory_observation_source"] = selected_source
     diagnostics["observation_source_selection"] = source_selection
     updated["floorplan_constraint"] = diagnostics
     stats["floorplan_constraint"] = diagnostics
-    stats["map_matching_applied"] = bool(alignment["accepted"])
+    stats["map_matching_applied"] = bool(alignment.get("accepted"))
     stats["floorplan_id"] = map_id
-    if alignment["accepted"]:
+
+    if alignment.get("accepted") and selected_observation is not None:
         mapped = alignment["trajectory"]
-        # R3 turn indices have no valid correspondence to an independent
-        # LingBot trajectory and would create authoritative-looking false turns.
-        source_turns = [] if selected_observation_source == "lingbot_independent" else result.get("turn_points")
-        selected_timestamps = (
-            candidate_payload.get("lingbot_source_timestamps_seconds")
-            if selected_observation_source == "lingbot_independent"
-            and isinstance(candidate_payload, dict)
-            else source_timestamps
+        selected_points = selected_observation["points"]
+        selected_timestamps = selected_observation.get("timestamps")
+        source_turns = (
+            []
+            if selected_source == "lingbot_independent"
+            else result.get("turn_points")
         )
         map_turns = _map_turn_points(
             source_turns,
@@ -1776,7 +1877,7 @@ def apply_floorplan_constraints(
         updated["map_turn_points"] = map_turns
         updated["final_turn_points"] = (
             []
-            if selected_observation_source == "lingbot_independent"
+            if selected_source == "lingbot_independent"
             else (map_turns or result.get("turn_points") or [])
         )
         map_distance = (
@@ -1785,7 +1886,7 @@ def apply_floorplan_constraints(
         )
         stats["map_trajectory_points"] = len(mapped)
         stats["map_confidence"] = diagnostics.get("confidence")
-        stats["map_observation_source"] = selected_observation_source
+        stats["map_observation_source"] = selected_source
         stats["map_distance_meters"] = round(map_distance, 3)
         stats["estimated_distance"] = round(map_distance, 3)
         updated["map_metadata"] = {
@@ -1795,12 +1896,14 @@ def apply_floorplan_constraints(
             "meters_per_pixel": diagnostics.get("meters_per_pixel"),
             "person_radius_meters": diagnostics.get("person_radius_meters"),
             "source": "fixed_floorplan_constraint_engine",
-            "trajectory_observation_source": selected_observation_source,
+            "trajectory_observation_source": selected_source,
+            "observation_variant": selected_observation["variant"],
         }
     else:
         updated.pop("map_trajectory", None)
         updated.pop("map_turn_points", None)
         updated.pop("map_metadata", None)
         updated["final_turn_points"] = result.get("turn_points") or []
+
     updated["processing_stats"] = stats
     return updated
