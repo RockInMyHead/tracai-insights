@@ -884,7 +884,22 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               setCurrentStep(`[${video.ownerName}] Перенос R³ траектории на план...`);
               setLiveStage("map");
               setLiveProgress((prev) => Math.max(prev, 96));
-              const [filtered, selectedTrajectory] = await Promise.all([
+              // These two endpoints can be very slow on big AVI.
+              // If they take too long, keep the UI unblocked and skip the
+              // refined merge — the saved production result is still valid.
+              const withTimeout = async <T,>(p: Promise<T>, ms: number): Promise<T> =>
+                new Promise<T>((resolve, reject) => {
+                  const t = window.setTimeout(() => reject(new Error("r3_refine_timeout")), ms);
+                  p.then((v) => {
+                    window.clearTimeout(t);
+                    resolve(v);
+                  }).catch((e) => {
+                    window.clearTimeout(t);
+                    reject(e);
+                  });
+                });
+
+              const fetchRefined = Promise.all([
                 apiClient.getR3PointCloudFiltered(uploadedVideoId, {
                   maxPoints: 100000,
                   minConf: 1.4,
@@ -894,6 +909,8 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
                 }),
                 apiClient.getR3Trajectory(uploadedVideoId, r3TrajectorySource),
               ]);
+
+              const [filtered, selectedTrajectory] = await withTimeout(fetchRefined, 25000);
               const rawTrajectory3d = Array.isArray(filtered.raw_trajectory_3d)
                 ? filtered.raw_trajectory_3d.filter((p) => Array.isArray(p) && p.length >= 3)
                 : [];
