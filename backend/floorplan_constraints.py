@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - package import path
 
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
+FLOORPLAN_CONSTRAINT_REVISION = "authoritative_plan_connectivity_v2"
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
 
@@ -2060,6 +2061,7 @@ def apply_floorplan_constraints(
     )
     diagnostics["trajectory_observation_source"] = selected_source
     diagnostics["observation_source_selection"] = source_selection
+    diagnostics["constraint_revision"] = FLOORPLAN_CONSTRAINT_REVISION
     updated["floorplan_constraint"] = diagnostics
     stats["floorplan_constraint"] = diagnostics
     stats["map_matching_applied"] = bool(alignment.get("accepted"))
