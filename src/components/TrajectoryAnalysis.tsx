@@ -40,6 +40,10 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
   topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
   map_correction_exceeds_observation_budget: "коррекция плана превышает бюджет наблюдения",
+  insufficient_independent_net_progress: "независимая траектория слишком сжата или возвращается назад",
+  compressed_or_looping_independent_observation: "LingBot не даёт однозначного продвижения от старта к финишу",
+  ambiguous_independent_map_alignment: "для LingBot найдено несколько несовместимых масштабов маршрута",
+  independent_scale_or_topology_ambiguous: "масштаб или топология независимой траектории неоднозначны",
 };
 
 const LINGBOT_FUSION_REASON_LABELS: Record<string, string> = {
@@ -47,6 +51,7 @@ const LINGBOT_FUSION_REASON_LABELS: Record<string, string> = {
   turn_chirality_conflict: "разный знак поворотов",
   trajectory_too_short: "слишком короткая траектория",
   similarity_fit_failed: "не удалось совместить траектории",
+  insufficient_net_progress: "слишком мало продвижения от старта к финишу",
 };
 
 const MAP_OBSERVATION_SOURCE_LABELS: Record<string, string> = {

@@ -18,7 +18,7 @@
   "person_radius_meters": 0.28,
   "walking_speed_mps": 1.2,
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
-  "obstacle_mask_sha256": "bc311db521ba6acf3f1243247c0f89bba5169fe743a13bba2477098c3a017ba1",
+  "obstacle_mask_sha256": "e1c650ab68868022a00ffec7463cc69a3ee6d67176153fe1c74c0f5566e8a034",
   "support_mask_file": "kerama_marazzi_2025_support.png",
   "support_mask_sha256": "f1eed9806e2021124b01168f8b320f25ca4eca2d1e0595a29d168a15908a1ce5",
   "support_mask_generation": {
@@ -32,11 +32,14 @@
   "source_pdf": "kerama-marazzi-2025.pdf",
   "display_image": "kerama-marazzi-2025.png",
   "annotation_component_count": 44,
-  "annotation_pixel_count": 1368527,
+  "annotation_pixel_count": 1352160,
   "reference_mask": {
-    "method": "manual_reference_obstacle_override_v1",
-    "source": "Керама Марацци 2025-Model (1)(5).pdf",
-    "support_policy": "retain_verified_support_no_green_expansion",
+    "method": "operator_ground_truth_corridor_v1",
+    "reference_route_file": "kerama_marazzi_2025_reference_route.json",
+    "verified_walkable_half_width_meters": 0.75,
+    "corridor_pixel_count": 58207,
+    "obstacle_pixels_cleared": 16367,
+    "support_pixels_added": 0,
     "false_north_corridor_blocked": [
       600,
       500,

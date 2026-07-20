@@ -190,6 +190,27 @@ class LingBotFusionTests(unittest.TestCase):
         self.assertFalse(result["independent_accepted"])
         self.assertIn("degenerate_span", result["diagnostics"]["independent_quality"]["reasons"])
 
+    def test_low_progress_lingbot_cannot_become_independent_map_rescue(self) -> None:
+        r3 = self._r3_path()
+        lingbot = np.asarray([
+            [0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [10.0, 5.0],
+            [5.0, 5.0], [0.0, 5.0], [0.0, 10.0], [5.0, 10.0],
+            [10.0, 10.0], [10.0, 6.0], [6.0, 6.0], [4.0, 6.0],
+        ])
+        result = build_lingbot_fusion_candidate(
+            {"plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist()},
+            {
+                "plan_trajectory": np.column_stack(
+                    (lingbot, np.zeros(len(lingbot)))
+                ).tolist()
+            },
+        )
+
+        quality = result["diagnostics"]["independent_quality"]
+        self.assertLess(quality["net_progress_ratio"], 0.64)
+        self.assertIn("insufficient_net_progress", quality["reasons"])
+        self.assertFalse(result["independent_accepted"])
+
     def test_timestamp_correspondence_is_preferred_over_arc_length(self) -> None:
         r3 = self._r3_path()
         lingbot = r3.copy()

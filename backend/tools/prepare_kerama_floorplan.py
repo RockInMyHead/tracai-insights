@@ -25,6 +25,12 @@ from scipy import ndimage
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from backend.kerama_reference_route import apply_reference_route_overrides
+
+
 PUBLIC = ROOT / "public" / "floorplans"
 BACKEND = ROOT / "backend" / "assets" / "floorplans"
 MAP_ID = "kerama_marazzi_2025"
@@ -70,7 +76,6 @@ def main() -> None:
         display_path = PUBLIC / "kerama-marazzi-2025.png"
         marked_image.save(display_path, optimize=True)
         obstacle_path = BACKEND / "kerama_marazzi_2025_obstacles.png"
-        Image.fromarray((mask * 255).astype(np.uint8)).save(obstacle_path, optimize=True)
 
         # A distance halo around every CAD primitive is not a walkability
         # model.  In particular it creates an artificial corridor on the
@@ -99,6 +104,19 @@ def main() -> None:
         )))
         exterior = np.isin(blank_labels, border_labels)
         support = ~exterior
+        meters_per_pixel = math.sqrt(
+            OFFICE_AREA_M2
+            / ((OFFICE_INTERIOR[2] - OFFICE_INTERIOR[0])
+               * (OFFICE_INTERIOR[3] - OFFICE_INTERIOR[1]))
+        )
+        mask, support, reference_override = apply_reference_route_overrides(
+            mask,
+            support,
+            meters_per_pixel=meters_per_pixel,
+        )
+        Image.fromarray((mask * 255).astype(np.uint8)).save(
+            obstacle_path, optimize=True
+        )
         support_path = BACKEND / "kerama_marazzi_2025_support.png"
         Image.fromarray((support * 255).astype(np.uint8)).save(
             support_path, optimize=True
@@ -112,7 +130,7 @@ def main() -> None:
         "map_id": MAP_ID,
         "width": int(marked.shape[1]),
         "height": int(marked.shape[0]),
-        "meters_per_pixel": math.sqrt(OFFICE_AREA_M2 / office_pixels),
+        "meters_per_pixel": meters_per_pixel,
         "scale_calibration": {
             "source": "office_area",
             "office_area_m2": OFFICE_AREA_M2,
@@ -138,6 +156,7 @@ def main() -> None:
         "display_image": display_path.name,
         "annotation_component_count": int(len(keep)),
         "annotation_pixel_count": int(mask.sum()),
+        "reference_mask": reference_override,
     }
     (BACKEND / f"{MAP_ID}.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
