@@ -349,8 +349,15 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
         self.assertEqual(
             updated["floorplan_constraint"]["constraint_revision"],
-            "fusion_supported_independent_fallback_v3",
+            "kerama_reference_obstacles_v5",
         )
+
+    def test_reference_mask_blocks_false_north_corridor(self) -> None:
+        engine = get_floorplan_engine()
+
+        self.assertTrue(engine._point_occupied([1700, 575]))
+        self.assertFalse(engine._point_occupied([1700, 850]))
+        self.assertFalse(engine._point_occupied([2200, 850]))
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [

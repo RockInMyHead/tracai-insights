@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - package import path
 
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
-FLOORPLAN_CONSTRAINT_REVISION = "fusion_supported_independent_fallback_v3"
+FLOORPLAN_CONSTRAINT_REVISION = "kerama_reference_obstacles_v5"
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
 
