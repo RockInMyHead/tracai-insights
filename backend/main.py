@@ -4501,9 +4501,12 @@ async def r3_trajectory_proxy(
                             saved_stats = saved_result.get("processing_stats") or {}
                             requested_source = str(trajectory_source or "raw")
                             saved_source = saved_stats.get("r3_trajectory_source")
+                            saved_source_requested = saved_stats.get(
+                                "r3_trajectory_source_requested"
+                            )
                             if not isinstance(saved_source, str) or not saved_source.strip():
                                 saved_source = str(
-                                    saved_stats.get("r3_trajectory_source_requested")
+                                    saved_source_requested
                                     or "scale_aware_candidate"
                                 )
                             candidate = saved_result.get("lingbot_fusion_candidate")
@@ -4511,6 +4514,9 @@ async def r3_trajectory_proxy(
                                 candidate,
                                 requested_source=requested_source,
                                 saved_source=str(saved_source),
+                                saved_source_requested=str(
+                                    saved_source_requested or ""
+                                ),
                             ):
                                 worker_result["lingbot_fusion_candidate"] = candidate
                                 worker_result["lingbot_shadow"] = saved_result.get("lingbot_shadow")
