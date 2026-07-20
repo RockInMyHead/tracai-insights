@@ -4514,7 +4514,7 @@ async def r3_trajectory_proxy(
                                 candidate,
                                 requested_source=requested_source,
                                 saved_source=str(saved_source),
-                                saved_requested_source=str(
+                                saved_source_requested=str(
                                     saved_source_requested or ""
                                 ),
                             ):
