@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - package import path
 
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
-FLOORPLAN_CONSTRAINT_REVISION = "authoritative_plan_connectivity_v2"
+FLOORPLAN_CONSTRAINT_REVISION = "fusion_supported_independent_fallback_v3"
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
 
@@ -1836,6 +1836,7 @@ def apply_floorplan_constraints(
             "coordinate_convention": "x_right_y_down",
             "selection_tier": 1,
             "source_prior": independent_prior,
+            "fusion_supported": bool(candidate_payload.get("accepted")),
             "observation_stabilization": independent_stabilization,
         })
         flipped = _flip_polyline_y(stabilized_independent)
@@ -1848,6 +1849,7 @@ def apply_floorplan_constraints(
                 "coordinate_convention": "x_right_y_down",
                 "selection_tier": 1,
                 "source_prior": independent_prior + 0.02,
+                "fusion_supported": bool(candidate_payload.get("accepted")),
                 "observation_stabilization": independent_stabilization,
             })
 
@@ -1892,7 +1894,10 @@ def apply_floorplan_constraints(
                     context.get("direction_point"),
                     timestamps=observation.get("timestamps"),
                     coordinate_convention=str(observation["coordinate_convention"]),
-                    allow_safe_shape_fallback=(tier == 0),
+                    allow_safe_shape_fallback=(
+                        tier == 0
+                        or bool(observation.get("fusion_supported"))
+                    ),
                 )
                 diag = dict(candidate_alignment.get("diagnostics") or {})
                 if (
@@ -1965,6 +1970,9 @@ def apply_floorplan_constraints(
                     ),
                     "observation_stabilization": observation.get(
                         "observation_stabilization"
+                    ),
+                    "fusion_supported": bool(
+                        observation.get("fusion_supported", False)
                     ),
                 })
             accepted = [

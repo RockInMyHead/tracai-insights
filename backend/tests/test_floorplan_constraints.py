@@ -349,7 +349,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
         self.assertEqual(
             updated["floorplan_constraint"]["constraint_revision"],
-            "authoritative_plan_connectivity_v2",
+            "fusion_supported_independent_fallback_v3",
         )
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
@@ -445,6 +445,88 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertEqual(updated["map_turn_points"], [])
         self.assertEqual(updated["final_turn_points"], [])
+
+    def test_fusion_supported_independent_can_use_safe_map_fallback(self) -> None:
+        class StubConfig:
+            meters_per_pixel = 0.1
+            width = 100
+            height = 100
+            person_radius_meters = 0.0
+
+        class StubEngine:
+            config = StubConfig()
+
+            def align(self, trajectory, *args, **kwargs):
+                points = np.asarray(trajectory, dtype=float)
+                is_independent = len(points) >= 21
+                if is_independent and kwargs.get("allow_safe_shape_fallback"):
+                    return {
+                        "accepted": True,
+                        "trajectory": [[10.0, 50.0], [20.0, 50.0]],
+                        "diagnostics": {
+                            "accepted": True,
+                            "reason": None,
+                            "constrained_score": 1.0,
+                            "correction_p95_meters": 6.6,
+                            "corrected_collision_ratio": 0.0,
+                            "length_ratio": 1.0,
+                            "estimated_length_meters": 1.0,
+                            "plan_width": 100,
+                            "plan_height": 100,
+                            "meters_per_pixel": 0.1,
+                            "person_radius_meters": 0.0,
+                            "confidence": 0.5,
+                        },
+                    }
+                return {
+                    "accepted": False,
+                    "trajectory": [],
+                    "diagnostics": {
+                        "accepted": False,
+                        "reason": "constraint_solution_not_found",
+                        "rejection_reasons": ["different_walkable_components"],
+                    },
+                }
+
+        independent = [
+            [float(index), float(index % 3), 0.0]
+            for index in range(25)
+        ]
+        source = {
+            "method": "r3_reconstruction_scale_aware",
+            "plan_trajectory": [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+            "turn_points": [],
+            "processing_stats": {},
+            "lingbot_fusion_candidate": {
+                "accepted": True,
+                "plan_trajectory": [[0.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
+                "independent_accepted": True,
+                "independent_plan_trajectory": independent,
+                "diagnostics": {
+                    "independent_quality": {"accepted": True, "reasons": []},
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine",
+            return_value=StubEngine(),
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
+        self.assertEqual(
+            updated["processing_stats"]["map_observation_source"],
+            "lingbot_independent",
+        )
+        selection = updated["floorplan_constraint"]["observation_source_selection"]
+        selected = next(
+            item for item in selection["candidate_results"]
+            if item["source"] == "lingbot_independent" and item["accepted"]
+        )
+        self.assertTrue(selected["fusion_supported"])
 
     def test_fragmented_r3_refuses_low_quality_independent(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
