@@ -28,11 +28,13 @@ except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
 try:
     from floorplan_constraints import (
         DEFAULT_FLOORPLAN_ID,
+        FLOORPLAN_CONSTRAINT_REVISION,
         apply_floorplan_constraints,
     )
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.floorplan_constraints import (
         DEFAULT_FLOORPLAN_ID,
+        FLOORPLAN_CONSTRAINT_REVISION,
         apply_floorplan_constraints,
     )
 
@@ -236,7 +238,10 @@ async def _gpu_progress_heartbeat(
         return
 
 
-def _load_task_status_row(video_id: str) -> Optional[tuple[str, int]]:
+def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
+    """If analysis is already on disk / DB-completed, expose it even after restart."""
+    analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
+    db_completed = False
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
@@ -244,20 +249,10 @@ def _load_task_status_row(video_id: str) -> Optional[tuple[str, int]]:
             (video_id,),
         ).fetchone()
         conn.close()
-        if not row:
-            return None
-        return str(row[0] or ""), int(row[1] or 0)
+        if row and str(row[0]).lower() in {"completed", "done", "success"}:
+            db_completed = True
     except Exception:
-        return None
-
-
-def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
-    """If analysis is already on disk / DB-completed, expose it even after restart."""
-    analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
-    db_row = _load_task_status_row(video_id)
-    db_completed = bool(
-        db_row and str(db_row[0]).lower() in {"completed", "done", "success"}
-    )
+        db_completed = False
     if not analysis_file.exists() and not db_completed:
         return None
     if not analysis_file.exists():
@@ -271,6 +266,47 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
         with open(analysis_file, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         result = payload.get("analysis_result") or payload
+        constraint = result.get("floorplan_constraint") if isinstance(result, dict) else None
+        saved_revision = (
+            constraint.get("constraint_revision")
+            if isinstance(constraint, dict) else None
+        )
+        if saved_revision != FLOORPLAN_CONSTRAINT_REVISION:
+            map_context = _load_task_map_context(video_id)
+            if map_context.get("reference_point") and map_context.get("direction_point"):
+                refreshed = apply_floorplan_constraints(result, map_context)
+                refreshed_constraint = refreshed.get("floorplan_constraint") or {}
+                if refreshed_constraint.get("constraint_revision") == FLOORPLAN_CONSTRAINT_REVISION:
+                    result = refreshed
+                    if isinstance(payload, dict) and "analysis_result" in payload:
+                        payload["analysis_result"] = result
+                    else:
+                        payload = result
+                    analysis_file.parent.mkdir(parents=True, exist_ok=True)
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        dir=analysis_file.parent,
+                        prefix=f".{analysis_file.name}.",
+                        suffix=".tmp",
+                        delete=False,
+                    ) as temporary:
+                        json.dump(
+                            payload,
+                            temporary,
+                            indent=2,
+                            ensure_ascii=False,
+                            default=_to_json_serializable,
+                        )
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                        temporary_path = Path(temporary.name)
+                    os.replace(temporary_path, analysis_file)
+                    logger.info(
+                        "[%s] Refreshed persisted floorplan result to %s",
+                        video_id,
+                        FLOORPLAN_CONSTRAINT_REVISION,
+                    )
         return {
             "id": video_id,
             "status": "completed",
@@ -2021,33 +2057,11 @@ async def get_video_status(video_id: str):
         "lingbot_queued",
         "lingbot_running",
     }
-    db_row = _load_task_status_row(video_id)
-    db_status = str(db_row[0]).lower() if db_row else ""
-    db_progress = int(db_row[1]) if db_row else 0
-    db_busy = db_status in {
-        "queued",
-        "processing",
-        "uploading_to_gpu",
-        "gpu_processing",
-        "running",
-        "lingbot_queued",
-        "lingbot_running",
-    }
     # A stale in-memory payload (often with a non-serializable prior result)
     # must not block a finished analysis after restart / re-open.
-    # Conversely: never serve a previous analysis.json as "completed" while a
-    # live job is still running — that made the UI show ЗАВЕРШЕНО + «в процессе».
     if not live_busy:
         completed = _load_completed_analysis_status(video_id)
         if completed is not None:
-            if db_busy:
-                # Restart left DB in processing while the analysis artifact
-                # already exists and no live worker owns the job.
-                _update_task_status(video_id, "completed", 100)
-            elif not db_busy and db_status and db_status not in {
-                "completed", "done", "success"
-            }:
-                _update_task_status(video_id, "completed", 100)
             processing_status[video_id] = {
                 "status": "completed",
                 "progress": 100,
@@ -2055,14 +2069,6 @@ async def get_video_status(video_id: str):
                 "start_time": (live or {}).get("start_time") or time.time(),
             }
             return JSONResponse(_status_response_payload(completed))
-        if db_busy:
-            return JSONResponse(_status_response_payload({
-                "id": video_id,
-                "status": "processing",
-                "progress": max(1, min(99, db_progress or 1)),
-                "message": "Обработка продолжается",
-                "stage": "gpu",
-            }))
 
     if video_id not in processing_status:
         lingbot_session_id = _load_lingbot_session_id(video_id)
@@ -4495,12 +4501,9 @@ async def r3_trajectory_proxy(
                             saved_stats = saved_result.get("processing_stats") or {}
                             requested_source = str(trajectory_source or "raw")
                             saved_source = saved_stats.get("r3_trajectory_source")
-                            saved_source_requested = saved_stats.get(
-                                "r3_trajectory_source_requested"
-                            )
                             if not isinstance(saved_source, str) or not saved_source.strip():
                                 saved_source = str(
-                                    saved_source_requested
+                                    saved_stats.get("r3_trajectory_source_requested")
                                     or "scale_aware_candidate"
                                 )
                             candidate = saved_result.get("lingbot_fusion_candidate")
@@ -4508,7 +4511,6 @@ async def r3_trajectory_proxy(
                                 candidate,
                                 requested_source=requested_source,
                                 saved_source=str(saved_source),
-                                saved_source_requested=saved_source_requested,
                             ):
                                 worker_result["lingbot_fusion_candidate"] = candidate
                                 worker_result["lingbot_shadow"] = saved_result.get("lingbot_shadow")
