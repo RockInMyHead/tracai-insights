@@ -268,20 +268,21 @@ class LingBotFusionTests(unittest.TestCase):
                 saved_source="raw",
             )
         )
-        self.assertTrue(
-            should_restore_lingbot_fusion_candidate(
-                {"accepted": True, "independent_accepted": True},
-                requested_source="scale_aware_candidate",
-                saved_source="raw",
-                saved_requested_source="scale_aware_candidate",
-            )
-        )
         # Production bug: pose-confidence arrays were stored as saved_source.
         self.assertTrue(
             should_restore_lingbot_fusion_candidate(
                 {"accepted": False, "independent_accepted": True},
                 requested_source="scale_aware_candidate",
                 saved_source=str([34.9, 34.9, 37.0]),
+            )
+        )
+        # Recompute left effective source as "raw" while UI asks for scale_aware.
+        self.assertTrue(
+            should_restore_lingbot_fusion_candidate(
+                {"accepted": True, "independent_accepted": True},
+                requested_source="scale_aware_candidate",
+                saved_source="raw",
+                saved_source_requested="scale_aware_candidate",
             )
         )
 
