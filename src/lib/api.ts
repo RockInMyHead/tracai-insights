@@ -31,6 +31,8 @@ export interface VideoAnalysisResult {
     method: string;
     trajectory: number[][];
     map_trajectory?: number[][];
+    map_trajectory_timestamps_seconds?: number[];
+    map_trajectory_source_fractions?: number[];
     floorplan_constraint?: Record<string, unknown>;
     lingbot_fusion_candidate?: Record<string, unknown>;
     lingbot_shadow?: Record<string, unknown>;
@@ -740,14 +742,14 @@ export class ApiClient {
       try {
         const data = JSON.parse(event.data);
         callbacks.onVideoInfo?.(data);
-      } catch { /* ignore */ }
+      } catch { return; }
     });
 
     eventSource.addEventListener('complete', (event) => {
       try {
         const data = JSON.parse(event.data);
         callbacks.onComplete?.(data);
-      } catch { /* ignore */ }
+      } catch { return; }
     });
 
     eventSource.addEventListener('error', (event) => {
@@ -769,34 +771,34 @@ export class ApiClient {
 
     // Support extra events
     eventSource.addEventListener('connected', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'connected' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'connected' }); } catch { return; }
     });
     eventSource.addEventListener('receiving', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'receiving' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'receiving' }); } catch { return; }
     });
     eventSource.addEventListener('video_received', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'video_received' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'video_received' }); } catch { return; }
     });
     eventSource.addEventListener('processing_started', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_start' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_start' }); } catch { return; }
     });
     eventSource.addEventListener('r3_start', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_start' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_start' }); } catch { return; }
     });
     eventSource.addEventListener('replay', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'replay' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'replay' }); } catch { return; }
     });
     eventSource.addEventListener('pointcloud_status', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'pointcloud_status' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'pointcloud_status' }); } catch { return; }
     });
     eventSource.addEventListener('r3_segment_start', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segment_start' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segment_start' }); } catch { return; }
     });
     eventSource.addEventListener('r3_segment_complete', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segment_complete' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segment_complete' }); } catch { return; }
     });
     eventSource.addEventListener('r3_segmented_complete', (event) => {
-      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segmented_complete' }); } catch {}
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'r3_segmented_complete' }); } catch { return; }
     });
 
     // Return unsubscribe function
@@ -861,6 +863,8 @@ export class ApiClient {
     /** Cleaned c2w translations for Three.js only; never use these as map X/Y. */
     raw_trajectory_3d?: number[][];
     map_trajectory?: number[][];
+    map_trajectory_timestamps_seconds?: number[];
+    map_trajectory_source_fractions?: number[];
     map_turn_points?: Array<Record<string, unknown>>;
     floorplan_constraint?: Record<string, unknown>;
     lingbot_fusion_candidate?: Record<string, unknown>;
@@ -942,6 +946,8 @@ export class ApiClient {
     raw_plan_trajectory?: number[][];
     raw_trajectory_3d?: number[][];
     map_trajectory?: number[][];
+    map_trajectory_timestamps_seconds?: number[];
+    map_trajectory_source_fractions?: number[];
     map_turn_points?: Array<{
       frame_index: number;
       trajectory_index: number;

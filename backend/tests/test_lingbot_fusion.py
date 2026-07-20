@@ -246,6 +246,21 @@ class LingBotFusionTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["correspondence_mode"], "arc_length")
         self.assertTrue(result["accepted"], result["diagnostics"])
 
+    def test_non_monotonic_clocks_never_drive_timestamp_correspondence(self) -> None:
+        from backend.lingbot_fusion import _correspond, _finite_timestamps
+
+        lingbot = np.asarray([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+        broken = _finite_timestamps([0.0, 2.0, 1.0])
+        self.assertIsNone(broken)
+        mapped, mode = _correspond(
+            lingbot,
+            3,
+            broken,
+            np.asarray([0.0, 1.0, 2.0]),
+        )
+        self.assertEqual(mode, "arc_length")
+        self.assertTrue(np.allclose(mapped, lingbot))
+
     def test_restore_helper_keeps_independent_candidates(self) -> None:
         self.assertTrue(
             should_restore_lingbot_fusion_candidate(

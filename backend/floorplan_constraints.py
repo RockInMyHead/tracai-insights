@@ -30,8 +30,17 @@ except ImportError:  # pragma: no cover - package import path
 
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
-FLOORPLAN_CONSTRAINT_REVISION = "kerama_reference_obstacles_v5"
+FLOORPLAN_CONSTRAINT_REVISION = "kerama_metric_source_gates_v6"
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
+
+# R3/fusion is an authoritative motion observation, while an independent
+# LingBot rescue has an unconstrained monocular scale.  The latter therefore
+# needs a materially tighter metric prior before the floor plan is allowed to
+# choose its scale.  These are ratios to the calibrated walking-speed prior.
+AUTHORITATIVE_SPEED_RATIO_BOUNDS = (0.30, 2.70)
+INDEPENDENT_SPEED_RATIO_BOUNDS = (0.72, 1.80)
+MAX_START_SNAP_METERS = 1.50
+MAX_PUBLISHED_SEGMENT_METERS = 0.75
 
 
 def _finite_float(value: Any, default: float = 0.0) -> float:
@@ -146,6 +155,57 @@ def _resample_timestamps(values: Any, count: int) -> Any:
     return np.interp(
         np.linspace(0.0, 1.0, count), np.linspace(0.0, 1.0, len(source)), source
     ).tolist()
+
+
+def _densify_polyline(points: np.ndarray, max_step_pixels: float) -> np.ndarray:
+    """Bound published segment length without changing route geometry."""
+    if len(points) < 2 or max_step_pixels <= 1e-9:
+        return points.copy()
+    output: list[np.ndarray] = [points[0]]
+    for start, end in zip(points[:-1], points[1:]):
+        length = float(np.linalg.norm(end - start))
+        count = max(1, int(math.ceil(length / max_step_pixels)))
+        for index in range(1, count + 1):
+            output.append(start + (end - start) * (index / count))
+    return np.asarray(output, dtype=np.float64)
+
+
+def _mapped_timestamps(
+    source: Any,
+    mapped: Any,
+    timestamps: Any,
+) -> list[Optional[float]]:
+    """Transfer source time to an arbitrary-length map polyline by arc."""
+    source_points = _normalise_points(source)
+    mapped_points = _normalise_points(mapped)
+    if (
+        len(source_points) < 2
+        or len(mapped_points) < 2
+        or not isinstance(timestamps, list)
+        or len(timestamps) != len(source_points)
+    ):
+        return []
+    values = np.asarray(
+        [_finite_float(value, math.nan) for value in timestamps], dtype=np.float64
+    )
+    finite = np.flatnonzero(np.isfinite(values))
+    if len(finite) < 2:
+        return []
+    values = np.interp(np.arange(len(values)), finite, values[finite])
+    if np.any(np.diff(values) < 0.0):
+        return []
+    source_fractions = _trajectory_fractions(source_points)
+    unique_fractions, first_indices = np.unique(source_fractions, return_index=True)
+    unique_values = values[first_indices]
+    if len(unique_values):
+        unique_values[0] = values[0]
+        unique_values[-1] = values[-1]
+    result = np.interp(
+        _trajectory_fractions(mapped_points),
+        unique_fractions,
+        unique_values,
+    )
+    return [round(float(value), 6) for value in result]
 
 
 def _flip_polyline_y(points: Any) -> list[list[float]]:
@@ -539,6 +599,12 @@ class FloorplanConstraintEngine:
         finite_indices = np.flatnonzero(np.isfinite(values))
         if point_count < 2 or len(finite_indices) < 2:
             return None
+        # Interpolation and speed estimation require one forward-moving clock.
+        # A few duplicated timestamps are pauses; negative jumps mean samples
+        # came from incompatible clocks or were associated with wrong frames.
+        finite_values = values[finite_indices]
+        if np.any(np.diff(finite_values) < 0.0):
+            return None
         first, last = int(finite_indices[0]), int(finite_indices[-1])
         total = float(values[last] - values[first])
         if not 1.0 <= total <= 8 * 60 * 60:
@@ -646,6 +712,11 @@ class FloorplanConstraintEngine:
         metrics = self._path_metrics(points)
         length_meters = _polyline_length(points) * self.config.meters_per_pixel
         speed = length_meters / duration if duration else None
+        speed_ratio = (
+            speed / self.config.walking_speed_mps
+            if speed is not None and self.config.walking_speed_mps > 1e-9
+            else None
+        )
         speed_penalty = 0.0
         if speed is not None and speed > 1e-9:
             speed_penalty = abs(math.log(speed / self.config.walking_speed_mps))
@@ -655,14 +726,42 @@ class FloorplanConstraintEngine:
             34.0 * metrics["collision_ratio"]
             + 60.0 * metrics["outside_ratio"]
             + 0.35 * metrics["clearance_penalty"]
-            + 0.75 * speed_penalty
+            + 3.0 * speed_penalty
             + 0.08 * abs(yaw_offset_degrees) / 5.0
         )
         return score, {
             **metrics,
             "length_meters": length_meters,
             "speed_mps": speed if speed is not None else math.nan,
+            "speed_ratio": speed_ratio if speed_ratio is not None else math.nan,
         }
+
+    def _metric_hypothesis_is_plausible(
+        self,
+        speed_ratio: float,
+        *,
+        duration: Optional[float],
+        observation_policy: str,
+    ) -> bool:
+        if duration is None or not math.isfinite(speed_ratio):
+            return observation_policy != "independent"
+        lower, upper = (
+            INDEPENDENT_SPEED_RATIO_BOUNDS
+            if observation_policy == "independent"
+            else AUTHORITATIVE_SPEED_RATIO_BOUNDS
+        )
+        return lower <= speed_ratio <= upper
+
+    def _path_component_count(self, points: np.ndarray) -> int:
+        component_ids: set[int] = set()
+        for point in self._sample_path(points):
+            if self._point_occupied(point):
+                continue
+            x, y = self._pixel_to_cell(point)
+            component = int(self._component_ids[y, x])
+            if component:
+                component_ids.add(component)
+        return len(component_ids)
 
     def _segment_collides(self, start: np.ndarray, end: np.ndarray) -> bool:
         return any(self._point_occupied(point) for point in self._sample_path(
@@ -903,15 +1002,6 @@ class FloorplanConstraintEngine:
                     connectivity_reason
                     or ("detour_spike_rejected" if spike_rejected else "local_search_exhausted")
                 )
-                # A residual nick may only cover sub-metre mask raster noise.
-                # The previous 6 m allowance accepted real wall/equipment
-                # crossings as "micro collisions" in production.
-                if segment_m <= 0.75:
-                    if failure_reasons is not None:
-                        failure_reasons.append("short_residual_collision_kept")
-                    rebuilt.extend(raw_segment)
-                    cursor = right + 1
-                    continue
                 if failure_reasons is not None:
                     failure_reasons.append(reason)
                 return None, len(merged)
@@ -1164,10 +1254,14 @@ class FloorplanConstraintEngine:
             -20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0
         ),
         allow_safe_shape_fallback: bool = False,
+        observation_policy: str = "authoritative",
     ) -> dict[str, Any]:
+        observation_policy = str(observation_policy or "authoritative").lower()
+        if observation_policy not in {"authoritative", "independent"}:
+            observation_policy = "authoritative"
         raw = _normalise_points(trajectory)
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v5_exterior_guarded",
+            "engine": "floorplan_constraint_engine_v6_metric_source_guarded",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -1175,6 +1269,7 @@ class FloorplanConstraintEngine:
             "person_radius_meters": self.config.person_radius_meters,
             "point_count": int(len(raw)),
             "accepted": False,
+            "observation_policy": observation_policy,
             "support_mask_enabled": self._support_mask is not None,
             "support_coverage_ratio": (
                 round(float(np.mean(self._support_mask)), 8)
@@ -1206,6 +1301,17 @@ class FloorplanConstraintEngine:
             float(np.linalg.norm(start - requested_start))
             * self.config.meters_per_pixel
         )
+        if start_snap_meters > MAX_START_SNAP_METERS:
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": "start_too_far_from_walkable_area",
+                    "start_snap_meters": round(start_snap_meters, 3),
+                    "max_start_snap_meters": MAX_START_SNAP_METERS,
+                },
+            }
 
         relative = raw - raw[0]
         if coordinate_convention == "x_forward_y_left_z_up":
@@ -1221,16 +1327,56 @@ class FloorplanConstraintEngine:
             for yaw in yaw_offsets_degrees:
                 points = self._build_hypothesis(relative, start, desired_heading, float(scale), float(yaw))
                 score, metrics = self._score_hypothesis(points, duration, float(yaw))
-                hypotheses.append({"score": score, "scale": float(scale), "yaw": float(yaw), "points": points, **metrics})
+                metric_plausible = self._metric_hypothesis_is_plausible(
+                    float(metrics["speed_ratio"]),
+                    duration=duration,
+                    observation_policy=observation_policy,
+                )
+                hypotheses.append({
+                    "score": score,
+                    "scale": float(scale),
+                    "yaw": float(yaw),
+                    "points": points,
+                    "metric_plausible": metric_plausible,
+                    **metrics,
+                })
         if not hypotheses:
             return {"accepted": False, "trajectory": [], "diagnostics": {**base_diagnostics, "reason": "no_hypotheses"}}
         hypotheses.sort(key=lambda item: item["score"])
+        metric_hypotheses = [item for item in hypotheses if item["metric_plausible"]]
+        if not metric_hypotheses:
+            finite_speeds = [
+                float(item["speed_mps"])
+                for item in hypotheses
+                if math.isfinite(float(item["speed_mps"]))
+            ]
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": (
+                        "metric_prior_unavailable"
+                        if duration is None else "metric_prior_inconsistent"
+                    ),
+                    "rejection_reasons": ["implausible_metric_scale"],
+                    "motion_duration_seconds": (
+                        round(float(duration), 3) if duration is not None else None
+                    ),
+                    "candidate_speed_min_mps": (
+                        round(min(finite_speeds), 3) if finite_speeds else None
+                    ),
+                    "candidate_speed_max_mps": (
+                        round(max(finite_speeds), 3) if finite_speeds else None
+                    ),
+                },
+            }
 
         # The plan is part of estimation, not a post-hoc accept/reject gate.
         # Repair a yaw-diverse beam and rank only after the walkable mask is
         # enforced so raw collision scores cannot freeze the wrong homotopy.
         feasible: list[dict[str, Any]] = []
-        beam = self._select_diverse_beam(hypotheses)
+        beam = self._select_diverse_beam(metric_hypotheses)
         attempted = 0
         route_failure_counts: dict[str, int] = {}
 
@@ -1248,12 +1394,10 @@ class FloorplanConstraintEngine:
             if repaired is None:
                 continue
             corrected_metrics = self._path_metrics(repaired)
-            # Dense sample metrics can still report a single-pixel nick after
-            # A* + line-of-sight simplify, even when every polyline segment
-            # is collision-free.  Prefer another local repair, but allow a small
-            # residual collision budget when the only alternative is a spike.
-            residual_collision_budget = 0.005
-            residual_segment_budget_meters = 0.75
+            # Obstacles are hard constraints. A second pass may repair a
+            # raster-edge nick, but no residual collision is publishable.
+            residual_collision_budget = 0.0
+            residual_segment_budget_meters = 0.0
             if corrected_metrics["outside_ratio"] > 0.0 or (
                 self._collision_runs(repaired)
                 and (
@@ -1292,6 +1436,20 @@ class FloorplanConstraintEngine:
             source_length = max(_polyline_length(hypothesis["points"]), 1e-9)
             corrected_length = _polyline_length(repaired)
             length_ratio = corrected_length / source_length
+            corrected_length_meters = corrected_length * self.config.meters_per_pixel
+            corrected_speed = (
+                corrected_length_meters / duration if duration is not None else math.nan
+            )
+            corrected_speed_ratio = (
+                corrected_speed / self.config.walking_speed_mps
+                if math.isfinite(corrected_speed) and self.config.walking_speed_mps > 1e-9
+                else math.nan
+            )
+            metric_preserved = self._metric_hypothesis_is_plausible(
+                corrected_speed_ratio,
+                duration=duration,
+                observation_policy=observation_policy,
+            )
             median_correction = (
                 float(np.median(displacement_m)) if len(displacement_m) else 0.0
             )
@@ -1322,6 +1480,7 @@ class FloorplanConstraintEngine:
                 and sharp_reverse_ratio <= 0.08
                 and corrected_metrics["collision_ratio"] <= residual_collision_budget
                 and max_residual_collision_meters <= residual_segment_budget_meters
+                and metric_preserved
             )
             constrained_score = (
                 float(hypothesis["score"])
@@ -1330,6 +1489,10 @@ class FloorplanConstraintEngine:
                 + 0.75 * abs(math.log(max(length_ratio, 1e-9)))
                 + 0.08 * rerouted_segments
                 + 4.0 * sharp_reverse_ratio
+                + (
+                    2.0 * abs(math.log(max(corrected_speed_ratio, 1e-9)))
+                    if math.isfinite(corrected_speed_ratio) else 0.0
+                )
             )
             feasible.append({
                 **hypothesis,
@@ -1338,6 +1501,10 @@ class FloorplanConstraintEngine:
                 "corrected_metrics": corrected_metrics,
                 "displacement_m": displacement_m,
                 "length_ratio": length_ratio,
+                "corrected_length_meters": corrected_length_meters,
+                "corrected_speed_mps": corrected_speed,
+                "corrected_speed_ratio": corrected_speed_ratio,
+                "metric_preserved": metric_preserved,
                 "correction_budget_meters": correction_budget,
                 "sharp_reverse_ratio": sharp_reverse_ratio,
                 "max_residual_collision_meters": max_residual_collision_meters,
@@ -1361,6 +1528,7 @@ class FloorplanConstraintEngine:
                     ),
                     "route_failure_counts": route_failure_counts,
                     "hypothesis_count": len(hypotheses),
+                    "metric_hypothesis_count": len(metric_hypotheses),
                     "beam_size": len(beam),
                     "constrained_hypotheses_attempted": attempted,
                     "raw_collision_ratio": round(float(hypotheses[0]["collision_ratio"]), 6),
@@ -1371,11 +1539,11 @@ class FloorplanConstraintEngine:
         # With a positive support mask, accepting an arbitrary collision-free
         # path is worse than reporting that the visual observation and map do
         # not agree.  Only shape-preserving candidates are authoritative.
-        production_feasible = (
-            [item for item in feasible if item["shape_preserved"]]
-            if self._support_mask is not None
-            else feasible
-        )
+        production_feasible = [
+            item for item in feasible
+            if bool(item["metric_preserved"])
+            and (self._support_mask is None or bool(item["shape_preserved"]))
+        ]
         shape_fallback_used = False
         shape_fallback_budget = None
         if (
@@ -1401,6 +1569,7 @@ class FloorplanConstraintEngine:
                     <= residual_collision_budget
                     and self._max_collision_run_meters(item["repaired"])
                     <= residual_segment_budget_meters
+                    and bool(item["metric_preserved"])
                 ):
                     safe_fallbacks.append(item)
             if safe_fallbacks:
@@ -1423,8 +1592,16 @@ class FloorplanConstraintEngine:
                 "trajectory": [],
                 "diagnostics": {
                     **base_diagnostics,
-                    "reason": "map_correction_exceeds_observation_budget",
-                    "rejection_reasons": ["topology_destroying_map_correction"],
+                    "reason": (
+                        "metric_prior_inconsistent"
+                        if not bool(closest.get("metric_preserved", True))
+                        else "map_correction_exceeds_observation_budget"
+                    ),
+                    "rejection_reasons": [
+                        "implausible_corrected_metric_scale"
+                        if not bool(closest.get("metric_preserved", True))
+                        else "topology_destroying_map_correction"
+                    ],
                     "hypothesis_count": len(hypotheses),
                     "beam_size": len(beam),
                     "constrained_hypotheses_attempted": attempted,
@@ -1476,6 +1653,24 @@ class FloorplanConstraintEngine:
                 nonlinear_length_ratio = _polyline_length(nonlinear) / max(
                     _polyline_length(best["points"]), 1e-9
                 )
+                nonlinear_length_meters = (
+                    _polyline_length(nonlinear) * self.config.meters_per_pixel
+                )
+                nonlinear_speed = (
+                    nonlinear_length_meters / duration
+                    if duration is not None else math.nan
+                )
+                nonlinear_speed_ratio = (
+                    nonlinear_speed / self.config.walking_speed_mps
+                    if math.isfinite(nonlinear_speed)
+                    and self.config.walking_speed_mps > 1e-9
+                    else math.nan
+                )
+                nonlinear_metric_preserved = self._metric_hypothesis_is_plausible(
+                    nonlinear_speed_ratio,
+                    duration=duration,
+                    observation_policy=observation_policy,
+                )
                 observed_resampled = _resample_polyline(
                     best["points"], np.linspace(0.0, 1.0, 64)
                 )
@@ -1511,6 +1706,7 @@ class FloorplanConstraintEngine:
                     and chirality_preserved
                     and not self._collision_runs(nonlinear)
                     and self._path_metrics(nonlinear)["outside_ratio"] == 0.0
+                    and nonlinear_metric_preserved
                 )
                 nonlinear_diagnostics.update({
                     "correction_p95_before_meters": round(p95_correction, 3),
@@ -1520,6 +1716,11 @@ class FloorplanConstraintEngine:
                     "observed_signed_turn_degrees": round(observed_turn, 3),
                     "candidate_signed_turn_degrees": round(candidate_turn, 3),
                     "chirality_preserved": chirality_preserved,
+                    "speed_mps_after": (
+                        round(nonlinear_speed, 4)
+                        if math.isfinite(nonlinear_speed) else None
+                    ),
+                    "metric_preserved": nonlinear_metric_preserved,
                 })
                 if improves and bounded:
                     repaired = nonlinear
@@ -1527,6 +1728,7 @@ class FloorplanConstraintEngine:
                     displacement_m = nonlinear_displacement
                     p95_correction = nonlinear_p95
                     length_ratio = nonlinear_length_ratio
+                    speed = nonlinear_speed
                     nonlinear_diagnostics["accepted"] = True
                     nonlinear_diagnostics["reason"] = None
                 else:
@@ -1547,17 +1749,24 @@ class FloorplanConstraintEngine:
             quality_warnings.append("large_map_correction_applied")
         if shape_fallback_used:
             quality_warnings.append("authoritative_safe_map_fallback")
-        if float(corrected_metrics.get("collision_ratio", 0.0)) > 0.0:
-            quality_warnings.append("residual_micro_collisions_kept_to_preserve_shape")
-        speed = float(best["speed_mps"])
-        if math.isfinite(speed) and not 0.20 <= speed <= 3.20:
+        speed = (
+            float(best["corrected_speed_mps"])
+            if not nonlinear_diagnostics.get("accepted")
+            else float(speed)
+        )
+        final_speed_ratio = (
+            speed / self.config.walking_speed_mps
+            if math.isfinite(speed) and self.config.walking_speed_mps > 1e-9
+            else math.nan
+        )
+        if not bool(best.get("metric_preserved", True)):
             quality_warnings.append("walking_speed_prior_inconsistent")
         if start_snap_meters > max(0.05, self.cell_meters * 0.75):
             quality_warnings.append("start_projected_to_walkable_area")
 
         second_score = (
-            float(feasible[1]["constrained_score"])
-            if len(feasible) > 1
+            float(production_feasible[1]["constrained_score"])
+            if len(production_feasible) > 1
             else float(best["constrained_score"] + 1.0)
         )
         margin = max(0.0, second_score - float(best["constrained_score"]))
@@ -1569,7 +1778,44 @@ class FloorplanConstraintEngine:
             0.0,
             1.0,
         ))
+        if observation_policy == "independent":
+            quality_warnings.append("independent_monocular_rescue")
+            confidence = min(confidence, 0.55)
         probability_correct, calibration = calibrated_probability(confidence)
+
+        # Publication is stricter than candidate scoring: no residual obstacle
+        # contact, no cross-component stitching, and no multi-metre sparse
+        # chords that downstream consumers could mistake for one time step.
+        repaired = _densify_polyline(
+            repaired,
+            MAX_PUBLISHED_SEGMENT_METERS
+            / max(self.config.meters_per_pixel, 1e-9),
+        )
+        final_metrics = self._path_metrics(repaired)
+        if (
+            final_metrics["outside_ratio"] > 0.0
+            or final_metrics["collision_ratio"] > 0.0
+            or self._collision_runs(repaired)
+            or self._path_component_count(repaired) != 1
+        ):
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": "final_publication_invariant_failed",
+                    "rejection_reasons": ["unsafe_or_disconnected_final_polyline"],
+                },
+            }
+        corrected_metrics = final_metrics
+        published_steps = np.linalg.norm(np.diff(repaired, axis=0), axis=1)
+        max_published_segment_meters = (
+            float(np.max(published_steps)) * self.config.meters_per_pixel
+            if len(published_steps) else 0.0
+        )
+        published_length_meters = (
+            _polyline_length(repaired) * self.config.meters_per_pixel
+        )
         diagnostics = {
             **base_diagnostics,
             "accepted": True,
@@ -1581,10 +1827,16 @@ class FloorplanConstraintEngine:
                 if self._support_mask is not None else "hard_walkable_mask"
             ),
             "hypothesis_count": len(hypotheses),
+            "metric_hypothesis_count": len(metric_hypotheses),
             "beam_size": len(beam),
             "constrained_hypotheses_attempted": attempted,
             "feasible_hypotheses": len(feasible),
-            "shape_preserving_hypotheses": len(production_feasible),
+            "shape_preserving_hypotheses": sum(
+                1 for item in feasible
+                if bool(item.get("shape_preserved"))
+                and bool(item.get("metric_preserved"))
+            ),
+            "production_hypotheses": len(production_feasible),
             "shape_fallback_used": shape_fallback_used,
             "shape_fallback_budget_meters": (
                 round(shape_fallback_budget, 3)
@@ -1599,8 +1851,13 @@ class FloorplanConstraintEngine:
             "selected_scale_pixels_per_unit": round(float(best["scale"]), 8),
             "selected_yaw_offset_degrees": round(float(best["yaw"]), 3),
             "estimated_length_meters": round(float(best["length_meters"]), 3),
+            "published_length_meters": round(published_length_meters, 3),
             "motion_duration_seconds": round(float(duration), 3) if duration is not None else None,
             "estimated_speed_mps": round(speed, 3) if math.isfinite(speed) else None,
+            "estimated_speed_ratio": (
+                round(final_speed_ratio, 4)
+                if math.isfinite(final_speed_ratio) else None
+            ),
             "raw_collision_ratio": round(float(best["collision_ratio"]), 6),
             "corrected_collision_ratio": round(float(corrected_metrics["collision_ratio"]), 6),
             "max_residual_collision_meters": round(
@@ -1614,6 +1871,7 @@ class FloorplanConstraintEngine:
             "correction_budget_meters": round(allowed_correction, 3),
             "sharp_reverse_ratio": round(float(best.get("sharp_reverse_ratio", 0.0)), 4),
             "length_ratio": round(length_ratio, 5),
+            "max_published_segment_meters": round(max_published_segment_meters, 4),
             "hypothesis_score": round(float(best["score"]), 6),
             "constrained_score": round(float(best["constrained_score"]), 6),
             "runner_up_margin": round(margin, 6),
@@ -1820,10 +2078,12 @@ def apply_floorplan_constraints(
         or candidate_payload.get("source_timestamps_seconds")
     )
     if independent_points:
+        timestamp_provenance = "lingbot_source_timestamps"
         if not isinstance(independent_timestamps, list) or len(independent_timestamps) < 2:
             independent_timestamps = _resample_timestamps(
                 source_timestamps, len(independent_points)
             )
+            timestamp_provenance = "r3_duration_resampled"
         stabilized_independent, independent_stabilization = (
             _stabilize_independent_observation(independent_points)
         )
@@ -1837,6 +2097,7 @@ def apply_floorplan_constraints(
             "selection_tier": 1,
             "source_prior": independent_prior,
             "fusion_supported": bool(candidate_payload.get("accepted")),
+            "timestamp_provenance": timestamp_provenance,
             "observation_stabilization": independent_stabilization,
         })
         flipped = _flip_polyline_y(stabilized_independent)
@@ -1850,6 +2111,7 @@ def apply_floorplan_constraints(
                 "selection_tier": 1,
                 "source_prior": independent_prior + 0.02,
                 "fusion_supported": bool(candidate_payload.get("accepted")),
+                "timestamp_provenance": timestamp_provenance,
                 "observation_stabilization": independent_stabilization,
             })
 
@@ -1859,7 +2121,7 @@ def apply_floorplan_constraints(
         "reason": "no_candidate_satisfied_floorplan",
         "r3_severely_fragmented": bool(fragmented_r3),
         "fragmentation_policy": "soft_prior_not_veto",
-        "selection_policy": "authoritative_then_independent_fallback_v2",
+        "selection_policy": "metric_authoritative_then_guarded_independent_v3",
         "candidate_results": [],
     }
     selected_observation: Optional[dict[str, Any]] = None
@@ -1867,7 +2129,7 @@ def apply_floorplan_constraints(
         "accepted": False,
         "trajectory": [],
         "diagnostics": {
-            "engine": "floorplan_constraint_engine_v5_exterior_guarded",
+            "engine": "floorplan_constraint_engine_v6_metric_source_guarded",
             "map_id": map_id,
             "accepted": False,
             "reason": "no_candidates_evaluated",
@@ -1896,7 +2158,11 @@ def apply_floorplan_constraints(
                     coordinate_convention=str(observation["coordinate_convention"]),
                     allow_safe_shape_fallback=(
                         tier == 0
-                        or bool(observation.get("fusion_supported"))
+                    ),
+                    observation_policy=(
+                        "independent"
+                        if observation["source"] == "lingbot_independent"
+                        else "authoritative"
                     ),
                 )
                 diag = dict(candidate_alignment.get("diagnostics") or {})
@@ -1968,12 +2234,15 @@ def apply_floorplan_constraints(
                         if math.isfinite(length_ratio)
                         else None
                     ),
+                    "estimated_speed_mps": diag.get("estimated_speed_mps"),
+                    "estimated_speed_ratio": diag.get("estimated_speed_ratio"),
                     "observation_stabilization": observation.get(
                         "observation_stabilization"
                     ),
                     "fusion_supported": bool(
                         observation.get("fusion_supported", False)
                     ),
+                    "timestamp_provenance": observation.get("timestamp_provenance"),
                 })
             accepted = [
                 item for item in tier_evaluated
@@ -2051,7 +2320,7 @@ def apply_floorplan_constraints(
             "accepted": False,
             "trajectory": [],
             "diagnostics": {
-                "engine": "floorplan_constraint_engine_v5_exterior_guarded",
+                "engine": "floorplan_constraint_engine_v6_metric_source_guarded",
                 "map_id": map_id,
                 "accepted": False,
                 "reason": "engine_error",
@@ -2092,15 +2361,23 @@ def apply_floorplan_constraints(
             timestamps=selected_timestamps,
         )
         updated["map_trajectory"] = mapped
+        updated["map_trajectory_timestamps_seconds"] = _mapped_timestamps(
+            selected_points, mapped, selected_timestamps
+        )
+        updated["map_trajectory_source_fractions"] = [
+            round(float(value), 8)
+            for value in _trajectory_fractions(_normalise_points(mapped))
+        ]
         updated["map_turn_points"] = map_turns
         updated["final_turn_points"] = (
             []
             if selected_source == "lingbot_independent"
             else (map_turns or result.get("turn_points") or [])
         )
-        map_distance = (
+        map_distance = _finite_float(
+            diagnostics.get("published_length_meters"),
             _finite_float(diagnostics.get("estimated_length_meters"))
-            * _finite_float(diagnostics.get("length_ratio"), 1.0)
+            * _finite_float(diagnostics.get("length_ratio"), 1.0),
         )
         stats["map_trajectory_points"] = len(mapped)
         stats["map_confidence"] = diagnostics.get("confidence")
@@ -2119,6 +2396,8 @@ def apply_floorplan_constraints(
         }
     else:
         updated.pop("map_trajectory", None)
+        updated.pop("map_trajectory_timestamps_seconds", None)
+        updated.pop("map_trajectory_source_fractions", None)
         updated.pop("map_turn_points", None)
         updated.pop("map_metadata", None)
         updated["final_turn_points"] = result.get("turn_points") or []

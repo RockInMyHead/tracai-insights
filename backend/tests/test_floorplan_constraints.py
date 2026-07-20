@@ -108,7 +108,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(np.all(points[:, 0] >= 0.0))
         self.assertTrue(np.all(points[:, 0] < 100.0))
 
-    def test_implausible_speed_is_warning_not_map_rejection(self) -> None:
+    def test_physically_impossible_authoritative_speed_is_rejected(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
             np.zeros((100, 160), dtype=bool), meters_per_pixel=0.1
         )
@@ -120,10 +120,88 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             scale_candidates=[1.0],
             yaw_offsets_degrees=[0.0],
         )
-        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertEqual(result["diagnostics"]["reason"], "metric_prior_inconsistent")
+
+    def test_compressed_independent_scale_is_hard_rejected(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((300, 1000), dtype=bool),
+            meters_per_pixel=0.1,
+            walking_speed_mps=1.2,
+        )
+        trajectory = [[float(x), 0.0] for x in range(0, 101, 10)]
+        timestamps = [float(x) for x in range(0, 101, 10)]
+        # Production regression: a collision-free 0.79 m/s hypothesis must
+        # not beat the 1.2 m/s metric prior merely because it fits a narrow
+        # office strip.
+        result = engine.align(
+            trajectory,
+            {"x": 10, "y": 50},
+            {"x": 20, "y": 50},
+            timestamps=timestamps,
+            scale_candidates=[7.9],
+            yaw_offsets_degrees=[0.0],
+            observation_policy="independent",
+        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertEqual(result["diagnostics"]["reason"], "metric_prior_inconsistent")
         self.assertIn(
-            "walking_speed_prior_inconsistent",
-            result["diagnostics"]["quality_warnings"],
+            "implausible_metric_scale", result["diagnostics"]["rejection_reasons"]
+        )
+
+    def test_metric_scale_beats_collision_free_compressed_scale(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((300, 1600), dtype=bool),
+            meters_per_pixel=0.1,
+            walking_speed_mps=1.2,
+        )
+        trajectory = [[float(x), 0.0] for x in range(0, 101, 10)]
+        result = engine.align(
+            trajectory,
+            {"x": 10, "y": 50},
+            {"x": 20, "y": 50},
+            timestamps=[float(x) for x in range(0, 101, 10)],
+            scale_candidates=[7.9, 12.0],
+            yaw_offsets_degrees=[0.0],
+            observation_policy="independent",
+        )
+        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertAlmostEqual(
+            result["diagnostics"]["selected_scale_pixels_per_unit"], 12.0
+        )
+        self.assertAlmostEqual(result["diagnostics"]["estimated_speed_mps"], 1.2)
+        self.assertLessEqual(result["diagnostics"]["confidence"], 0.55)
+
+    def test_independent_metric_prior_requires_monotonic_time(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((100, 200), dtype=bool), meters_per_pixel=0.1
+        )
+        result = engine.align(
+            [[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]],
+            {"x": 10, "y": 50},
+            {"x": 30, "y": 50},
+            timestamps=[0.0, 2.0, 1.0, 3.0],
+            scale_candidates=[1.2],
+            yaw_offsets_degrees=[0.0],
+            observation_policy="independent",
+        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertEqual(result["diagnostics"]["reason"], "metric_prior_unavailable")
+
+    def test_start_is_not_silently_snapped_across_large_obstacle(self) -> None:
+        mask = np.zeros((200, 200), dtype=bool)
+        mask[40:160, 40:160] = True
+        engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
+        result = engine.align(
+            [[0.0, 0.0], [10.0, 0.0]],
+            {"x": 50, "y": 50},
+            {"x": 70, "y": 50},
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertEqual(
+            result["diagnostics"]["reason"], "start_too_far_from_walkable_area"
         )
 
     def test_stationary_time_is_removed_from_scale_prior(self) -> None:
@@ -349,8 +427,17 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
         self.assertEqual(
             updated["floorplan_constraint"]["constraint_revision"],
-            "kerama_reference_obstacles_v5",
+            "kerama_metric_source_gates_v6",
         )
+        self.assertEqual(
+            len(updated["map_trajectory_timestamps_seconds"]),
+            len(updated["map_trajectory"]),
+        )
+        mapped = np.asarray(updated["map_trajectory"], dtype=float)
+        max_step_meters = float(
+            np.max(np.linalg.norm(np.diff(mapped[:, :2], axis=0), axis=1))
+        ) * updated["map_metadata"]["meters_per_pixel"]
+        self.assertLessEqual(max_step_meters, 0.751)
 
     def test_reference_mask_blocks_false_north_corridor(self) -> None:
         engine = get_floorplan_engine()
@@ -408,7 +495,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
 
     def test_fragmented_r3_selects_independent_lingbot_even_after_fusion_veto(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
-            np.zeros((120, 180), dtype=bool), meters_per_pixel=0.1
+            np.zeros((120, 300), dtype=bool), meters_per_pixel=0.1
         )
         independent = [[float(x), 0.0, 0.0] for x in range(0, 61, 10)]
         source = {
@@ -426,7 +513,9 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 "accepted": False,
                 "independent_accepted": True,
                 "independent_plan_trajectory": independent,
-                "lingbot_source_timestamps_seconds": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+                "lingbot_source_timestamps_seconds": [
+                    0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0,
+                ],
                 "diagnostics": {
                     "reason": "trajectory_disagreement_too_large",
                     "independent_quality": {"accepted": True, "reasons": []},
@@ -453,7 +542,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_turn_points"], [])
         self.assertEqual(updated["final_turn_points"], [])
 
-    def test_fusion_supported_independent_can_use_safe_map_fallback(self) -> None:
+    def test_fusion_support_cannot_weaken_independent_shape_gate(self) -> None:
         class StubConfig:
             meters_per_pixel = 0.1
             width = 100
@@ -523,17 +612,15 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 "reference_point": {"x": 10, "y": 50},
                 "direction_point": {"x": 30, "y": 50},
             })
-        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
-        self.assertEqual(
-            updated["processing_stats"]["map_observation_source"],
-            "lingbot_independent",
-        )
+        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
+        self.assertNotIn("map_observation_source", updated["processing_stats"])
         selection = updated["floorplan_constraint"]["observation_source_selection"]
-        selected = next(
+        independent_result = next(
             item for item in selection["candidate_results"]
-            if item["source"] == "lingbot_independent" and item["accepted"]
+            if item["source"] == "lingbot_independent"
         )
-        self.assertTrue(selected["fusion_supported"])
+        self.assertTrue(independent_result["fusion_supported"])
+        self.assertFalse(independent_result["accepted"])
 
     def test_fragmented_r3_refuses_low_quality_independent(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(

@@ -152,7 +152,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         r3CameraPoints: camPts.length > 0 ? camPts : undefined,
       };
     });
-  }, [trajectories, trajectory, turnPoints, floorPlan, imageSize.width, imageSize.height]);
+  }, [trajectories, trajectory, turnPoints, floorPlan, imageSize]);
 
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);

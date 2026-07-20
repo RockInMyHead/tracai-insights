@@ -20,17 +20,23 @@ const SHOW_ADVANCED_ANALYSIS_SETTINGS = false;
 const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   route_length_changed_significantly: "маршрут перестроен по проходам",
   large_map_correction_applied: "применена большая коррекция по плану",
-  walking_speed_prior_inconsistent: "масштаб уточнён без опоры на скорость",
+  walking_speed_prior_inconsistent: "скорость не согласуется с метрической моделью",
   start_projected_to_walkable_area: "старт перенесён в проходимую зону",
   no_collision_free_route: "между точками нет связного прохода",
   different_walkable_components: "точки попали в разные связные зоны маски",
   no_walkable_segment_endpoint: "конец сегмента не попал в проходимую область",
   local_search_exhausted: "локальный поиск не нашёл безопасный обход",
   detour_spike_rejected: "найденный обход отклонён как аномальная петля",
-  short_residual_collision_kept: "сохранена короткая коллизия для защиты формы маршрута",
-  residual_micro_collisions_kept_to_preserve_shape: "сохранена коллизия до 0,75 м из-за погрешности маски",
   authoritative_safe_map_fallback: "использован безопасный графовый маршрут по фиксированному плану",
+  independent_monocular_rescue: "использован независимый монокулярный LingBot",
   independent_residual_collision: "независимый LingBot пересекает запрещённую область",
+  implausible_metric_scale: "масштаб не согласуется со временем и скоростью движения",
+  implausible_corrected_metric_scale: "после обхода препятствий нарушилась метрическая модель",
+  metric_prior_inconsistent: "не найден физически правдоподобный масштаб",
+  metric_prior_unavailable: "нет надёжной временной шкалы для независимого масштаба",
+  start_too_far_from_walkable_area: "старт слишком далеко от проходимой области",
+  final_publication_invariant_failed: "итоговая линия не прошла проверку безопасности",
+  unsafe_or_disconnected_final_polyline: "итоговый маршрут небезопасен или несвязен",
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
   topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
   map_correction_exceeds_observation_budget: "коррекция плана превышает бюджет наблюдения",
@@ -709,7 +715,9 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
 
       // Use the current `videos` state for analysis
       const videosToAnalyze = [...videos];
-      const batchId = (typeof crypto !== "undefined" && (crypto as any).randomUUID) ? (crypto as any).randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+      const batchId = (
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ) ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const batchSize = videosToAnalyze.length;
       setBatchTotal(batchSize);
 

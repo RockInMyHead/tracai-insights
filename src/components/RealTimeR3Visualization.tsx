@@ -33,6 +33,11 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
   const [animProgress, setAnimProgress] = useState(0);
   const completedRef = useRef(false);
   const totalFramesRef = useRef(0);
+  const onCompleteRef = useRef(onComplete);
+
+  useEffect(() => {
+    onCompleteRef.current = onComplete;
+  }, [onComplete]);
 
   // Subscribe to SSE stream
   useEffect(() => {
@@ -165,7 +170,7 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
           totalFramesRef.current = numFrames;
           setTotalFrames(numFrames);
         }
-        onComplete?.(data);
+        onCompleteRef.current?.(data);
 
         // ── 2. Fetch full point cloud from API (SSE only carries a small preview) ─────
         apiClient.getR3PointCloudFiltered(videoId, {

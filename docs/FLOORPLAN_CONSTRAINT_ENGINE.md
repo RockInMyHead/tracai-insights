@@ -12,11 +12,14 @@ Production map matching for the fixed Kerama Marazzi 2025 floor plan.
   candidate; the fixed plan selects between primary R3 and that candidate.
 - The engine may add `map_trajectory`; it never overwrites
   `plan_trajectory` or `raw_trajectory_3d`.
-- The walkable mask is a hard production constraint. Scale, speed and
-  correction-size inconsistencies lower confidence but do not suppress a
-  collision-free map route.
-- No map overlay is returned only when the walkable graph contains no feasible
-  route for any tested scale/yaw hypothesis.
+- The walkable mask, metric scale, forward time and final route connectivity
+  are hard production constraints. A collision-free but physically implausible
+  route is not publishable.
+- Independent LingBot is a guarded rescue source. It requires a monotonic time
+  base and a speed within `0.72..1.80` of the calibrated walking-speed prior;
+  fusion support never grants it an unrestricted shape fallback.
+- No map overlay is returned when no candidate satisfies both the visual/map
+  topology and the source-specific metric policy.
 
 ## Metric calibration
 
@@ -42,20 +45,25 @@ The calibration and source rectangle are stored in
 4. Generate global scale and small yaw hypotheses. Metric scale is seeded by
    active walking time, not full video duration, so stationary intervals do
    not stretch the path.
-5. Pre-score every hypothesis by restricted-area intersections, plan bounds,
-   clearance, walking-speed plausibility, and yaw deviation.
+5. Reject hypotheses outside the source-specific metric envelope before the
+   repair beam is built. Pre-score the survivors by restricted-area
+   intersections, plan bounds, clearance, walking speed and yaw deviation.
 6. Inflate the no-go mask by a `0.28 m` person radius.
-7. Constrain the best hypotheses to the walkable mask. Points outside the
-   plan and start markers inside no-go cells are projected to the nearest
-   walkable cell.
+7. Constrain the best hypotheses to the walkable mask. A start marker may only
+   be projected locally (`<= 1.5 m`); larger snaps are rejected.
 8. Repair collision runs with local eight-connected A*. Its objective
    combines path length, wall clearance, and deviation from the visual path.
 9. Simplify A* output only through verified collision-free line of sight.
    This prevents sparse resampling from cutting through equipment again.
-10. Select the feasible constrained hypothesis and observation source with the
-    smallest combined visual, correction and route-distortion cost.
-11. Hard-accept only zero-intersection, inside-plan routes. Report route-length,
-    correction and speed inconsistencies as `quality_warnings`.
+10. Recompute length and speed after A*/Viterbi. A repair that breaks the metric
+    envelope is rejected even when its collision count is zero.
+11. Select authoritative R3/fusion first. Evaluate independent LingBot only
+    after all authoritative candidates fail, without inheriting their relaxed
+    shape policy.
+12. Before publication, densify the polyline to at most `0.75 m` per segment,
+    reconstruct timestamps by source arc fraction, and revalidate every sample,
+    segment, plan bound and connected-component ID.
+13. Hard-accept only a zero-intersection, single-component final polyline.
 
 Turn angles and left/right labels stay sourced from R3. Their positions are
 transferred to the constrained route by arc-length fraction.
@@ -83,13 +91,17 @@ red CAD content that was already present.
 `floorplan_constraint` and `processing_stats.floorplan_constraint` include:
 
 - selected scale and yaw;
-- active motion duration and estimated speed;
+- active motion duration, final speed and speed/prior ratio;
 - raw/corrected collision ratios;
 - rerouted segment count;
 - correction median and p95 in meters;
 - route-length ratio;
-- confidence, `quality_warnings`, and a machine-readable rejection reason when
-  the constrained graph truly has no feasible route.
+- published length and maximum published segment length;
+- observation policy and timestamp provenance;
+- confidence, `quality_warnings`, and machine-readable metric, topology or
+  publication rejection reasons.
 
 The map result is accepted when every rendered segment is inside the fixed
-walkable mask. Monocular-quality priors affect ranking and confidence only.
+walkable mask, belongs to one walkable component and satisfies the applicable
+metric policy. Independent monocular scale is never inferred from mask fit
+alone.

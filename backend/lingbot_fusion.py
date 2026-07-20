@@ -76,7 +76,9 @@ def _finite_timestamps(value: Any) -> Optional[np.ndarray]:
         return None
     if len(finite) < len(raw):
         raw = np.interp(np.arange(len(raw)), finite, raw[finite])
-    if float(np.ptp(raw)) <= 1e-9:
+    # np.interp below requires a monotonic parameter. Mixing frame clocks or
+    # accepting a reset here silently creates false R3/LingBot correspondence.
+    if float(np.ptp(raw)) <= 1e-9 or np.any(np.diff(raw) <= 0.0):
         return None
     return raw
 
@@ -143,7 +145,12 @@ def _resample_by_parameter(
     source_t = np.asarray(parameter, dtype=np.float64)
     source_start = float(source_t[0]) if len(source_t) else 0.0
     source_end = float(source_t[-1]) if len(source_t) else 1.0
-    if len(source_t) != len(points) or float(np.ptp(source_t)) <= 1e-12:
+    if (
+        len(source_t) != len(points)
+        or float(np.ptp(source_t)) <= 1e-12
+        or np.any(~np.isfinite(source_t))
+        or np.any(np.diff(source_t) <= 0.0)
+    ):
         source_t = np.linspace(0.0, 1.0, len(points))
     else:
         source_t = (source_t - source_t[0]) / max(float(source_t[-1] - source_t[0]), 1e-12)
