@@ -347,6 +347,10 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(updated["map_turn_points"][0]["map_constrained"])
         self.assertAlmostEqual(updated["processing_stats"]["estimated_distance"], 96.0, delta=2.0)
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
+        self.assertEqual(
+            updated["floorplan_constraint"]["constraint_revision"],
+            "authoritative_plan_connectivity_v2",
+        )
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [
