@@ -1,10 +1,4 @@
-"""Verified Kerama route data and deterministic mask overrides.
-
-The red annotation mask is still the general obstacle source.  A small number
-of operator-verified passages are stronger evidence than the annotation where
-the two disagree.  Keeping the override as plan coordinates makes the binary
-asset reproducible and lets tests validate the same production geometry.
-"""
+"""Verified Kerama route data and deterministic mask overrides."""
 
 from __future__ import annotations
 
@@ -19,7 +13,7 @@ from scipy import ndimage
 
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 REFERENCE_ROUTE_FILE = ASSET_ROOT / "kerama_marazzi_2025_reference_route.json"
-FALSE_NORTH_CORRIDOR = (600, 500, 3050, 650)  # x1, y1, x2, y2
+FALSE_NORTH_CORRIDOR = (600, 500, 3050, 650)
 
 
 def load_reference_route(path: Optional[Path] = None) -> dict[str, Any]:
@@ -65,7 +59,7 @@ def apply_reference_route_overrides(
     meters_per_pixel: float,
     payload: Optional[dict[str, Any]] = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Apply the v7 verified passage and retained v5 exterior protection."""
+    """Apply the verified passage and retained exterior protection."""
     obstacles = np.asarray(obstacle_mask, dtype=bool).copy()
     support = np.asarray(support_mask, dtype=bool).copy()
     if obstacles.shape != support.shape:
@@ -85,7 +79,6 @@ def apply_reference_route_overrides(
 
     x1, y1, x2, y2 = FALSE_NORTH_CORRIDOR
     obstacles[y1:y2, x1:x2] = True
-
     half_width_meters = float(
         route_payload.get("verified_walkable_half_width_meters", 0.75)
     )

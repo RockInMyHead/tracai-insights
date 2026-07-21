@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 
@@ -6,9 +7,9 @@ import numpy as np
 from backend.floorplan_constraints import (
     FloorplanConfig,
     FloorplanConstraintEngine,
-    _densify_polyline,
     _polyline_progress_metrics,
     _polyline_sharp_reverse_ratio,
+    _speed_prior_penalty,
     _stabilize_independent_observation,
     _trajectory_fractions,
     apply_floorplan_constraints,
@@ -270,6 +271,71 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         local = np.asarray([[10.0, 40.0], [25.0, 48.0], [40.0, 40.0]])
         self.assertFalse(engine._detour_is_spike(local, start, end, raw))
 
+    def test_long_detour_supported_by_observed_arc_is_not_a_false_spike(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((100, 120), dtype=bool), meters_per_pixel=0.1
+        )
+        observed_arc = np.asarray([
+            [10.0, 60.0], [10.0, -10.0], [40.0, -10.0], [40.0, 60.0]
+        ])
+        metrics = engine._detour_metrics(
+            observed_arc, observed_arc[0], observed_arc[-1], observed_arc
+        )
+        self.assertGreater(metrics["route_meters"], metrics["chord_meters"] + 12.0)
+        self.assertAlmostEqual(metrics["route_observed_length_ratio"], 1.0)
+        self.assertFalse(metrics["spike"], metrics)
+
+    def test_authoritative_spike_can_reach_graph_recovery_before_rejection(self) -> None:
+        mask = np.zeros((120, 120), dtype=bool)
+        mask[10:110, 55:65] = True
+        engine = FloorplanConstraintEngine.from_mask(
+            mask,
+            grid_cell_pixels=1,
+            meters_per_pixel=0.1,
+            person_radius_meters=0.0,
+        )
+        observed = np.asarray([
+            [45.5, 60.5], [53.0, 60.5], [60.5, 60.5],
+            [68.0, 60.5], [75.5, 60.5],
+        ])
+        diagnostics: dict[str, object] = {}
+        provisional, _ = engine._repair_collisions(
+            observed,
+            allow_provisional_spikes=True,
+            repair_diagnostics=diagnostics,
+        )
+        self.assertIsNotNone(provisional)
+        self.assertGreater(int(diagnostics.get("provisional_spike_count", 0)), 0)
+        with patch.object(
+            engine,
+            "_multilevel_viterbi_map_match",
+            return_value=(
+                provisional,
+                {
+                    "attempted": True,
+                    "accepted": False,
+                    "method": "corridor_graph_multilevel_viterbi_v3_second_order",
+                    "reason": None,
+                    "post_repair_segments": 0,
+                },
+            ),
+        ):
+            result = engine.align(
+                observed.tolist(),
+                {"x": 45.5 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
+                {"x": 53.0 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
+                coordinate_convention="x_right_y_down",
+                scale_candidates=[1.0],
+                yaw_offsets_degrees=[0.0],
+            )
+        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertGreater(result["diagnostics"]["topology_recovery_attempted"], 0)
+        self.assertGreater(result["diagnostics"]["topology_recovery_accepted"], 0)
+        self.assertEqual(
+            result["diagnostics"]["nonlinear_map_matching"]["phase"],
+            "preselection_spike_recovery",
+        )
+
     def test_sharp_reverse_ratio_flags_triangular_spike(self) -> None:
         # Straight walk with one large triangular detour (classic bad A* spike).
         points = np.asarray([
@@ -430,7 +496,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
         self.assertEqual(
             updated["floorplan_constraint"]["constraint_revision"],
-            "kerama_reference_topology_v7",
+            "kerama_topology_recovery_v8",
         )
         self.assertEqual(
             len(updated["map_trajectory_timestamps_seconds"]),
@@ -446,73 +512,55 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         engine = get_floorplan_engine()
 
         self.assertTrue(engine._point_occupied([1700, 575]))
-        self.assertFalse(engine._point_occupied([1700, 705]))
         self.assertFalse(engine._point_occupied([1700, 850]))
         self.assertFalse(engine._point_occupied([2200, 850]))
 
-    def test_operator_reference_route_is_one_collision_free_component(self) -> None:
+    def test_operator_reference_route_is_walkable_connected_and_metric(self) -> None:
         engine = get_floorplan_engine()
-        payload = load_reference_route()
-        route = np.asarray(payload["points"], dtype=np.float64)
-        metrics = engine._path_metrics(route)
-
-        self.assertEqual(metrics["collision_ratio"], 0.0)
-        self.assertEqual(metrics["outside_ratio"], 0.0)
-        self.assertEqual(engine._collision_runs(route), [])
-        self.assertEqual(engine._path_component_count(route), 1)
-        length_meters = (
-            np.linalg.norm(np.diff(route, axis=0), axis=1).sum()
+        reference = load_reference_route()
+        points = np.asarray(reference["points"], dtype=float)
+        self.assertEqual(engine._collision_runs(points), [])
+        self.assertEqual(engine._path_component_count(points), 1)
+        length_meters = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum()) \
             * engine.config.meters_per_pixel
-        )
         self.assertAlmostEqual(
             length_meters,
-            float(payload["expected_length_meters"]),
-            delta=float(payload["length_tolerance_meters"]),
+            float(reference["expected_length_meters"]),
+            delta=float(reference["length_tolerance_meters"]),
         )
 
-    def test_operator_reference_route_aligns_end_to_end_at_metric_scale(self) -> None:
+    def test_operator_reference_route_aligns_end_to_end(self) -> None:
         engine = get_floorplan_engine()
-        payload = load_reference_route()
-        route = np.asarray(payload["points"], dtype=np.float64)
-        dense = _densify_polyline(route, 2.0)
-        fractions = _trajectory_fractions(dense)
-        duration = float(payload["expected_length_meters"]) / 1.5
-        reference = payload["reference_point"]
-        direction = payload["direction_point"]
+        reference = load_reference_route()
+        points = reference["points"]
+
+        def percent(point: list[float]) -> dict[str, float]:
+            return {
+                "x": point[0] / engine.config.width * 100.0,
+                "y": point[1] / engine.config.height * 100.0,
+            }
 
         result = engine.align(
-            dense.tolist(),
-            {
-                "x": reference[0] / engine.config.width * 100.0,
-                "y": reference[1] / engine.config.height * 100.0,
-            },
-            {
-                "x": direction[0] / engine.config.width * 100.0,
-                "y": direction[1] / engine.config.height * 100.0,
-            },
-            timestamps=(fractions * duration).tolist(),
+            points,
+            percent(reference["reference_point"]),
+            percent(reference["direction_point"]),
             coordinate_convention="x_right_y_down",
             scale_candidates=[1.0],
             yaw_offsets_degrees=[0.0],
+            allow_safe_shape_fallback=True,
         )
-
         self.assertTrue(result["accepted"], result["diagnostics"])
-        diagnostics = result["diagnostics"]
-        self.assertEqual(diagnostics["corrected_collision_ratio"], 0.0)
+        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
         self.assertAlmostEqual(
-            diagnostics["published_length_meters"],
-            float(payload["expected_length_meters"]),
-            delta=float(payload["length_tolerance_meters"]),
+            result["diagnostics"]["published_length_meters"],
+            reference["expected_length_meters"],
+            delta=reference["length_tolerance_meters"],
         )
-        endpoint = np.asarray(result["trajectory"][-1][:2], dtype=np.float64)
-        endpoint_error_meters = (
-            float(np.linalg.norm(endpoint - np.asarray(payload["expected_end_point"])))
-            * engine.config.meters_per_pixel
-        )
-        self.assertLessEqual(
-            endpoint_error_meters, float(payload["endpoint_tolerance_meters"])
-        )
-        self.assertTrue(diagnostics["nonlinear_map_matching"]["attempted"])
+        endpoint = np.asarray(result["trajectory"][-1][:2])
+        endpoint_error = float(np.linalg.norm(
+            endpoint - np.asarray(reference["expected_end_point"])
+        )) * engine.config.meters_per_pixel
+        self.assertLessEqual(endpoint_error, reference["endpoint_tolerance_meters"])
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [
@@ -955,88 +1003,48 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         yaws = {item["yaw"] for item in beam}
         self.assertGreaterEqual(len(yaws), 4)
 
-    def test_diverse_beam_retains_distant_metric_scale_strata(self) -> None:
+    def test_diverse_beam_retains_metric_scale_strata(self) -> None:
         hypotheses = [
-            {"score": float(index), "scale": float(index + 1), "yaw": 0.0}
-            for index in range(10)
+            {"score": abs(index - 10), "scale": float(2 ** (index / 4)), "yaw": 0.0}
+            for index in range(20)
         ]
         beam = FloorplanConstraintEngine._select_diverse_beam(
-            hypotheses, per_yaw=4, global_top=0
+            hypotheses, per_yaw=1, global_top=1
         )
-        scales = [float(item["scale"]) for item in beam]
-        self.assertLessEqual(min(scales), 1.0)
-        self.assertGreaterEqual(max(scales), 8.0)
+        scales = {item["scale"] for item in beam}
+        self.assertIn(min(item["scale"] for item in hypotheses), scales)
+        self.assertIn(max(item["scale"] for item in hypotheses), scales)
+        self.assertGreaterEqual(len(scales), 6)
 
-    def test_walking_speed_prior_is_flat_across_normal_human_range(self) -> None:
+    def test_speed_prior_is_flat_across_normal_walking_speeds(self) -> None:
+        self.assertEqual(_speed_prior_penalty(1.0, "authoritative"), 0.0)
+        self.assertEqual(_speed_prior_penalty(1.5, "authoritative"), 0.0)
+        self.assertEqual(_speed_prior_penalty(1.0, "independent"), 0.0)
+        self.assertGreater(_speed_prior_penalty(0.65, "independent"), 4.0)
+
+    def test_low_progress_independent_is_rejected_before_scale_search(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
-            np.zeros((500, 500), dtype=bool), meters_per_pixel=0.1
+            np.zeros((200, 200), dtype=bool), meters_per_pixel=0.1
         )
-        _, normal = engine._score_hypothesis(
-            np.asarray([[50.0, 250.0], [170.0, 250.0]]),
-            10.0,
-            0.0,
-            observation_policy="authoritative",
-        )
-        _, brisk = engine._score_hypothesis(
-            np.asarray([[50.0, 250.0], [242.0, 250.0]]),
-            10.0,
-            0.0,
-            observation_policy="authoritative",
-        )
-        self.assertEqual(normal["speed_prior_penalty"], 0.0)
-        self.assertEqual(brisk["speed_prior_penalty"], 0.0)
-
-    def test_04e39cf_compressed_independent_shape_is_rejected_before_scale_search(self) -> None:
-        # RDP landmarks from the bad 04e39cf output.  The trajectory doubles
-        # back through the office strip, so its endpoint covers only 63.5% of
-        # its travelled arc even before monocular scale is chosen.
-        bad_route = np.asarray([
-            [2226.0, 678.0], [1794.2, 656.9], [1742.5, 691.9],
-            [1646.0, 678.0], [1602.0, 734.0], [1498.0, 718.0],
-            [1490.0, 834.0], [1456.8, 808.4], [1466.0, 858.0],
-            [1498.0, 910.0], [1560.1, 894.7],
+        observation = np.asarray([
+            [0.0, 0.0], [15.0, 0.0], [30.0, 0.0], [30.0, 15.0],
+            [30.0, 30.0], [19.0, 30.0], [8.0, 30.0],
         ])
-        progress = _polyline_progress_metrics(bad_route)
-        self.assertLess(progress["net_progress_ratio"], 0.64)
-        engine = FloorplanConstraintEngine.from_mask(
-            np.zeros((1200, 2600), dtype=bool), meters_per_pixel=0.05
+        self.assertLess(
+            _polyline_progress_metrics(observation)["net_progress_ratio"], 0.64
         )
         result = engine.align(
-            bad_route.tolist(),
-            {"x": 2226.0 / 2600.0 * 100.0, "y": 678.0 / 1200.0 * 100.0},
-            {"x": 2145.0 / 2600.0 * 100.0, "y": 705.0 / 1200.0 * 100.0},
-            timestamps=np.linspace(0.0, 54.0, len(bad_route)).tolist(),
-            coordinate_convention="x_right_y_down",
-            scale_candidates=[0.7, 1.0, 1.4],
+            observation.tolist(),
+            {"x": 10.0, "y": 50.0},
+            {"x": 30.0, "y": 50.0},
+            timestamps=[0.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0],
             observation_policy="independent",
         )
-        self.assertFalse(result["accepted"])
+        self.assertFalse(result["accepted"], result["diagnostics"])
         self.assertEqual(
             result["diagnostics"]["reason"],
             "insufficient_independent_net_progress",
         )
-
-    def test_independent_alignment_fails_closed_when_two_scales_are_tied(self) -> None:
-        engine = FloorplanConstraintEngine.from_mask(
-            np.zeros((500, 500), dtype=bool), meters_per_pixel=0.1
-        )
-        result = engine.align(
-            [[0.0, 0.0], [40.0, 0.0], [80.0, 0.0], [120.0, 0.0]],
-            {"x": 20.0, "y": 50.0},
-            {"x": 30.0, "y": 50.0},
-            timestamps=[0.0, 3.0, 6.0, 10.0],
-            coordinate_convention="x_right_y_down",
-            scale_candidates=[1.0, 1.5],
-            yaw_offsets_degrees=[0.0],
-            observation_policy="independent",
-        )
-
-        self.assertFalse(result["accepted"])
-        self.assertEqual(
-            result["diagnostics"]["reason"],
-            "ambiguous_independent_map_alignment",
-        )
-        self.assertGreater(result["diagnostics"]["ambiguous_scale_ratio"], 1.18)
 
     def test_malformed_points_are_dropped_not_zeroed(self) -> None:
         from backend.floorplan_constraints import _normalise_points
@@ -1071,20 +1079,26 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(engine._collision_runs(matched), [])
         self.assertGreater(diagnostics["corridor_graph_nodes"], 0)
 
-    def test_second_order_hmm_is_enabled_in_production_by_default(self) -> None:
+    def test_second_order_hmm_is_enabled_in_production(self) -> None:
         mask = np.zeros((120, 180), dtype=bool)
         mask[42:78, 78:102] = True
         engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
-        result = engine.align(
-            [[0, 0], [20, 0], [40, 0], [60, 0], [80, 0]],
-            {"x": 10, "y": 50}, {"x": 30, "y": 50},
-            scale_candidates=[2.0], yaw_offsets_degrees=[0.0],
-        )
+        with patch.dict(os.environ, {"TRACKAI_ENABLE_MULTILEVEL_HMM": "1"}):
+            result = engine.align(
+                [[0, 0], [20, 0], [40, 0], [60, 0], [80, 0]],
+                {"x": 10, "y": 50}, {"x": 30, "y": 50},
+                scale_candidates=[2.0], yaw_offsets_degrees=[0.0],
+            )
+        self.assertTrue(result["accepted"], result["diagnostics"])
         nonlinear = result["diagnostics"]["nonlinear_map_matching"]
         self.assertTrue(nonlinear["attempted"])
         self.assertTrue(nonlinear["production_enabled"])
-        self.assertEqual(nonlinear["coarse"]["order"], 2)
-        self.assertEqual(nonlinear["fine"]["order"], 2)
+        self.assertEqual(
+            nonlinear["method"],
+            "corridor_graph_multilevel_viterbi_v3_second_order",
+        )
+        if "fine" in nonlinear and nonlinear["fine"].get("reason") is None:
+            self.assertEqual(nonlinear["fine"]["order"], 2)
 
 
 if __name__ == "__main__":

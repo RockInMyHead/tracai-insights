@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the verified Kerama route override to the checked-in v5 assets."""
+"""Apply the verified Kerama route override to the checked-in assets."""
 
 from __future__ import annotations
 
@@ -34,10 +34,6 @@ def main() -> None:
         support,
         meters_per_pixel=float(metadata["meters_per_pixel"]),
     )
-    # The command is deliberately idempotent.  Once the checked-in mask has
-    # been overridden there are no blocked corridor pixels left to count, but
-    # rerunning the tool must not erase the provenance of the original v5
-    # correction.
     previous_override = metadata.get("reference_mask") or {}
     if previous_override.get("method") == override.get("method"):
         for key in ("obstacle_pixels_cleared", "support_pixels_added"):

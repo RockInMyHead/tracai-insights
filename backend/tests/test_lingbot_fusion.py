@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from backend.lingbot_fusion import (
+    _independent_quality,
     build_lingbot_fusion_candidate,
     should_restore_lingbot_fusion_candidate,
 )
@@ -56,7 +57,7 @@ class LingBotFusionTests(unittest.TestCase):
         self.assertAlmostEqual(result["plan_trajectory"][-1][1], r3[-1, 1], places=6)
         self.assertEqual(result["diagnostics"]["endpoint_displacement"], 0.0)
         self.assertFalse(result["diagnostics"]["chirality_conflict"])
-        self.assertIn("v3_gip", result["diagnostics"]["method"])
+        self.assertIn("v4_progress_guard", result["diagnostics"]["method"])
 
     def test_incompatible_trajectory_remains_shadow_only(self) -> None:
         r3 = self._r3_path()
@@ -190,26 +191,23 @@ class LingBotFusionTests(unittest.TestCase):
         self.assertFalse(result["independent_accepted"])
         self.assertIn("degenerate_span", result["diagnostics"]["independent_quality"]["reasons"])
 
-    def test_low_progress_lingbot_cannot_become_independent_map_rescue(self) -> None:
-        r3 = self._r3_path()
-        lingbot = np.asarray([
-            [0.0, 0.0], [5.0, 0.0], [10.0, 0.0], [10.0, 5.0],
-            [5.0, 5.0], [0.0, 5.0], [0.0, 10.0], [5.0, 10.0],
-            [10.0, 10.0], [10.0, 6.0], [6.0, 6.0], [4.0, 6.0],
+    def test_compressed_open_lingbot_path_is_not_independent_accepted(self) -> None:
+        path = np.asarray([
+            [0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [20.0, 10.0],
+            [20.0, 20.0], [10.0, 20.0], [6.0, 20.0],
         ])
-        result = build_lingbot_fusion_candidate(
-            {"plan_trajectory": np.column_stack((r3, np.zeros(len(r3)))).tolist()},
-            {
-                "plan_trajectory": np.column_stack(
-                    (lingbot, np.zeros(len(lingbot)))
-                ).tolist()
-            },
-        )
-
-        quality = result["diagnostics"]["independent_quality"]
-        self.assertLess(quality["net_progress_ratio"], 0.64)
+        quality = _independent_quality(path, {"method": "explicit_plan_trajectory"})
+        self.assertFalse(quality["accepted"], quality)
         self.assertIn("insufficient_net_progress", quality["reasons"])
-        self.assertFalse(result["independent_accepted"])
+        self.assertFalse(quality["loop_closure_verified"])
+
+    def test_geometric_full_loop_is_explicitly_verified(self) -> None:
+        angles = np.linspace(0.0, 2.0 * np.pi, 49)
+        path = np.column_stack((10.0 * np.cos(angles), 10.0 * np.sin(angles)))
+        quality = _independent_quality(path, {"method": "explicit_plan_trajectory"})
+        self.assertTrue(quality["accepted"], quality)
+        self.assertTrue(quality["loop_closure_verified"])
+        self.assertLess(quality["net_progress_ratio"], 0.01)
 
     def test_timestamp_correspondence_is_preferred_over_arc_length(self) -> None:
         r3 = self._r3_path()

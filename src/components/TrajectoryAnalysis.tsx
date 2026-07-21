@@ -27,9 +27,15 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   no_walkable_segment_endpoint: "конец сегмента не попал в проходимую область",
   local_search_exhausted: "локальный поиск не нашёл безопасный обход",
   detour_spike_rejected: "найденный обход отклонён как аномальная петля",
+  corridor_graph_recovery_failed: "граф коридоров не подтвердил безопасный обход",
+  corridor_graph_topology_recovery_applied: "аномальный A* обход заменён маршрутом по графу коридоров",
   authoritative_safe_map_fallback: "использован безопасный графовый маршрут по фиксированному плану",
   independent_monocular_rescue: "использован независимый монокулярный LingBot",
   independent_residual_collision: "независимый LingBot пересекает запрещённую область",
+  insufficient_independent_net_progress: "траектория LingBot слишком сжата или возвращается к старту",
+  compressed_or_looping_independent_observation: "наблюдение LingBot не даёт достаточного перемещения по плану",
+  ambiguous_independent_map_alignment: "для LingBot найдено несколько неоднозначных привязок к плану",
+  independent_scale_or_topology_ambiguous: "масштаб или ветвь прохода для LingBot неоднозначны",
   implausible_metric_scale: "масштаб не согласуется со временем и скоростью движения",
   implausible_corrected_metric_scale: "после обхода препятствий нарушилась метрическая модель",
   metric_prior_inconsistent: "не найден физически правдоподобный масштаб",
@@ -40,10 +46,6 @@ const FLOORPLAN_DIAGNOSTIC_LABELS: Record<string, string> = {
   constraint_solution_not_found: "не найден допустимый маршрут по маске",
   topology_destroying_map_correction: "коррекция плана ломает форму маршрута",
   map_correction_exceeds_observation_budget: "коррекция плана превышает бюджет наблюдения",
-  insufficient_independent_net_progress: "независимая траектория слишком сжата или возвращается назад",
-  compressed_or_looping_independent_observation: "LingBot не даёт однозначного продвижения от старта к финишу",
-  ambiguous_independent_map_alignment: "для LingBot найдено несколько несовместимых масштабов маршрута",
-  independent_scale_or_topology_ambiguous: "масштаб или топология независимой траектории неоднозначны",
 };
 
 const LINGBOT_FUSION_REASON_LABELS: Record<string, string> = {
@@ -51,7 +53,7 @@ const LINGBOT_FUSION_REASON_LABELS: Record<string, string> = {
   turn_chirality_conflict: "разный знак поворотов",
   trajectory_too_short: "слишком короткая траектория",
   similarity_fit_failed: "не удалось совместить траектории",
-  insufficient_net_progress: "слишком мало продвижения от старта к финишу",
+  insufficient_net_progress: "траектория слишком сжата или возвращается к старту",
 };
 
 const MAP_OBSERVATION_SOURCE_LABELS: Record<string, string> = {

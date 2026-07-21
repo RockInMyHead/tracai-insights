@@ -21,7 +21,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-METHOD_TAG = "robust_similarity_confidence_blend_v3_gip"
+METHOD_TAG = "robust_similarity_confidence_blend_v4_progress_guard"
 
 
 def _finite_points(value: Any) -> np.ndarray:
@@ -255,15 +255,23 @@ def _independent_quality(
 ) -> dict[str, Any]:
     span = _spatial_span(lingbot)
     length = _polyline_length(lingbot)
-    rank, condition = _effective_rank(lingbot)
-    plane_ratio = float(projection.get("explained_motion_plane_ratio") or 1.0)
-    method = str(projection.get("method") or "")
     endpoint_displacement = (
-        float(np.linalg.norm(lingbot[-1] - lingbot[0])) if len(lingbot) >= 2 else 0.0
+        float(np.linalg.norm(lingbot[-1] - lingbot[0]))
+        if len(lingbot) >= 2 else 0.0
     )
     net_progress_ratio = endpoint_displacement / max(length, 1e-12)
     tortuosity = length / max(endpoint_displacement, 1e-12)
-    loop_closure_verified = bool(projection.get("loop_closure_verified", False))
+    signed_turn_degrees = math.degrees(_signed_turn_radians(lingbot))
+    loop_closure_verified = bool(
+        len(lingbot) >= 12
+        and length > 1e-3
+        and net_progress_ratio <= 0.22
+        and length >= 1.8 * max(span, 1e-12)
+        and abs(signed_turn_degrees) >= 300.0
+    )
+    rank, condition = _effective_rank(lingbot)
+    plane_ratio = float(projection.get("explained_motion_plane_ratio") or 1.0)
+    method = str(projection.get("method") or "")
     reasons: list[str] = []
     if len(lingbot) < 6:
         reasons.append("too_few_points")
@@ -277,10 +285,6 @@ def _independent_quality(
         reasons.append("nonplanar_motion")
     if method in {"unavailable", "pca_failed"}:
         reasons.append("projection_unavailable")
-    # Monocular scale is unresolved for an independent rescue.  A low-progress
-    # curve can be shrunk into any convenient map island and is therefore not
-    # an identifiable open route.  Explicit loop-closure evidence is the only
-    # exception; ordinary PCA/adapter projection never sets that evidence.
     if net_progress_ratio < 0.64 and not loop_closure_verified:
         reasons.append("insufficient_net_progress")
     return {
@@ -292,6 +296,7 @@ def _independent_quality(
         "endpoint_displacement": round(endpoint_displacement, 8),
         "net_progress_ratio": round(net_progress_ratio, 8),
         "tortuosity": round(tortuosity, 8),
+        "signed_turn_degrees": round(signed_turn_degrees, 4),
         "loop_closure_verified": loop_closure_verified,
         "effective_rank": round(rank, 4),
         "secondary_condition": round(condition, 8),
