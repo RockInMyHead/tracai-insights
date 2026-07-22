@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -6,14 +6,27 @@ import { Progress } from "@/components/ui/progress";
 import { Loader2, EyeOff } from "lucide-react";
 import { apiClient } from "@/lib/api";
 import R3Visualization3D from "./R3Visualization3D";
+import TrajectoryMap, { type TrajectoryData } from "./TrajectoryMap";
 
 interface Props {
   videoId: string;
   onComplete?: (result: Record<string, unknown>) => void;
   onClose?: () => void;
+  floorPlan?: string | null;
+  drawnPlan?: unknown[] | null;
+  referencePoint?: { x: number; y: number } | null;
+  directionPoint?: { x: number; y: number } | null;
 }
 
-export default function RealTimeR3Visualization({ videoId, onComplete, onClose }: Props) {
+export default function RealTimeR3Visualization({
+  videoId,
+  onComplete,
+  onClose,
+  floorPlan = null,
+  drawnPlan = null,
+  referencePoint = null,
+  directionPoint = null,
+}: Props) {
   const [points, setPoints] = useState<number[][]>([]);
   const [poses, setPoses] = useState<{frame: number; pose: number[][]; intrinsics?: number[][]}[]>([]);
   const [pointCloud, setPointCloud] = useState<number[][] | null>(null);
@@ -25,8 +38,8 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
   const [fps, setFps] = useState(0);
   const [processingTime, setProcessingTime] = useState(0);
   const [errorMessage, setErrorMessage] = useState("");
-  // Сразу fullscreen — компонент должен занимать всю страницу
-  const [isFullscreen3d, setIsFullscreen3d] = useState(true);
+  // Keep inline so the live floor-plan panel stays visible during analysis.
+  const [isFullscreen3d, setIsFullscreen3d] = useState(false);
   const unsubscribeRef = useRef<(() => void) | null>(null);
   const pointsRef = useRef<number[][]>([]);
   const posesRef = useRef<{frame: number; pose: number[][]; intrinsics?: number[][]}[]>([]);
@@ -229,6 +242,28 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
 
   const isLive = status === "connecting" || status === "processing";
 
+  const liveTrajectories = useMemo<TrajectoryData[]>(() => {
+    if (points.length < 2) return [];
+    return [{
+      trajectory: points.map((point) => ({
+        x: Number(point[0]) || 0,
+        y: Number(point[1]) || 0,
+        z: Number(point[2]) || 0,
+      })),
+      turnPoints: [],
+      ownerName: "Live R³",
+      color: "#38bdf8",
+      videoId,
+      method: "r3_reconstruction",
+      coordinateConvention: "x_forward_y_left_z_up",
+      mapAligned: false,
+      r3AutoFitToPlan: true,
+      mapScaleFactor: 1,
+    }];
+  }, [points, videoId]);
+
+  const showFloorplanLive = Boolean(floorPlan || drawnPlan);
+
   return (
     <Card className={`w-full border-2 border-primary/20 ${isFullscreen3d ? "fixed inset-0 z-[99] rounded-none border-0" : ""}`}>
       {/* Кнопка закрытия при fullscreen */}
@@ -253,7 +288,7 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
                   <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500" />
                 </span>
-                R³ Live — реконструкция в реальном времени
+                Live — траектория рисуется по мере готовности
               </>
             ) : status === "complete" ? (
               <>
@@ -278,41 +313,79 @@ export default function RealTimeR3Visualization({ videoId, onComplete, onClose }
             </Button>
           </div>
         </div>
+        <p className="text-xs text-muted-foreground">
+          {statusMessage}
+          {errorMessage ? ` · ${errorMessage}` : ""}
+        </p>
       </CardHeader>
       <CardContent className="space-y-3">
         {/* Progress */}
         <Progress value={animProgress} className="w-full h-1.5" />
 
-        {/* 3D Visualization */}
-        <div className="relative rounded-lg overflow-hidden bg-black/40 border border-border/30">
-          {points.length > 0 ? (
-            <R3Visualization3D
-              videoId={videoId}
-              points={points}
-              poses={poses}
-              pointCloud={pointCloud}
-              totalFrames={totalFrames}
-              distance={distance}
-              onFullscreenChange={(full) => setIsFullscreen3d(full)}
-            />
-          ) : (
-            <div
-              className="flex items-center justify-center"
-              style={{ height: 500 }}
-            >
-              <div className="text-center">
-                <Loader2 className="h-10 w-10 animate-spin mx-auto mb-3 text-primary" />
-                <p className="text-sm text-muted-foreground">Ожидание первой 3D точки...</p>
+        <div className={`grid gap-3 ${showFloorplanLive ? "xl:grid-cols-2" : "grid-cols-1"}`}>
+          {showFloorplanLive && (
+            <div className="overflow-hidden rounded-lg border border-primary/20 bg-background">
+              <div className="border-b border-border/40 px-3 py-2 text-sm font-medium">
+                План: live-траектория ({points.length.toLocaleString("ru-RU")} точек)
+              </div>
+              <div className="h-[420px]">
+                {liveTrajectories.length > 0 ? (
+                  <TrajectoryMap
+                    trajectories={liveTrajectories}
+                    floorPlan={floorPlan}
+                    drawnPlan={drawnPlan}
+                    referencePoint={referencePoint}
+                    directionPoint={directionPoint}
+                    playbackPointLimit={points.length}
+                    compactMode
+                  />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                    <div className="text-center">
+                      <Loader2 className="mx-auto mb-2 h-8 w-8 animate-spin text-primary" />
+                      Ждём первые точки R³…
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
+
+          {/* 3D Visualization */}
+          <div className="relative overflow-hidden rounded-lg border border-border/30 bg-black/40">
+            {points.length > 0 ? (
+              <R3Visualization3D
+                videoId={videoId}
+                points={points}
+                poses={poses}
+                pointCloud={pointCloud}
+                totalFrames={totalFrames}
+                distance={distance}
+                onFullscreenChange={(full) => setIsFullscreen3d(full)}
+              />
+            ) : (
+              <div
+                className="flex items-center justify-center"
+                style={{ height: showFloorplanLive ? 420 : 500 }}
+              >
+                <div className="text-center">
+                  <Loader2 className="h-10 w-10 animate-spin mx-auto mb-3 text-primary" />
+                  <p className="text-sm text-muted-foreground">Ожидание первой 3D точки...</p>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Status */}
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <div className="flex items-center gap-2">
             {isLive && <Loader2 className="h-3 w-3 animate-spin" />}
-            <span>{statusMessage}</span>
+            <span>
+              {isLive
+                ? "Линия на плане удлиняется по мере обработки кадров"
+                : statusMessage}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             {fps > 0 && (

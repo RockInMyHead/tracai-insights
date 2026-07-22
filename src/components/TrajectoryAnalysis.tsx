@@ -762,6 +762,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             // Set live view video ID for R³
             if (analysisMethod === 'r3' && !liveViewVideoId) {
               setLiveViewVideoId(uploadedVideoId);
+              setShowLiveView(true);
             }
             apiClient
               .updateTaskContext(uploadedVideoId, {
@@ -802,6 +803,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
             uploadedVideoId = uploadResult.video_id;
             if (analysisMethod === 'r3' && !liveViewVideoId) {
               setLiveViewVideoId(uploadedVideoId);
+              setShowLiveView(true);
             }
             processingId = uploadedVideoId;
             apiClient
@@ -1478,7 +1480,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
           )}
         </div>
 
-        {/* Live view button for R³ monitoring */}
+        {/* Live view: auto-opens for R³ so the floorplan path grows as frames arrive */}
         {analysisMethod === 'r3' && isAnalyzing && liveViewVideoId && !showLiveView && (
           <div className="space-y-2">
             <Button
@@ -1487,7 +1489,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               className="w-full border-primary/30 hover:bg-primary/10 gap-2"
             >
               <Eye className="h-4 w-4 text-primary" />
-              <span>Смотреть реконструкцию в реальном времени</span>
+              <span>Показать live-отрисовку траектории</span>
             </Button>
           </div>
         )}
@@ -1496,6 +1498,10 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
         {showLiveView && liveViewVideoId && (
           <RealTimeR3Visualization
             videoId={liveViewVideoId}
+            floorPlan={externalFloorPlan || floorPlan}
+            drawnPlan={drawnPlan}
+            referencePoint={externalReferencePoint || referencePoint}
+            directionPoint={externalDirectionPoint || null}
             onComplete={() => {
               // Keep showing the visualization when complete
             }}
