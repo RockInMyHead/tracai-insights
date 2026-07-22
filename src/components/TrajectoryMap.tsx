@@ -84,6 +84,8 @@ interface TrajectoryMapProps {
   reviewMode?: boolean;
   /** Компактная тулбар — только зум, сброс, поворот, направление. Без калибровки, pathfinding, fullscreen. */
   compactMode?: boolean;
+  /** Ещё проще: только зум и сброс — для live-черновика во время анализа. */
+  minimalChrome?: boolean;
   setDirectionMode?: boolean;
   onSetDirectionModeChange?: (enabled: boolean) => void;
   onDirectionPointSet?: (point: { x: number; y: number }) => void;
@@ -121,7 +123,7 @@ function isR3PlanTrajectory(data: Pick<TrajectoryData, "method" | "coordinateCon
     || data.coordinateConvention === "x_forward_y_left_z_up";
 }
 
-const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, compactMode = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
+const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan, drawnPlan, referencePoint, directionPoint, playbackPointLimit, reviewMode = false, compactMode = false, minimalChrome = false, setDirectionMode, onSetDirectionModeChange, onDirectionPointSet }: TrajectoryMapProps) => {
   const [planScale, setPlanScale] = useState(1);
   const [imageSize, setImageSize] = useState({ width: 800, height: 600 });
 
@@ -786,7 +788,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           onClick={(e) => e.stopPropagation()}
         >
           {/* Zoom */}
-          <div className="flex items-center gap-0.5 px-1.5 border-r border-border/40">
+          <div className={`flex items-center gap-0.5 px-1.5 ${minimalChrome ? "" : "border-r border-border/40"}`}>
             <Button variant="ghost" size="icon" className="h-7 w-7" onClick={(e) => { e.stopPropagation(); zoomOut(); }} title="Уменьшить вид">
               <ZoomOut className="h-3.5 w-3.5" />
             </Button>
@@ -799,6 +801,8 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
             </Button>
           </div>
 
+          {!minimalChrome && (
+            <>
           {/* Масштаб маршрута */}
           <div className="flex items-center gap-1 px-1.5 border-r border-border/40">
             <Button
@@ -809,7 +813,6 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
               title="Уменьшить маршрут"
             >
               <ZoomOut className="h-3 w-3" />
-              <span className="text-[8px] ml-0.5">📏</span>
             </Button>
             <span className="text-[10px] font-mono w-9 text-center select-none">{trajScale.toFixed(1)}×</span>
             <Button
@@ -820,7 +823,6 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
               title="Увеличить маршрут"
             >
               <ZoomIn className="h-3 w-3" />
-              <span className="text-[8px] ml-0.5">📏</span>
             </Button>
             <Button
               variant="ghost"
@@ -861,7 +863,6 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                   title="Отразить траекторию (поменять лево и право)"
                 >
                   <FlipHorizontal2 className="h-3 w-3" />
-                  ↔
                 </Button>
               )}
               <Button
@@ -945,6 +946,8 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
               </svg>
             </div>
           </div>
+            </>
+          )}
         </div>
       )}
 

@@ -1566,6 +1566,7 @@ async def r3_process_video(
     _reset_r3_output_dir(video_output_dir)
 
     try:
+        await _ensure_shared_gpu_for_r3(video_id)
         # Run R³ wrapper via subprocess
         logger.info(f"[{video_id}] Starting R³ inference (frame_stride={frame_stride}, ckpt={ckpt})")
 
@@ -1584,12 +1585,7 @@ async def r3_process_video(
         env = os.environ.copy()
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-        result = subprocess.run(
-            conda_cmd,
-            capture_output=True, text=True,
-            timeout=14400,  # 4 hours max
-            env=env,
-        )
+        result = await _run_r3_inference_subprocess(conda_cmd, env=env)
 
         if result.returncode != 0:
             error_src = (result.stderr or result.stdout or "").strip()
@@ -1636,7 +1632,7 @@ async def r3_process_video(
         elapsed = time.time() - start_ts
         logger.error(f"[{video_id}] R³ failed after {elapsed:.1f}s: {e}")
         return JSONResponse(status_code=500, content={
-            "success": False, "video_id": video_id, "error": str(e)
+            "success": False, "video_id": video_id, "error": _format_r3_failure(e),
         })
     finally:
         if local_video.exists():
@@ -1697,6 +1693,7 @@ async def r3_process_video_raw(
     _reset_r3_output_dir(video_output_dir)
 
     try:
+        await _ensure_shared_gpu_for_r3(video_id)
         logger.info(f"[{video_id}] Starting R³ inference (frame_stride={frame_stride}, ckpt={ckpt})")
 
         conda_cmd = [
@@ -1714,10 +1711,7 @@ async def r3_process_video_raw(
         env = os.environ.copy()
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-        result = subprocess.run(
-            conda_cmd, capture_output=True, text=True,
-            timeout=14400, env=env,
-        )
+        result = await _run_r3_inference_subprocess(conda_cmd, env=env)
 
         if result.returncode != 0:
             error_src = (result.stderr or result.stdout or "").strip()
@@ -1761,7 +1755,7 @@ async def r3_process_video_raw(
         elapsed = time.time() - start_ts
         logger.error(f"[{video_id}] R³ raw failed after {elapsed:.1f}s: {e}")
         return JSONResponse(status_code=500, content={
-            "success": False, "video_id": video_id, "error": str(e)
+            "success": False, "video_id": video_id, "error": _format_r3_failure(e),
         })
     finally:
         _r3_clear_busy(video_id)
@@ -1777,6 +1771,70 @@ async def r3_process_video_raw(
 _r3_active_processes: Dict[str, subprocess.Popen] = {}
 _r3_active_lock = threading.Lock()
 _r3_busy_video_ids: Set[str] = set()
+_R3_MIN_FREE_VRAM_MIB = int(os.getenv("R3_MIN_FREE_VRAM_MIB", "8000"))
+
+
+def _gpu_free_vram_mib() -> int:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        line = (result.stdout or "").strip().splitlines()[0].strip()
+        return int(float(line))
+    except Exception:
+        return -1
+
+
+def _stop_lingbot_batch_jobs() -> None:
+    """Stop LingBot batch_demo jobs that block R³ on the shared RTX 3090."""
+    for pattern in ("demo_render/batch_demo.py", "lingbot-map/demo_render/batch_demo.py"):
+        try:
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            pass
+
+
+async def _ensure_shared_gpu_for_r3(video_id: str, *, min_free_mib: Optional[int] = None) -> None:
+    required = _R3_MIN_FREE_VRAM_MIB if min_free_mib is None else int(min_free_mib)
+    free = _gpu_free_vram_mib()
+    if free >= required:
+        return
+    logger.warning(
+        f"[{video_id}] GPU VRAM low ({free} MiB free, need {required}); stopping LingBot batch jobs"
+    )
+    await asyncio.to_thread(_stop_lingbot_batch_jobs)
+    for _ in range(15):
+        await asyncio.sleep(2.0)
+        free = _gpu_free_vram_mib()
+        if free >= required:
+            logger.info(f"[{video_id}] GPU VRAM recovered to {free} MiB")
+            return
+    raise RuntimeError(
+        f"GPU занят: свободно {max(free, 0)} MiB, нужно ≥{required} MiB. "
+        "LingBot занял видеопамять — дождитесь завершения или перезапустите GPU worker."
+    )
+
+
+def _format_r3_failure(error: Exception) -> str:
+    text = str(error)
+    if "OutOfMemoryError" in text or "CUDA out of memory" in text:
+        free = _gpu_free_vram_mib()
+        return (
+            "Недостаточно VRAM на GPU для R³"
+            f" (свободно ~{max(free, 0)} MiB). "
+            "Скорее всего параллельно работает LingBot — повторите анализ через 1–2 мин."
+        )
+    return text
 
 
 def _r3_try_mark_busy(video_id: str) -> bool:
@@ -1787,9 +1845,135 @@ def _r3_try_mark_busy(video_id: str) -> bool:
         return True
 
 
+def _r3_is_busy(video_id: str) -> bool:
+    with _r3_active_lock:
+        return video_id in _r3_busy_video_ids
+
+
 def _r3_clear_busy(video_id: str) -> None:
     with _r3_active_lock:
         _r3_busy_video_ids.discard(video_id)
+
+
+async def _run_r3_inference_subprocess(
+    conda_cmd: list[str],
+    *,
+    env: Dict[str, str],
+    timeout: int = 14400,
+) -> subprocess.CompletedProcess[str]:
+    """Run R³ wrapper without blocking the FastAPI event loop (live-progress must stay responsive)."""
+    return await asyncio.to_thread(
+        subprocess.run,
+        conda_cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
+
+
+async def _watch_active_r3_camera_stream(
+    request: Request,
+    video_id: str,
+    video_output_dir: Path,
+    start_ts: float,
+):
+    """Tail camera/*.npz from an already-running R³ job (raw or live).
+
+    The production analyze path uses blocking /api/r3-process-video-raw and holds
+    the busy lock. Live UI must follow that job instead of starting a second one.
+    """
+    import numpy as _np
+
+    yield (
+        "event: watching\ndata: "
+        + json.dumps({
+            "mode": "follow_active",
+            "video_id": video_id,
+            "message": "Следим за активным R³ — линия растёт по мере появления кадров",
+        })
+        + "\n\n"
+    )
+    yield (
+        "event: processing_started\ndata: "
+        + json.dumps({"live": True, "follow_active": True, "video_id": video_id})
+        + "\n\n"
+    )
+
+    known_files: set[str] = set()
+    num_processed = 0
+    camera_dir = video_output_dir / "camera"
+
+    while True:
+        if await request.is_disconnected():
+            return
+
+        camera_dir = video_output_dir / "camera"
+        current_files = sorted(camera_dir.glob("*.npz")) if camera_dir.exists() else []
+        for cf in current_files:
+            if cf.name in known_files:
+                continue
+            try:
+                data = _np.load(str(cf))
+                pose = data["pose"].tolist() if "pose" in data else None
+                if pose and len(pose) >= 3 and len(pose[0]) >= 4:
+                    traj_point = [pose[0][3], pose[1][3], pose[2][3]]
+                    num_processed += 1
+                    payload = _sanitize_for_json({
+                        "num_processed": num_processed,
+                        "num_total": "?",
+                        "new_trajectory_points": [traj_point],
+                        "follow_active": True,
+                    })
+                    yield "event: frame_processed\ndata: " + json.dumps(payload) + "\n\n"
+                known_files.add(cf.name)
+            except Exception:
+                # File may still be flushing; retry next loop.
+                pass
+
+        if not _r3_is_busy(video_id):
+            # Emit any files that appeared in the final flush.
+            current_files = sorted(camera_dir.glob("*.npz")) if camera_dir.exists() else []
+            for cf in current_files:
+                if cf.name in known_files:
+                    continue
+                try:
+                    data = _np.load(str(cf))
+                    pose = data["pose"].tolist() if "pose" in data else None
+                    if pose and len(pose) >= 3 and len(pose[0]) >= 4:
+                        traj_point = [pose[0][3], pose[1][3], pose[2][3]]
+                        num_processed += 1
+                        payload = _sanitize_for_json({
+                            "num_processed": num_processed,
+                            "num_total": num_processed,
+                            "new_trajectory_points": [traj_point],
+                            "follow_active": True,
+                        })
+                        yield "event: frame_processed\ndata: " + json.dumps(payload) + "\n\n"
+                    known_files.add(cf.name)
+                except Exception:
+                    pass
+
+            elapsed = time.time() - start_ts
+            complete_payload = {
+                "total_time_s": round(elapsed, 1),
+                "num_frames": num_processed,
+                "follow_active": True,
+                "processing_stats": {
+                    "fps": round(num_processed / max(elapsed, 0.1), 1),
+                    "estimated_distance": 0,
+                    "turns_detected": 0,
+                },
+            }
+            yield "event: complete\ndata: " + json.dumps(_sanitize_for_json(complete_payload)) + "\n\n"
+            while True:
+                if await request.is_disconnected():
+                    return
+                await asyncio.sleep(30)
+                yield ": keepalive\n\n"
+            return
+
+        await asyncio.sleep(1.0)
 
 
 def _reset_r3_output_dir(output_dir: Path) -> None:
@@ -1798,6 +1982,41 @@ def _reset_r3_output_dir(output_dir: Path) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+
+@app.get("/api/r3-live-progress/{video_id}")
+async def r3_live_progress(video_id: str):
+    """Lightweight live progress based on actual camera pose files, not cached trajectory."""
+    base = R3_OUTPUT_DIR / video_id
+    camera_dir = base / "camera"
+    camera_frames = len(list(camera_dir.glob("*.npz"))) if camera_dir.exists() else 0
+    frame_files = len(list((base / "frames").glob("*"))) if (base / "frames").exists() else 0
+    return {
+        "success": True,
+        "video_id": video_id,
+        "camera_frames": camera_frames,
+        "extracted_frames": frame_files,
+        "busy": _r3_is_busy(video_id),
+        "output_exists": base.exists(),
+    }
+
+
+@app.post("/api/r3-reset-output/{video_id}")
+async def r3_reset_output(video_id: str):
+    """Clear camera/pose artifacts so live preview cannot show a previous run."""
+    if _r3_is_busy(video_id):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "video_id": video_id,
+                "error": "R³ processing is already running for this video_id",
+            },
+        )
+    output_dir = R3_OUTPUT_DIR / video_id
+    _reset_r3_output_dir(output_dir)
+    logger.info(f"[{video_id}] R³ output reset for live preview")
+    return {"success": True, "video_id": video_id, "cleared": True}
 
 
 def _r3_run_matches(
@@ -2062,10 +2281,15 @@ async def r3_process_stream(
             # ─── End of replay mode ───
 
             if not _r3_try_mark_busy(video_id):
-                yield "event: error\ndata: " + json.dumps({
-                    "message": "R³ processing is already running for this video_id",
-                    "video_id": video_id,
-                }) + "\n\n"
+                # Main analyze already holds the busy lock (raw endpoint).
+                # Follow that job's growing camera/*.npz instead of 409.
+                logger.info(
+                    f"[{video_id}] R³ already busy — entering follow_active watch mode"
+                )
+                async for chunk in _watch_active_r3_camera_stream(
+                    request, video_id, video_output_dir, start_ts
+                ):
+                    yield chunk
                 return
             marked_busy = True
 

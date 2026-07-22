@@ -126,6 +126,8 @@ def _status_response_payload(status_data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(safe, dict):
         return {"status": "unknown", "progress": 0, "message": "invalid status"}
     now = time.time()
+    # Recompute stage-weighted progress so the UI bar always matches the pipeline.
+    _apply_pipeline_progress(safe, now=now)
     start_raw = safe.get("start_time")
     try:
         start_time = float(start_raw) if start_raw is not None else None
@@ -137,20 +139,27 @@ def _status_response_payload(status_data: Dict[str, Any]) -> Dict[str, Any]:
     progress = int(round(_finite_status_progress(safe.get("progress"))))
     status = str(safe.get("status") or "unknown").lower()
     eta_seconds = None
+    stage = _normalize_pipeline_stage(safe.get("stage"), status, safe.get("message"), progress)
+    stage_fraction = _stage_fraction_from_state(safe, stage, now)
     if (
         elapsed is not None
         and elapsed >= 8.0
         and 3 <= progress < 100
         and status not in {"completed", "error", "failed", "unknown"}
     ):
-        # Extrapolate from observed rate; clamp so the UI never shows absurd ETAs.
-        rate = progress / max(elapsed, 1e-6)
-        remaining = (100.0 - progress) / max(rate, 1e-6)
+        # Prefer remaining work in the current stage span, then remaining stages.
+        span = _PIPELINE_STAGE_SPANS.get(stage) or (float(progress), 100.0)
+        lo, hi = span
+        stage_remaining = max(0.0, (hi - lo) * (1.0 - stage_fraction))
+        after_stage = max(0.0, 100.0 - hi)
+        remaining_pct = stage_remaining + after_stage
+        rate = max(progress / max(elapsed, 1e-6), 1e-6)
+        remaining = remaining_pct / rate
         eta_seconds = float(min(max(remaining, 5.0), 3 * 60 * 60))
-    stage = str(safe.get("stage") or _infer_processing_stage(status, safe.get("message"), progress))
     enriched = dict(safe)
     enriched["progress"] = progress
     enriched["stage"] = stage
+    enriched["stage_fraction"] = round(stage_fraction, 4)
     if start_time is not None:
         enriched["start_time"] = start_time
     if elapsed is not None:
@@ -159,7 +168,88 @@ def _status_response_payload(status_data: Dict[str, Any]) -> Dict[str, Any]:
         enriched["eta_seconds"] = round(eta_seconds, 1)
     else:
         enriched.pop("eta_seconds", None)
+
+    timings_raw = safe.get("stage_timings") if isinstance(safe.get("stage_timings"), dict) else {}
+    timings: Dict[str, float] = {}
+    for key, value in timings_raw.items():
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if _math.isfinite(seconds) and seconds >= 0:
+            timings[str(key)] = round(seconds, 1)
+    stage_current_seconds = None
+    stage_started_raw = safe.get("stage_started_at")
+    try:
+        stage_started = float(stage_started_raw) if stage_started_raw is not None else None
+    except (TypeError, ValueError):
+        stage_started = None
+    if (
+        stage_started is not None
+        and _math.isfinite(stage_started)
+        and stage_started > 0
+        and stage not in {"done", "error", "failed"}
+    ):
+        stage_current_seconds = round(max(0.0, now - stage_started), 1)
+    enriched["stage_timings"] = timings
+    if stage_current_seconds is not None:
+        enriched["stage_current_seconds"] = stage_current_seconds
+    else:
+        enriched.pop("stage_current_seconds", None)
     return enriched
+
+
+def _set_processing_stage(video_id: str, stage: str, **fields: Any) -> None:
+    """Update processing status and accumulate real wall-time per stage."""
+    now = time.time()
+    state = processing_status.setdefault(video_id, {})
+    if not isinstance(state, dict):
+        state = {}
+        processing_status[video_id] = state
+
+    timings = dict(state.get("stage_timings") or {})
+    previous = _normalize_pipeline_stage(
+        state.get("stage"),
+        state.get("status"),
+        state.get("message"),
+        _finite_status_progress(state.get("progress")),
+    )
+    started_raw = state.get("stage_started_at")
+    try:
+        started = float(started_raw) if started_raw is not None else None
+    except (TypeError, ValueError):
+        started = None
+
+    next_stage = _normalize_pipeline_stage(
+        stage,
+        fields.get("status", state.get("status")),
+        fields.get("message", state.get("message")),
+        _finite_status_progress(fields.get("progress", state.get("progress"))),
+    )
+
+    if previous and started and previous != next_stage:
+        delta = max(0.0, now - started)
+        timings[previous] = round(float(timings.get(previous, 0.0)) + delta, 1)
+
+    if previous != next_stage:
+        state["stage_started_at"] = now
+        state["stage_fraction"] = 0.0
+        # First stage also seeds overall start_time if missing.
+        if not state.get("start_time"):
+            state["start_time"] = now
+
+    state["stage"] = next_stage
+    state["stage_timings"] = timings
+    for key, value in fields.items():
+        if key == "stage":
+            continue
+        state[key] = value
+    # If caller set a terminal/high progress explicitly, keep fraction in sync.
+    if next_stage == "done":
+        state["stage_fraction"] = 1.0
+    elif "stage_fraction" not in fields and previous != next_stage:
+        state["stage_fraction"] = 0.0
+    _apply_pipeline_progress(state, now=now)
 
 
 def _finite_status_progress(value: Any) -> float:
@@ -179,68 +269,551 @@ def _infer_processing_stage(status: str, message: Any, progress: float) -> str:
         return "done"
     if status in {"error", "failed"}:
         return "error"
-    if "загруз" in text or "upload" in text or status in {"uploading_to_gpu"}:
+    if "загруз" in text or "upload" in text or status in {"uploading_to_gpu", "uploading"}:
         return "upload"
     if "lingbot" in text or status in {"lingbot_fusion", "lingbot_queued", "lingbot_running"}:
         return "lingbot"
-    if "план" in text or "floorplan" in text or "map" in text:
+    if "траект" in text or "сборк" in text or status in {"trajectory"}:
+        return "trajectory"
+    if "план" in text or "floorplan" in text or "map" in text or status in {"map"}:
         return "map"
-    if "gpu" in text or "r³" in text or "r3" in text or status in {"gpu_processing", "processing"}:
+    if "gpu" in text or "r³" in text or "r3" in text or status in {"gpu_processing"}:
         return "gpu"
-    if status in {"queued"}:
-        return "queued"
-    return "processing"
+    if status in {"queued", "selected"}:
+        return "upload"
+    if status in {"processing", "running"}:
+        return "gpu"
+    return "gpu"
+
+
+# Canonical production pipeline spans (percent). Progress is derived from
+# stage + in-stage fraction — not from a free-floating soft curve.
+_PIPELINE_STAGE_SPANS: Dict[str, tuple[float, float]] = {
+    "upload": (0.0, 6.0),
+    "gpu": (6.0, 70.0),
+    "trajectory": (70.0, 78.0),
+    "lingbot": (78.0, 92.0),
+    "map": (92.0, 99.0),
+    "done": (100.0, 100.0),
+}
+_PIPELINE_STAGE_TYPICAL_SECONDS: Dict[str, float] = {
+    "upload": 20.0,
+    "gpu": 720.0,
+    "trajectory": 25.0,
+    "lingbot": 180.0,
+    "map": 40.0,
+    "done": 1.0,
+}
+
+
+def _normalize_pipeline_stage(stage: Any, status: Any = None, message: Any = None, progress: float = 0.0) -> str:
+    raw = str(stage or "").lower().strip()
+    aliases = {
+        "queued": "upload",
+        "selected": "upload",
+        "uploading": "upload",
+        "uploading_to_gpu": "upload",
+        "gpu_processing": "gpu",
+        "processing": "gpu",
+        "running": "gpu",
+        "lingbot_fusion": "lingbot",
+        "lingbot_queued": "lingbot",
+        "lingbot_running": "lingbot",
+        "completed": "done",
+        "success": "done",
+        "failed": "error",
+    }
+    if raw in _PIPELINE_STAGE_SPANS or raw == "error":
+        return raw
+    if raw in aliases:
+        return aliases[raw]
+    return _infer_processing_stage(str(status or ""), message, progress)
+
+
+def _pipeline_progress(stage: str, stage_fraction: float) -> int:
+    if stage == "error":
+        return 0
+    span = _PIPELINE_STAGE_SPANS.get(stage)
+    if not span:
+        span = (0.0, 100.0)
+    lo, hi = span
+    frac = max(0.0, min(1.0, float(stage_fraction)))
+    return int(round(lo + (hi - lo) * frac))
+
+
+def _stage_fraction_from_state(state: Dict[str, Any], stage: str, now: float) -> float:
+    """0..1 progress inside the active stage from frames and/or wall time."""
+    if stage == "done":
+        return 1.0
+    if stage == "error":
+        return 0.0
+
+    frames_done = state.get("gpu_frames_done")
+    frames_total = state.get("gpu_frames_total")
+    try:
+        done = float(frames_done) if frames_done is not None else None
+        total = float(frames_total) if frames_total is not None else None
+    except (TypeError, ValueError):
+        done = total = None
+    if (
+        stage == "gpu"
+        and done is not None
+        and total is not None
+        and total > 0
+        and _math.isfinite(done)
+        and _math.isfinite(total)
+        and done > 0
+    ):
+        return max(0.0, min(0.97, done / total))
+
+    if stage == "gpu":
+        extracted_raw = state.get("gpu_frames_extracted")
+        try:
+            extracted = float(extracted_raw) if extracted_raw is not None else 0.0
+        except (TypeError, ValueError):
+            extracted = 0.0
+        started_raw = state.get("stage_started_at")
+        try:
+            gpu_started = float(started_raw) if started_raw is not None else None
+        except (TypeError, ValueError):
+            gpu_started = None
+        elapsed_gpu = max(0.0, now - gpu_started) if gpu_started and gpu_started > 0 else 0.0
+        prep_frac = 0.0
+        if extracted > 0 and total and total > 0:
+            prep_frac = min(0.08, (extracted / total) * 0.08)
+        # R³ loads the model and computes the first segment before camera/*.npz appear.
+        warmup_frac = min(0.32, (1.0 - _math.exp(-elapsed_gpu / 240.0)) * 0.32)
+        if extracted > 0 or elapsed_gpu > 0:
+            return max(0.02, min(0.40, prep_frac + warmup_frac))
+
+    explicit = state.get("stage_fraction")
+    try:
+        if explicit is not None:
+            value = float(explicit)
+            if _math.isfinite(value):
+                return max(0.0, min(1.0, value))
+    except (TypeError, ValueError):
+        pass
+
+    started_raw = state.get("stage_started_at")
+    try:
+        started = float(started_raw) if started_raw is not None else None
+    except (TypeError, ValueError):
+        started = None
+    if started is None or not _math.isfinite(started) or started <= 0:
+        return 0.0
+    elapsed = max(0.0, now - started)
+    typical = float(_PIPELINE_STAGE_TYPICAL_SECONDS.get(stage, 60.0))
+    # Asymptotic so a long stage never falsely hits 100% before completion.
+    return max(0.0, min(0.97, 1.0 - _math.exp(-elapsed / max(typical, 1.0))))
+
+
+def _apply_pipeline_progress(state: Dict[str, Any], *, now: Optional[float] = None) -> Dict[str, Any]:
+    """Write canonical stage/progress fields used by the live dashboard."""
+    if not isinstance(state, dict):
+        return state
+    clock = time.time() if now is None else now
+    stage = _normalize_pipeline_stage(
+        state.get("stage"),
+        state.get("status"),
+        state.get("message"),
+        _finite_status_progress(state.get("progress")),
+    )
+    fraction = _stage_fraction_from_state(state, stage, clock)
+    progress = _pipeline_progress(stage, fraction)
+    # Never move progress backwards within the same run unless error/reset.
+    try:
+        previous = int(_finite_status_progress(state.get("progress")))
+    except Exception:
+        previous = 0
+    if stage != "error" and progress < previous and previous < 100:
+        # Allow tiny stalls, but keep monotonic overall bar.
+        progress = previous
+    state["stage"] = stage
+    state["stage_fraction"] = round(fraction, 4)
+    state["progress"] = progress
+    return state
+
+
+async def _fetch_gpu_live_progress(video_id: str) -> Dict[str, Any]:
+    """Best-effort camera-frame progress from the GPU worker."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{GPU_WORKER_URL}/api/r3-live-progress/{video_id}",
+                timeout=aiohttp.ClientTimeout(total=2.5),
+            ) as resp:
+                if resp.status != 200:
+                    return {}
+                payload = await resp.json(content_type=None)
+                return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gpu_status_message(
+    *,
+    label: str,
+    elapsed: float,
+    frames_done: int,
+    extracted_frames: int,
+    target_total: int,
+) -> str:
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+    if frames_done > 0:
+        return (
+            f"{label} · {mins:02d}:{secs:02d} · кадры {frames_done}/{target_total}"
+            " — черновик на плане растёт"
+        )
+    if extracted_frames > 0:
+        return (
+            f"{label} · {mins:02d}:{secs:02d} · подготовлено {extracted_frames}/{target_total}"
+            " кадров · R³ считает первые позы (3–8 мин)"
+        )
+    return f"{label} · {mins:02d}:{secs:02d} · извлечение кадров из видео"
+
+
+def _build_gpu_processing_status(
+    video_id: str,
+    live_progress: Dict[str, Any],
+    *,
+    existing: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    prev = existing if isinstance(existing, dict) else {}
+    camera_frames = int(live_progress.get("camera_frames") or 0)
+    extracted_frames = int(live_progress.get("extracted_frames") or 0)
+    target_total = max(int(prev.get("gpu_frames_total") or 2000), 1)
+    start_time = float(prev.get("start_time") or (time.time() - 120.0))
+    stage_started = float(prev.get("stage_started_at") or start_time)
+    elapsed = max(0.0, time.time() - start_time)
+    frames_done = camera_frames if camera_frames > 0 else 0
+    state: Dict[str, Any] = {
+        "id": video_id,
+        "status": "gpu_processing",
+        "stage": "gpu",
+        "message": _gpu_status_message(
+            label="R³ реконструкция на GPU",
+            elapsed=elapsed,
+            frames_done=frames_done,
+            extracted_frames=extracted_frames,
+            target_total=target_total,
+        ),
+        "start_time": start_time,
+        "stage_started_at": stage_started,
+        "gpu_frames_done": frames_done,
+        "gpu_frames_extracted": extracted_frames,
+        "gpu_frames_total": target_total,
+        "suppress_disk_completion": True,
+        "live_artifacts_ready": True,
+    }
+    if prev.get("analysis_run_id"):
+        state["analysis_run_id"] = prev.get("analysis_run_id")
+    _apply_pipeline_progress(state)
+    return state
+
+
+_orphan_r3_recovery_lock: Set[str] = set()
+
+
+async def _recover_orphaned_r3_completion(video_id: str) -> Optional[Dict[str, Any]]:
+    """GPU finished R³ but VPS lost the in-flight HTTP result (restart/crash)."""
+    if video_id in _orphan_r3_recovery_lock:
+        return None
+    if _analysis_file_path(video_id).is_file():
+        return None
+
+    live = await _fetch_gpu_live_progress(video_id)
+    if bool(live.get("busy")):
+        existing = processing_status.get(video_id) if isinstance(processing_status.get(video_id), dict) else None
+        rebuilt = _build_gpu_processing_status(video_id, live, existing=existing)
+        processing_status[video_id] = rebuilt
+        return _status_response_payload(rebuilt)
+
+    camera_frames = int(live.get("camera_frames") or 0)
+    if camera_frames < 100:
+        return None
+
+    _orphan_r3_recovery_lock.add(video_id)
+    try:
+        logger.warning(
+            f"[{video_id}] Recovering orphaned R³ GPU output ({camera_frames} camera frames)"
+        )
+        map_context = _load_task_map_context(video_id)
+        scale_factor = 12.306
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{GPU_WORKER_URL}/api/r3-trajectory/{video_id}",
+                params={"trajectory_source": "scale_aware_candidate"},
+                timeout=aiohttp.ClientTimeout(total=180),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                selected = await resp.json(content_type=None)
+        if not isinstance(selected, dict) or not selected.get("success"):
+            return None
+        plan = selected.get("plan_trajectory") or selected.get("trajectory") or []
+        if not isinstance(plan, list) or len(plan) < 2:
+            return None
+
+        estimated_distance = 0.0
+        for idx in range(1, len(plan)):
+            p0, p1 = plan[idx - 1], plan[idx]
+            if not isinstance(p0, list) or not isinstance(p1, list) or len(p0) < 2 or len(p1) < 2:
+                continue
+            dx = float(p1[0]) - float(p0[0])
+            dy = float(p1[1]) - float(p0[1])
+            dz = float(p1[2]) - float(p0[2]) if len(p0) > 2 and len(p1) > 2 else 0.0
+            estimated_distance += (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
+
+        trajectory_data: Dict[str, Any] = {
+            "method": "r3_reconstruction_scale_aware",
+            "trajectory": plan,
+            "plan_trajectory": plan,
+            "raw_trajectory_3d": selected.get("raw_trajectory_3d") or [],
+            "turn_points": selected.get("turn_points") or [],
+            "frame_count": len(plan),
+            "trajectory_points": len(plan),
+            "r3_source_frame_indices": selected.get("source_frame_indices") or [],
+            "r3_source_timestamps_seconds": selected.get("source_timestamps_seconds") or [],
+            "r3_pose_graph": selected.get("pose_graph"),
+            "r3_pose_graph_candidate": selected.get("pose_graph_candidate"),
+            "r3_scale_aware_candidate": selected.get("scale_aware_candidate"),
+            "processing_stats": {
+                "estimated_distance": round(estimated_distance, 2),
+                "scale_factor": 1.0,
+                "input_scale_factor": scale_factor,
+                "turns_detected": len(selected.get("turn_points") or []),
+                "r3_trajectory_quality": selected.get("trajectory_quality") or {},
+                "recovered_from_gpu_orphan": True,
+            },
+            "total_processing_time": 0.0,
+            "video_info": {
+                "width": 0,
+                "height": 0,
+                "fps": 0,
+                "frame_count": len(plan),
+                "duration": 0,
+            },
+        }
+        trajectory_data = apply_floorplan_constraints(trajectory_data, map_context)
+
+        video_filename = None
+        for candidate in VIDEOS_DIR.glob(f"{video_id}_*"):
+            if candidate.is_file():
+                video_filename = candidate.name
+                break
+        analysis_data = {
+            "video_id": video_id,
+            "video_filename": video_filename or f"{video_id}_video",
+            "original_filename": video_filename.split("_", 1)[-1] if video_filename and "_" in video_filename else "video",
+            "scale_factor": scale_factor,
+            "stabilized": False,
+            "analysis_method": "r3",
+            "analysis_result": trajectory_data,
+        }
+        analysis_file = _analysis_file_path(video_id)
+        with open(analysis_file, "w", encoding="utf-8") as handle:
+            json.dump(analysis_data, handle, indent=2, ensure_ascii=False, default=_to_json_serializable)
+
+        run_id = str(uuid.uuid4())
+        processing_status[video_id] = {
+            "status": "completed",
+            "progress": 100,
+            "message": "R³ восстановлен с GPU после перезапуска сервера",
+            "start_time": time.time(),
+            "suppress_disk_completion": False,
+            "analysis_run_id": run_id,
+            "result": trajectory_data,
+            "stage": "done",
+        }
+        _update_task_status(video_id, "completed", 100)
+        payload = {
+            "id": video_id,
+            "status": "completed",
+            "progress": 100,
+            "message": "R³ восстановлен с GPU после перезапуска сервера",
+            "result": trajectory_data,
+            "analysis_run_id": run_id,
+        }
+        return _status_response_payload(payload)
+    except Exception as exc:
+        logger.error(f"[{video_id}] Orphaned R³ recovery failed: {exc}")
+        return None
+    finally:
+        _orphan_r3_recovery_lock.discard(video_id)
+
+
+def _accept_gpu_frame_count(
+    state: Dict[str, Any],
+    *,
+    camera_frames: int,
+    trajectory_frames: Optional[int],
+    now: Optional[float] = None,
+) -> int:
+    """Only trust live camera pose files; never stale trajectory length."""
+    _ = trajectory_frames
+    _ = now
+    try:
+        camera_count = max(0, int(camera_frames))
+    except (TypeError, ValueError):
+        camera_count = 0
+    previous = int(state.get("gpu_frames_done") or 0)
+    if camera_count <= 0:
+        return 0
+    return max(previous, camera_count)
 
 
 async def _gpu_progress_heartbeat(
     video_id: str,
     *,
-    base_progress: int = 15,
-    ceiling: int = 88,
-    time_constant_seconds: float = 780.0,
+    max_frames: int = 2000,
     label: str = "R³ реконструкция на GPU",
+    analysis_run_id: Optional[str] = None,
 ) -> None:
-    """Soft-live progress while the blocking GPU HTTP call is in flight."""
+    """Update real stage-weighted progress while the GPU HTTP call is in flight."""
     try:
         while True:
             await asyncio.sleep(2.0)
             state = processing_status.get(video_id)
             if not isinstance(state, dict):
                 return
+            if analysis_run_id and state.get("analysis_run_id") not in {None, analysis_run_id}:
+                return
             status = str(state.get("status") or "")
-            if status in {"completed", "error", "failed"}:
+            stage = _normalize_pipeline_stage(state.get("stage"), status, state.get("message"), 0)
+            # Never overwrite LingBot / map / done with a stale GPU heartbeat.
+            if status not in {"gpu_processing", "uploading_to_gpu"}:
                 return
-            current = int(_finite_status_progress(state.get("progress")))
-            if current >= 90:
+            if stage not in {"gpu", "upload"}:
                 return
+
+            # Best-effort live frame count from GPU camera poses (not cached trajectory).
+            live_progress = await _fetch_gpu_live_progress(video_id)
+            camera_frames = int(live_progress.get("camera_frames") or 0)
+            extracted_frames = int(live_progress.get("extracted_frames") or 0)
+            frames_done = _accept_gpu_frame_count(
+                state,
+                camera_frames=camera_frames,
+                trajectory_frames=None,
+            )
+
+            target_total = max(int(state.get("gpu_frames_total") or max_frames or 2000), 1)
             start = float(state.get("start_time") or time.time())
             elapsed = max(0.0, time.time() - start)
-            soft = int(
-                base_progress
-                + (ceiling - base_progress)
-                * (1.0 - _math.exp(-elapsed / max(time_constant_seconds, 1.0)))
-            )
-            soft = max(base_progress, min(ceiling, soft))
             mins = int(elapsed // 60)
             secs = int(elapsed % 60)
-            update = {
-                "elapsed_seconds": round(elapsed, 1),
+            if frames_done:
+                message = (
+                    f"{label} · {mins:02d}:{secs:02d} · кадры {frames_done}/{target_total}"
+                    " — черновик на плане растёт"
+                )
+            elif extracted_frames > 0:
+                message = (
+                    f"{label} · {mins:02d}:{secs:02d} · подготовлено {extracted_frames}/{target_total}"
+                    " кадров · R³ считает первые позы (3–8 мин)"
+                )
+            else:
+                message = (
+                    f"{label} · {mins:02d}:{secs:02d}"
+                    " — извлечение кадров из видео"
+                )
+
+            state.update({
+                "status": "gpu_processing",
                 "stage": "gpu",
-                "message": f"{label} · {mins:02d}:{secs:02d}",
-            }
-            if soft > current:
-                update["progress"] = soft
-            processing_status[video_id].update(update)
+                "message": message,
+                "elapsed_seconds": round(elapsed, 1),
+                "gpu_frames_total": target_total,
+                "gpu_frames_extracted": extracted_frames,
+            })
+            if frames_done is not None:
+                state["gpu_frames_done"] = frames_done
+            _apply_pipeline_progress(state)
             # Persist only occasionally to avoid SQLite churn every 2s.
             if int(elapsed) % 10 < 2:
-                _update_task_status(video_id, "processing", int(update.get("progress", current)))
+                _update_task_status(video_id, "processing", int(state.get("progress") or 0))
     except asyncio.CancelledError:
         return
 
 
+def _is_analysis_run_current(video_id: str, analysis_run_id: Optional[str]) -> bool:
+    if not analysis_run_id:
+        return True
+    state = processing_status.get(video_id)
+    if not isinstance(state, dict):
+        return False
+    current = state.get("analysis_run_id")
+    return current in {None, analysis_run_id}
+
+
+def _analysis_file_path(video_id: str) -> Path:
+    return OUTPUT_DIR / f"{video_id}_analysis.json"
+
+
+def _invalidate_saved_analysis(video_id: str) -> None:
+    """Move prior on-disk analysis aside so /api/status cannot resurrect it mid-reprocess."""
+    analysis_file = _analysis_file_path(video_id)
+    if not analysis_file.is_file():
+        return
+    stale = OUTPUT_DIR / f"{video_id}_analysis.stale.{int(time.time())}.json"
+    try:
+        analysis_file.replace(stale)
+        logger.info(f"[{video_id}] Invalidated saved analysis → {stale.name}")
+    except OSError as exc:
+        logger.warning(f"[{video_id}] Could not rename saved analysis ({exc}); trying delete")
+        try:
+            analysis_file.unlink()
+        except OSError as unlink_exc:
+            logger.warning(f"[{video_id}] Could not delete saved analysis: {unlink_exc}")
+
+
+def _begin_analysis_run(video_id: str, *, message: str = "Поставлено в очередь на обработку") -> str:
+    """Mark a fresh analyze run; blocks disk/manual hydration until this run finishes successfully."""
+    run_id = str(uuid.uuid4())
+    now = time.time()
+    _invalidate_saved_analysis(video_id)
+    processing_status[video_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": message,
+        "start_time": now,
+        "stage": "queued",
+        "stage_started_at": now,
+        "stage_timings": {},
+        "analysis_run_id": run_id,
+        "suppress_disk_completion": True,
+        "live_preview_epoch": now,
+        "gpu_frames_done": 0,
+        "gpu_frames_total": 2000,
+    }
+    try:
+        _update_task_status(video_id, "queued", 0)
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to persist queued status for new run: {exc}")
+    return run_id
+
+
+_LIVE_BUSY_STATES = {
+    "queued",
+    "processing",
+    "uploading",
+    "uploading_to_gpu",
+    "gpu_processing",
+    "running",
+    "trajectory",
+    "map",
+    "lingbot_queued",
+    "lingbot_running",
+    "lingbot_fusion",
+    "reprocessing",
+    "selected",
+}
+
+
 def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
     """If analysis is already on disk / DB-completed, expose it even after restart."""
-    analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
+    analysis_file = _analysis_file_path(video_id)
     db_completed = False
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -313,6 +886,7 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
             "progress": 100,
             "message": "Анализ завершён",
             "result": result,
+            "analysis_run_id": payload.get("analysis_run_id"),
         }
     except Exception as exc:
         logger.warning("[%s] Could not load completed analysis for status: %s", video_id, exc)
@@ -2043,46 +2617,68 @@ async def get_video_status(video_id: str):
     """
     Get the current status and progress of video analysis
     """
-    manual_store = _load_manual_trajectories()
-    manual_item = manual_store.get(video_id)
-    if manual_item:
-        manual_result = _make_manual_result(
-            manual_item.get("trajectory") or [],
-            manual_item.get("turn_points") or [],
-        )
-        return JSONResponse(_status_response_payload({
-            "status": "completed",
-            "progress": 100,
-            "message": "Ручная траектория готова",
-            "result": manual_result,
-            "manual_updated_at": manual_item.get("updated_at"),
-        }))
-
     live = processing_status.get(video_id)
     live_state = str((live or {}).get("status") or "").lower()
-    live_busy = live_state in {
-        "queued",
-        "processing",
-        "uploading_to_gpu",
-        "gpu_processing",
-        "running",
-        "lingbot_queued",
-        "lingbot_running",
-    }
+    suppress_disk = bool((live or {}).get("suppress_disk_completion"))
+    live_busy = live_state in _LIVE_BUSY_STATES or (
+        suppress_disk and live_state not in {"completed", "done", "success"}
+    )
+
+    # Manual override must not win over an active / failed reprocess of the same video.
+    if not live_busy and not suppress_disk:
+        manual_store = _load_manual_trajectories()
+        manual_item = manual_store.get(video_id)
+        if manual_item:
+            manual_result = _make_manual_result(
+                manual_item.get("trajectory") or [],
+                manual_item.get("turn_points") or [],
+            )
+            return JSONResponse(_status_response_payload({
+                "status": "completed",
+                "progress": 100,
+                "message": "Ручная траектория готова",
+                "result": manual_result,
+                "manual_updated_at": manual_item.get("updated_at"),
+            }))
+
+    # Failed runs must stay failed — never resurrect the previous *_analysis.json.
+    if live_state in {"error", "failed"} and video_id in processing_status:
+        if "result" in processing_status[video_id]:
+            processing_status[video_id].pop("result", None)
+        merged = await _merge_lingbot_status(video_id, processing_status[video_id])
+        return JSONResponse(_status_response_payload(merged))
+
     # A stale in-memory payload (often with a non-serializable prior result)
     # must not block a finished analysis after restart / re-open.
-    if not live_busy:
+    # But never hydrate disk while a new run is in flight or after it failed
+    # without writing a fresh analysis file.
+    if not live_busy and not suppress_disk:
+        gpu_hint = await _fetch_gpu_live_progress(video_id)
+        if bool(gpu_hint.get("busy")):
+            existing = live if isinstance(live, dict) else None
+            rebuilt = _build_gpu_processing_status(video_id, gpu_hint, existing=existing)
+            processing_status[video_id] = rebuilt
+            return JSONResponse(_status_response_payload(rebuilt))
         completed = _load_completed_analysis_status(video_id)
         if completed is not None:
+            run_id = (live or {}).get("analysis_run_id") or completed.get("analysis_run_id")
             processing_status[video_id] = {
                 "status": "completed",
                 "progress": 100,
                 "message": completed.get("message") or "Анализ завершён",
                 "start_time": (live or {}).get("start_time") or time.time(),
+                "suppress_disk_completion": False,
+                "analysis_run_id": run_id,
             }
-            return JSONResponse(_status_response_payload(completed))
+            payload = {**completed, **processing_status[video_id]}
+            if completed.get("result") is not None:
+                payload["result"] = completed.get("result")
+            return JSONResponse(_status_response_payload(payload))
 
     if video_id not in processing_status:
+        recovered = await _recover_orphaned_r3_completion(video_id)
+        if recovered is not None:
+            return JSONResponse(recovered)
         lingbot_session_id = _load_lingbot_session_id(video_id)
         if lingbot_session_id:
             processing_status[video_id] = {
@@ -2652,7 +3248,8 @@ async def process_video_background(
             "status": "completed",
             "progress": 100,
             "message": "Обработка завершена успешно",
-            "result": result
+            "result": result,
+            "suppress_disk_completion": False,
         })
         _update_task_status(video_id, "completed", 100)
         logger.info(f"[{video_id}] Analysis saved and status set to completed")
@@ -2665,13 +3262,37 @@ async def process_video_background(
             processing_status[video_id].update({
                 "status": "error",
                 "progress": 0,
-                "message": f"Ошибка: {error_msg}"
+                "message": f"Ошибка: {error_msg}",
+                "suppress_disk_completion": True,
             })
+            processing_status[video_id].pop("result", None)
         await send_error_to_telegram(error_msg, f"Фон. обработка: {original_filename}")
 
 # ──────────────────────────────────────────────
 # R³ background processor
 # ──────────────────────────────────────────────
+
+async def _clear_r3_live_artifacts(video_id: str) -> bool:
+    """Delete previous R³ camera poses on the GPU so live UI cannot show a stale run."""
+    gpu_url = f"{GPU_WORKER_URL}/api/r3-reset-output/{video_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                gpu_url,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(f"[{video_id}] Cleared stale R³ live artifacts on GPU")
+                    return True
+                text = await resp.text()
+                logger.warning(
+                    f"[{video_id}] R³ reset-output returned HTTP {resp.status}: {text[:200]}"
+                )
+                return False
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to clear stale R³ live artifacts: {exc}")
+        return False
+
 
 async def process_video_r3_background(
     video_id: str,
@@ -2689,22 +3310,46 @@ async def process_video_r3_background(
 
     Если video_path=None — видео уже на GPU Worker (загружено через upload-video-stream).
     """
+    if video_id not in processing_status:
+        _begin_analysis_run(video_id, message="Подготовка к R³ анализу")
+    else:
+        processing_status[video_id].setdefault("suppress_disk_completion", True)
+        processing_status[video_id].setdefault(
+            "analysis_run_id",
+            str(uuid.uuid4()),
+        )
+    run_id = str(processing_status[video_id].get("analysis_run_id") or "")
     _update_task_status(video_id, "processing", 10)
     try:
-        if video_id not in processing_status:
-            processing_status[video_id] = {
-                "status": "queued", "progress": 0, "message": "Подготовка к R³ анализу",
-                "start_time": time.time(),
-                "stage": "queued",
-            }
+        # Suppress live preview until old camera/*.npz are deleted. Otherwise the UI
+        # instantly redraws the previous completed run (e.g. exactly 1999 points).
+        if not _is_analysis_run_current(video_id, run_id):
+            logger.warning(f"[{video_id}] Skipping stale R³ task run_id={run_id}")
+            return
+        processing_status[video_id]["live_artifacts_ready"] = False
+        processing_status[video_id]["live_preview_epoch"] = time.time()
+        processing_status[video_id]["gpu_frames_total"] = max(int(max_frames or 2000), 1)
+        processing_status[video_id]["gpu_frames_done"] = 0
+        cleared = await _clear_r3_live_artifacts(video_id)
+        if not _is_analysis_run_current(video_id, run_id):
+            logger.warning(f"[{video_id}] Aborting stale R³ task after clear run_id={run_id}")
+            return
+        # Arm after the clear attempt. If the GPU worker is not yet updated with
+        # /api/r3-reset-output, the frontend still rejects large stale dumps.
+        processing_status[video_id]["live_artifacts_ready"] = True
+        if not cleared:
+            logger.warning(
+                f"[{video_id}] Stale R³ clear skipped/failed — relying on raw reset + UI guard"
+            )
 
-        processing_status[video_id].update({
-            "status": "uploading_to_gpu",
-            "progress": 5,
-            "stage": "upload",
-            "message": "Отправка видео на GPU-сервер для R³ реконструкции...",
-            "start_time": processing_status[video_id].get("start_time") or time.time(),
-        })
+        _set_processing_stage(
+            video_id,
+            "upload",
+            status="uploading_to_gpu",
+            progress=5,
+            message="Отправка видео на GPU-сервер для R³ реконструкции...",
+            start_time=processing_status[video_id].get("start_time") or time.time(),
+        )
         # Drop any previous analysis payload so /api/status stays JSON-safe
         # while this long GPU upload/inference is in flight.
         processing_status[video_id].pop("result", None)
@@ -2720,19 +3365,20 @@ async def process_video_r3_background(
                 'max_frames': str(max_frames),
             }
 
-            processing_status[video_id].update({
-                "status": "gpu_processing",
-                "progress": 15,
-                "message": "R³ реконструкция на GPU...",
-                "stage": "gpu",
-                "start_time": processing_status[video_id].get("start_time") or time.time(),
-            })
+            _set_processing_stage(
+                video_id,
+                "gpu",
+                status="gpu_processing",
+                progress=15,
+                message="R³ реконструкция на GPU...",
+                start_time=processing_status[video_id].get("start_time") or time.time(),
+            )
             heartbeat = asyncio.create_task(
                 _gpu_progress_heartbeat(
                     video_id,
-                    base_progress=15,
-                    ceiling=88,
+                    max_frames=max_frames,
                     label="R³ реконструкция на GPU",
+                    analysis_run_id=run_id or None,
                 )
             )
 
@@ -2770,15 +3416,22 @@ async def process_video_r3_background(
                 except asyncio.CancelledError:
                     pass
 
+        if not _is_analysis_run_current(video_id, run_id):
+            logger.warning(
+                f"[{video_id}] Dropping R³ GPU result for superseded run_id={run_id}"
+            )
+            return
+
         if not gpu_result.get("success"):
             raise Exception(gpu_result.get("error", "GPU Worker R³ returned unsuccessful status"))
 
-        processing_status[video_id].update({
-            "status": "processing",
-            "progress": 90,
-            "stage": "trajectory",
-            "message": "Сборка production-траектории R³...",
-        })
+        _set_processing_stage(
+            video_id,
+            "trajectory",
+            status="processing",
+            progress=90,
+            message="Сборка production-траектории R³...",
+        )
         _update_task_status(video_id, "processing", 90)
 
         # Конвертируем R³ camera poses в формат траектории
@@ -2813,12 +3466,13 @@ async def process_video_r3_background(
         # production falls back to the already selected R3 trajectory.
         if LINGBOT_FUSION_ENABLED and video_path and video_path.exists():
             try:
-                processing_status[video_id].update({
-                    "status": "lingbot_fusion",
-                    "progress": 92,
-                    "stage": "lingbot",
-                    "message": "LingBot-Map проверяет геометрию R³...",
-                })
+                _set_processing_stage(
+                    video_id,
+                    "lingbot",
+                    status="lingbot_fusion",
+                    progress=92,
+                    message="LingBot-Map проверяет геометрию R³...",
+                )
                 _update_task_status(video_id, "processing", 92)
                 submission = await _submit_lingbot_session(
                     video_path,
@@ -2873,12 +3527,13 @@ async def process_video_r3_background(
             }
             trajectory_data["processing_stats"] = stats
 
-        processing_status[video_id].update({
-            "status": "processing",
-            "progress": 96,
-            "stage": "map",
-            "message": "Сопоставление маршрута с планом Kerama...",
-        })
+        _set_processing_stage(
+            video_id,
+            "map",
+            status="processing",
+            progress=96,
+            message="Сопоставление маршрута с планом Kerama...",
+        )
         _update_task_status(video_id, "processing", 96)
         trajectory_data = apply_floorplan_constraints(trajectory_data, map_context)
 
@@ -2891,6 +3546,7 @@ async def process_video_r3_background(
             "scale_factor": scale_factor,
             "stabilized": False,
             "analysis_method": "r3",
+            "analysis_run_id": run_id,
             "analysis_result": trajectory_data,
         }
 
@@ -2898,27 +3554,39 @@ async def process_video_r3_background(
         with open(analysis_file, 'w', encoding='utf-8') as f:
             json.dump(analysis_data, f, indent=2, ensure_ascii=False, default=_to_json_serializable)
 
-        processing_status[video_id].update({
-            "status": "completed",
-            "progress": 100,
-            "stage": "done",
-            "message": "R³ + LingBot + план: обработка завершена",
-            "result": trajectory_data,
-            "eta_seconds": 0,
-        })
+        _set_processing_stage(
+            video_id,
+            "done",
+            status="completed",
+            progress=100,
+            message="R³ + LingBot + план: обработка завершена",
+            result=trajectory_data,
+            eta_seconds=0,
+            suppress_disk_completion=False,
+            analysis_run_id=run_id,
+        )
         _update_task_status(video_id, "completed", 100)
         logger.info(f"[{video_id}] R³ analysis saved and status set to completed")
 
     except Exception as e:
         error_msg = str(e)
+        if not _is_analysis_run_current(video_id, run_id):
+            logger.warning(
+                f"[{video_id}] Ignoring R³ error for superseded run_id={run_id}: {error_msg}"
+            )
+            return
         _update_task_status(video_id, "error", 0)
         logger.error(f"[{video_id}] R³ background error: {error_msg}")
         if video_id in processing_status:
-            processing_status[video_id].update({
-                "status": "error",
-                "progress": 0,
-                "message": f"Ошибка R³: {error_msg}"
-            })
+            _set_processing_stage(
+                video_id,
+                "error",
+                status="error",
+                progress=0,
+                message=f"Ошибка R³: {error_msg}",
+                suppress_disk_completion=True,
+            )
+            processing_status[video_id].pop("result", None)
 
 
 def _schedule_r3_process_background(
@@ -3397,12 +4065,14 @@ async def _await_lingbot_session_result(
         state = str(status.get("status") or "unknown")
         progress = float(status.get("progress") or 0.0)
         if video_id in processing_status:
-            processing_status[video_id].update({
-                "status": "lingbot_fusion",
-                "progress": min(94, 70 + int(round(progress * 24))),
-                "message": "LingBot-Map строит второе геометрическое наблюдение...",
-                "lingbot_fusion_session_id": session_id,
-            })
+            _set_processing_stage(
+                video_id,
+                "lingbot",
+                status="lingbot_fusion",
+                progress=min(94, 70 + int(round(progress * 24))),
+                message="LingBot-Map строит второе геометрическое наблюдение...",
+                lingbot_fusion_session_id=session_id,
+            )
         if state == "completed":
             metadata = await _fetch_lingbot_json(f"/sessions/{session_id}/metadata")
             trajectory = await _fetch_lingbot_json(f"/sessions/{session_id}/trajectory")
@@ -3454,6 +4124,7 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 "message": "Обработка завершена",
                 "result": manual_result,
                 "start_time": time.time(),
+                "suppress_disk_completion": False,
             }
             return {
                 "success": True,
@@ -3484,12 +4155,12 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 else:
                     raise HTTPException(status_code=404, detail=f"Видео {video_id} не найдено на сервере")
 
-        processing_status[video_id] = {
-            "status": "queued",
-            "progress": 0,
-            "message": "Поставлено в очередь на обработку",
-            "start_time": time.time()
-        }
+        # Invalidate prior *_analysis.json and arm a run id so /api/status cannot
+        # return the previous completed payload while this job is still running.
+        analysis_run_id = _begin_analysis_run(
+            video_id,
+            message="Поставлено в очередь на обработку",
+        )
 
         # ─── НЕМЕДЛЕННО запускаем обработку на GPU Worker ────────
         employee_name = body.get("employee_name")
@@ -3511,6 +4182,7 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 "status": "queued",
                 "message": "LingBot-Map анализ запущен",
                 "lingbot_session_id": lingbot_result.get("session_id"),
+                "analysis_run_id": analysis_run_id,
             }
         elif analysis_method == "r3":
             frame_stride = int(body.get("frame_stride", 5))
@@ -3548,7 +4220,8 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
             "success": True,
             "video_id": video_id,
             "status": "queued",
-            "message": "Анализ запущен на GPU-сервере"
+            "message": "Анализ запущен на GPU-сервере",
+            "analysis_run_id": analysis_run_id,
         }
     except HTTPException:
         raise
@@ -3666,24 +4339,33 @@ async def health_check():
 @app.get("/api/processing-status/{video_id}")
 async def get_processing_status(video_id: str):
     """Get processing status for a video"""
-    manual_store = _load_manual_trajectories()
-    manual_item = manual_store.get(video_id)
-    if manual_item:
-        manual_result = _make_manual_result(
-            manual_item.get("trajectory") or [],
-            manual_item.get("turn_points") or [],
-        )
-        return {
-            "status": "completed",
-            "progress": 100,
-            "message": "Ручная траектория готова",
-            "result": manual_result,
-            "manual_updated_at": manual_item.get("updated_at"),
-        }
+    live = processing_status.get(video_id) or {}
+    suppress_disk = bool(live.get("suppress_disk_completion"))
+    live_state = str(live.get("status") or "").lower()
+    live_busy = live_state in _LIVE_BUSY_STATES or (
+        suppress_disk and live_state not in {"completed", "done", "success"}
+    )
+    if not live_busy and not suppress_disk:
+        manual_store = _load_manual_trajectories()
+        manual_item = manual_store.get(video_id)
+        if manual_item:
+            manual_result = _make_manual_result(
+                manual_item.get("trajectory") or [],
+                manual_item.get("turn_points") or [],
+            )
+            return {
+                "status": "completed",
+                "progress": 100,
+                "message": "Ручная траектория готова",
+                "result": manual_result,
+                "manual_updated_at": manual_item.get("updated_at"),
+            }
     if video_id in processing_status:
-        return processing_status[video_id]
-    else:
-        raise HTTPException(status_code=404, detail="Video processing not found")
+        payload = dict(processing_status[video_id])
+        if live_busy:
+            payload.pop("result", None)
+        return payload
+    raise HTTPException(status_code=404, detail="Video processing not found")
 
 @app.get("/api/test")
 async def test_endpoint():
@@ -4282,7 +4964,11 @@ async def get_sample_data():
 # ──────────────────────────────────────────────
 
 @app.get("/api/r3-stream/{video_id}")
-async def r3_stream_proxy(video_id: str, request: Request):
+async def r3_stream_proxy(
+    video_id: str,
+    request: Request,
+    follow: bool = Query(False),
+):
     """Proxy SSE stream from GPU Worker R³ process to the frontend.
     
     Клиент подключается через EventSource (GET), а мы:
@@ -4290,6 +4976,9 @@ async def r3_stream_proxy(video_id: str, request: Request):
     2. Если видео нет — пробуем replay (GPU сам обнаружит .npz)
     3. Форвардим SSE события обратно
     4. После завершения стрима GPU держим соединение keepalive
+
+    follow=1 — не перезаливаем видео на GPU: только следим за уже
+    запущенным raw-анализом (camera/*.npz). Нужно для live-линии на плане.
     """
     # Find video file locally
     video_filename = UPLOADED_VIDEOS.get(video_id)
@@ -4314,7 +5003,36 @@ async def r3_stream_proxy(video_id: str, request: Request):
     async def event_generator():
         try:
             async with aiohttp.ClientSession() as session:
-                if video_path and video_path.exists():
+                # During active analyze, never POST the video again — that either
+                # races the raw job or uploads gigabytes for nothing.
+                if follow or not (video_path and video_path.exists()):
+                    if follow:
+                        logger.info(f"[{video_id}] SSE proxy follow_active (no re-upload)")
+                    else:
+                        logger.info(f"[{video_id}] Video not found locally, trying replay on GPU")
+                    if video_path and video_path.exists():
+                        params['original_filename'] = video_path.name
+                    async with session.post(
+                        gpu_url, params=params,
+                        data=b'', headers={'Content-Length': '0'},
+                        timeout=aiohttp.ClientTimeout(total=7200),
+                    ) as resp:
+                        if resp.status == 404:
+                            yield f"event: error\ndata: {json.dumps({'message': f'Видео и результаты R³ для {video_id} не найдены'})}\n\n"
+                            return
+                        if resp.status != 200:
+                            error_text = await resp.text()
+                            yield f"event: error\ndata: {json.dumps({'message': f'GPU Worker error: {error_text[:200]}'})}\n\n"
+                            return
+                        while True:
+                            line = await resp.content.readline()
+                            if not line:
+                                break
+                            decoded = line.decode('utf-8', errors='replace')
+                            if await request.is_disconnected():
+                                return
+                            yield decoded
+                elif video_path and video_path.exists():
                     # Видео есть — POST с телом
                     file_size = video_path.stat().st_size
                     params['original_filename'] = video_path.name
@@ -4335,29 +5053,6 @@ async def r3_stream_proxy(video_id: str, request: Request):
                             decoded = line.decode('utf-8', errors='replace')
                             if await request.is_disconnected():
                                 logger.info(f"[{video_id}] SSE proxy: client disconnected")
-                                return
-                            yield decoded
-                else:
-                    # Видео нет — пробуем replay (GPU сам найдёт .npz)
-                    logger.info(f"[{video_id}] Video not found locally, trying replay on GPU")
-                    async with session.post(
-                        gpu_url, params=params,
-                        data=b'', headers={'Content-Length': '0'},
-                        timeout=aiohttp.ClientTimeout(total=7200),
-                    ) as resp:
-                        if resp.status == 404:
-                            yield f"event: error\ndata: {json.dumps({'message': f'Видео и результаты R³ для {video_id} не найдены'})}\n\n"
-                            return
-                        if resp.status != 200:
-                            error_text = await resp.text()
-                            yield f"event: error\ndata: {json.dumps({'message': f'GPU Worker error: {error_text[:200]}'})}\n\n"
-                            return
-                        while True:
-                            line = await resp.content.readline()
-                            if not line:
-                                break
-                            decoded = line.decode('utf-8', errors='replace')
-                            if await request.is_disconnected():
                                 return
                             yield decoded
 
@@ -4507,21 +5202,98 @@ async def r3_diagnostics_proxy(video_id: str):
 async def r3_trajectory_proxy(
     video_id: str,
     trajectory_source: str = Query("raw"),
+    live_preview: bool = Query(False),
 ):
-    """Proxy the current lightweight R3 trajectory post-processing result."""
+    """Proxy the current lightweight R3 trajectory post-processing result.
+
+    live_preview=1 skips floorplan constraints and saved-analysis merge. The live
+    UI polls this every ~2s; running Kerama constraints on each poll wedges the
+    single uvicorn worker and freezes /api/uploaded-videos.
+    """
     gpu_url = f"{GPU_WORKER_URL}/api/r3-trajectory/{video_id}"
     try:
+        timeout = aiohttp.ClientTimeout(total=8 if live_preview else 60)
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 gpu_url,
                 params={"trajectory_source": trajectory_source},
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=timeout,
             ) as resp:
                 text = await resp.text()
                 if resp.status != 200:
+                    if live_preview:
+                        return JSONResponse({
+                            "success": True,
+                            "video_id": video_id,
+                            "trajectory": [],
+                            "plan_trajectory": [],
+                            "raw_plan_trajectory": [],
+                            "raw_trajectory_3d": [],
+                            "live_preview_pending": True,
+                            "detail": text[:200],
+                        })
                     return JSONResponse({"detail": text[:500]}, status_code=resp.status)
                 try:
                     worker_result = json.loads(text)
+                    if live_preview:
+                        state = processing_status.get(video_id) or {}
+                        # While a new analyze is clearing old poses, never return the
+                        # previous completed run (this looked like an instant "draft").
+                        if state.get("live_artifacts_ready") is False:
+                            return JSONResponse({
+                                "success": True,
+                                "video_id": video_id,
+                                "trajectory": [],
+                                "plan_trajectory": [],
+                                "raw_plan_trajectory": [],
+                                "raw_trajectory_3d": [],
+                                "live_preview_suppressed": True,
+                            })
+                        live_progress = await _fetch_gpu_live_progress(video_id)
+                        camera_frames = int(live_progress.get("camera_frames") or 0)
+                        if camera_frames <= 0:
+                            return JSONResponse({
+                                "success": True,
+                                "video_id": video_id,
+                                "trajectory": [],
+                                "plan_trajectory": [],
+                                "raw_plan_trajectory": [],
+                                "raw_trajectory_3d": [],
+                                "live_preview_suppressed": True,
+                                "camera_frames": 0,
+                            })
+                        traj = (
+                            worker_result.get("raw_trajectory_3d")
+                            or worker_result.get("trajectory")
+                            or worker_result.get("plan_trajectory")
+                            or []
+                        )
+                        if isinstance(traj, list) and len(traj) > camera_frames + 2:
+                            return JSONResponse({
+                                "success": True,
+                                "video_id": video_id,
+                                "trajectory": [],
+                                "plan_trajectory": [],
+                                "raw_plan_trajectory": [],
+                                "raw_trajectory_3d": [],
+                                "live_preview_suppressed": True,
+                                "camera_frames": camera_frames,
+                            })
+                        # Keep only what the draft plan needs — no Kerama snap.
+                        preview = {
+                            "success": worker_result.get("success", True),
+                            "video_id": video_id,
+                            "trajectory": worker_result.get("trajectory") or [],
+                            "plan_trajectory": worker_result.get("plan_trajectory")
+                            or worker_result.get("trajectory")
+                            or [],
+                            "raw_plan_trajectory": worker_result.get("raw_plan_trajectory")
+                            or [],
+                            "raw_trajectory_3d": worker_result.get("raw_trajectory_3d")
+                            or [],
+                        }
+                        return JSONResponse(_to_json_serializable(preview))
+
                     # The LingBot shadow run is owned by the VPS and therefore
                     # is not present in the R3 GPU worker response. Re-attach
                     # the persisted guarded candidate before map selection so
@@ -4589,7 +5361,9 @@ async def r3_trajectory_proxy(
                                 video_id,
                                 saved_error,
                             )
-                    constrained = apply_floorplan_constraints(
+                    from fastapi.concurrency import run_in_threadpool
+                    constrained = await run_in_threadpool(
+                        apply_floorplan_constraints,
                         worker_result,
                         _load_task_map_context(video_id),
                     )
@@ -4599,7 +5373,31 @@ async def r3_trajectory_proxy(
                         {"detail": "GPU Worker returned invalid trajectory JSON"},
                         status_code=502,
                     )
+    except (asyncio.TimeoutError, TimeoutError):
+        if live_preview:
+            return JSONResponse({
+                "success": True,
+                "video_id": video_id,
+                "trajectory": [],
+                "plan_trajectory": [],
+                "raw_plan_trajectory": [],
+                "raw_trajectory_3d": [],
+                "live_preview_pending": True,
+            })
+        logger.warning(f"[{video_id}] R3 trajectory proxy timeout")
+        return JSONResponse({"detail": "GPU trajectory timeout"}, status_code=504)
     except Exception as e:
+        if live_preview:
+            logger.info(f"[{video_id}] live R3 trajectory unavailable: {e}")
+            return JSONResponse({
+                "success": True,
+                "video_id": video_id,
+                "trajectory": [],
+                "plan_trajectory": [],
+                "raw_plan_trajectory": [],
+                "raw_trajectory_3d": [],
+                "live_preview_pending": True,
+            })
         logger.error(f"[{video_id}] R3 trajectory proxy error: {e}", exc_info=True)
         return JSONResponse({"detail": str(e)}, status_code=502)
 

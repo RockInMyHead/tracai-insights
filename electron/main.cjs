@@ -1,11 +1,69 @@
-const { app, BrowserWindow, Menu, dialog, shell } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const path = require('path');
+const { createCameraImportService } = require('./cameraImport.cjs');
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 const APP_URL = 'http://93.189.231.189';
 const DESKTOP_APP_URL = `${APP_URL}/trajectory?desktop=1`;
 
 let mainWindow = null;
+let cameraImportService = null;
+
+const cameraImportSettings = {
+  enabled: true,
+  ownerName: '',
+};
+
+function broadcastToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+function setupCameraImport() {
+  cameraImportService = createCameraImportService({
+    serverUrl: APP_URL,
+    getOwnerName: () => cameraImportSettings.ownerName,
+    isEnabled: () => cameraImportSettings.enabled,
+    onStatus: (status) => broadcastToRenderer('camera-import:status', status),
+    onProgress: (progress) => broadcastToRenderer('camera-import:progress', progress),
+    onBatchComplete: (uploaded) => broadcastToRenderer('camera-import:complete', uploaded),
+    onError: (error) => {
+      broadcastToRenderer('camera-import:error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    },
+  });
+
+  ipcMain.handle('camera-import:get-settings', () => ({
+    enabled: cameraImportSettings.enabled,
+    ownerName: cameraImportSettings.ownerName,
+  }));
+
+  ipcMain.handle('camera-import:set-settings', (_event, settings = {}) => {
+    if (typeof settings.enabled === 'boolean') {
+      cameraImportSettings.enabled = settings.enabled;
+      cameraImportService.setEnabled(settings.enabled);
+    }
+    if (typeof settings.ownerName === 'string') {
+      cameraImportSettings.ownerName = settings.ownerName;
+    }
+    return {
+      enabled: cameraImportSettings.enabled,
+      ownerName: cameraImportSettings.ownerName,
+    };
+  });
+
+  ipcMain.handle('camera-import:scan-now', async (_event, options = {}) => {
+    return cameraImportService.scanNow({
+      forceImport: Boolean(options.forceImport),
+    });
+  });
+
+  ipcMain.handle('camera-import:get-status', () => cameraImportService.getStatus());
+
+  cameraImportService.start();
+}
 
 function createMenu() {
   const template = [
@@ -106,9 +164,15 @@ function createWindow() {
   createMenu();
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  setupCameraImport();
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
+  if (cameraImportService) {
+    cameraImportService.stop();
+  }
   if (process.platform !== 'darwin') {
     app.quit();
   }

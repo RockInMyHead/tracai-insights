@@ -16,6 +16,32 @@ interface Props {
   drawnPlan?: unknown[] | null;
   referencePoint?: { x: number; y: number } | null;
   directionPoint?: { x: number; y: number } | null;
+  /** When true, follow the production analyze job (no second R³ upload). */
+  followActiveAnalysis?: boolean;
+  /** Parent still running analyzeVideo — keep draft live state. */
+  isAnalyzing?: boolean;
+  /** Live draft point count for the parent progress dashboard. */
+  onLiveStats?: (stats: { points: number }) => void;
+}
+
+function pickLivePoints(payload: {
+  plan_trajectory?: number[][];
+  raw_plan_trajectory?: number[][];
+  trajectory?: number[][];
+  raw_trajectory_3d?: number[][];
+}): number[][] {
+  const candidates = [
+    payload.plan_trajectory,
+    payload.raw_plan_trajectory,
+    payload.trajectory,
+    payload.raw_trajectory_3d,
+  ];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate) || candidate.length < 1) continue;
+    const valid = candidate.filter((p) => Array.isArray(p) && p.length >= 2);
+    if (valid.length > 0) return valid as number[][];
+  }
+  return [];
 }
 
 export default function RealTimeR3Visualization({
@@ -26,6 +52,9 @@ export default function RealTimeR3Visualization({
   drawnPlan = null,
   referencePoint = null,
   directionPoint = null,
+  followActiveAnalysis = false,
+  isAnalyzing = false,
+  onLiveStats,
 }: Props) {
   const [points, setPoints] = useState<number[][]>([]);
   const [poses, setPoses] = useState<{frame: number; pose: number[][]; intrinsics?: number[][]}[]>([]);
@@ -47,13 +76,146 @@ export default function RealTimeR3Visualization({
   const completedRef = useRef(false);
   const totalFramesRef = useRef(0);
   const onCompleteRef = useRef(onComplete);
+  const lastPointCountRef = useRef(0);
+  const stablePollsRef = useRef(0);
 
   useEffect(() => {
     onCompleteRef.current = onComplete;
   }, [onComplete]);
 
-  // Subscribe to SSE stream
+  const applyTrajectoryPoints = (nextPoints: number[][], processedHint?: number) => {
+    if (nextPoints.length === 0) return;
+    pointsRef.current = nextPoints;
+    setPoints([...nextPoints]);
+
+    let dist = 0;
+    for (let i = 1; i < nextPoints.length; i++) {
+      const dx = nextPoints[i][0] - nextPoints[i - 1][0];
+      const dy = nextPoints[i][1] - nextPoints[i - 1][1];
+      const dz = (nextPoints[i][2] || 0) - (nextPoints[i - 1][2] || 0);
+      dist += Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+    setDistance(dist);
+    setFrameCount(processedHint || nextPoints.length);
+    setStatus("processing");
+    setStatusMessage(
+      `${nextPoints.length.toLocaleString("ru-RU")} точек · черновик из готовых кадров`
+    );
+    setAnimProgress(Math.min(95, (nextPoints.length / Math.max(totalFramesRef.current || 100, 1)) * 100));
+    onLiveStats?.({ points: nextPoints.length });
+  };
+
+  // Poll growing plan trajectory while production analyze holds the GPU lock.
   useEffect(() => {
+    if (!followActiveAnalysis) return;
+
+    let cancelled = false;
+    let inFlight = false;
+    let abortController: AbortController | null = null;
+    setStatus("connecting");
+    setStatusMessage("Ожидание первых кадров…");
+    setErrorMessage("");
+    setPoints([]);
+    setPointCloud(null);
+    pointsRef.current = [];
+    posesRef.current = [];
+    setFrameCount(0);
+    setDistance(0);
+    setAnimProgress(0);
+    completedRef.current = false;
+    lastPointCountRef.current = 0;
+    stablePollsRef.current = 0;
+    // Ignore any leftover trajectory from a previous analyze of the same video_id
+    // until we observe an empty payload (stale artifacts cleared) or slow growth.
+    let armedForFreshRun = false;
+    const sessionStartedAt = Date.now();
+
+    const poll = async () => {
+      if (cancelled || completedRef.current || inFlight) return;
+      inFlight = true;
+      abortController?.abort();
+      abortController = new AbortController();
+      try {
+        const resp = await apiClient.getR3Trajectory(videoId, "raw", {
+          livePreview: true,
+          signal: abortController.signal,
+          timeoutMs: 5000,
+        });
+        if (cancelled) return;
+        const nextPoints = pickLivePoints(resp);
+        const suppressed = Boolean((resp as { live_preview_suppressed?: boolean }).live_preview_suppressed);
+
+        if (!armedForFreshRun) {
+          if (suppressed || nextPoints.length === 0) {
+            armedForFreshRun = true;
+            setPoints([]);
+            pointsRef.current = [];
+            setStatus("processing");
+            setStatusMessage("Ждём новые кадры текущего анализа…");
+            return;
+          }
+          // Large instant dump right after start = previous completed run. Ignore it.
+          const ageSec = (Date.now() - sessionStartedAt) / 1000;
+          if (ageSec < 20 && nextPoints.length >= 50) {
+            setStatus("processing");
+            setStatusMessage("Отбрасываю старый маршрут — жду текущий прогон…");
+            return;
+          }
+          armedForFreshRun = true;
+        }
+
+        if (nextPoints.length > 0) {
+          applyTrajectoryPoints(nextPoints, nextPoints.length);
+        } else {
+          setStatus("processing");
+          setStatusMessage("Обработка кадров…");
+        }
+
+        if (nextPoints.length === lastPointCountRef.current && nextPoints.length > 1) {
+          stablePollsRef.current += 1;
+        } else {
+          stablePollsRef.current = 0;
+          lastPointCountRef.current = nextPoints.length;
+        }
+
+        // After parent analyze finishes and the path stops growing, mark draft complete.
+        if (!isAnalyzing && nextPoints.length >= 2 && stablePollsRef.current >= 2) {
+          completedRef.current = true;
+          setStatus("complete");
+          setAnimProgress(100);
+          setStatusMessage(
+            `${nextPoints.length.toLocaleString("ru-RU")} точек · черновик готов`
+          );
+          onCompleteRef.current?.({ plan_trajectory: nextPoints, follow_active: true });
+        }
+      } catch {
+        if (cancelled || completedRef.current) return;
+        // 404 / timeout while GPU still starting is expected — keep waiting.
+        setStatus("processing");
+        setStatusMessage(
+          isAnalyzing ? "Обработка на GPU…" : "Ожидание траектории…"
+        );
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void poll();
+    const interval = setInterval(() => {
+      void poll();
+    }, 2500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      abortController?.abort();
+    };
+  }, [videoId, followActiveAnalysis, isAnalyzing]);
+
+  // Subscribe to SSE stream (standalone live / replay path)
+  useEffect(() => {
+    if (followActiveAnalysis) return;
+
     setStatus("connecting");
     setStatusMessage("Подключение к GPU-серверу...");
     setPoints([]);
@@ -71,12 +233,15 @@ export default function RealTimeR3Visualization({
           setStatus("processing");
           setStatusMessage("Получение видео на GPU-сервере...");
         } else if (data.event_type === "receiving") {
-          const mb = Math.round((data.received_bytes || 0) / 1024 / 1024);
+          const mb = Math.round((Number(data.received_bytes) || 0) / 1024 / 1024);
           setStatusMessage(`Загрузка видео на GPU: ${mb} MB...`);
         } else if (data.event_type === "video_received") {
           setStatusMessage("Видео загружено, запуск R³...");
         } else if (data.event_type === "r3_start") {
           setStatusMessage("R³ запущен, обработка кадров...");
+        } else if (data.event_type === "watching") {
+          setStatus("processing");
+          setStatusMessage("Live: следим за активным анализом — линия растёт по кадрам (черновик)");
         } else if (data.event_type === "replay") {
           const numFiles = data.npz_files || 0;
           setStatusMessage(`Загрузка готовых результатов R³ (${numFiles} точек)...`);
@@ -107,36 +272,22 @@ export default function RealTimeR3Visualization({
         const newTraj = Array.isArray(rawTraj) ? rawTraj.filter(p => Array.isArray(p)) : [];
         if (newTraj.length > 0) {
           pointsRef.current = [...pointsRef.current, ...newTraj];
-          setPoints([...pointsRef.current]);
-
-          // Calculate distance
-          const pts = pointsRef.current;
-          let dist = 0;
-          for (let i = 1; i < pts.length; i++) {
-            const dx = pts[i][0] - pts[i - 1][0];
-            const dy = pts[i][1] - pts[i - 1][1];
-            const dz = (pts[i][2] || 0) - (pts[i - 1][2] || 0);
-            dist += Math.sqrt(dx * dx + dy * dy + dz * dz);
-          }
-          setDistance(dist);
-
-          setFrameCount(data.num_processed || pts.length);
-          setStatusMessage(
-            `Обработано ${data.num_processed || pts.length} кадров, ${pts.length} точек`
-          );
-          setAnimProgress(Math.min(95, (pts.length / Math.max(totalFramesRef.current || 100, 1)) * 100));
+          applyTrajectoryPoints(pointsRef.current, data.num_processed || pointsRef.current.length);
         }
 
         // Capture full pose data for better 3D reconstruction
         const rawPoses = data.new_poses;
         if (Array.isArray(rawPoses) && rawPoses.length > 0) {
           const validPoses = rawPoses
-            .filter(p => p && Array.isArray(p.pose) && p.pose.length >= 3)
-            .map(p => ({
-              frame: typeof p.frame === 'number' ? p.frame : 0,
-              pose: p.pose as number[][],
-              intrinsics: Array.isArray(p.intrinsics) ? p.intrinsics as number[][] : undefined,
-            }));
+            .filter(p => p && Array.isArray((p as { pose?: unknown }).pose) && ((p as { pose: unknown[] }).pose.length >= 3))
+            .map(p => {
+              const item = p as { frame?: number; pose: number[][]; intrinsics?: number[][] };
+              return {
+                frame: typeof item.frame === "number" ? item.frame : 0,
+                pose: item.pose,
+                intrinsics: Array.isArray(item.intrinsics) ? item.intrinsics : undefined,
+              };
+            });
           if (validPoses.length > 0) {
             posesRef.current = [...posesRef.current, ...validPoses];
             setPoses([...posesRef.current]);
@@ -150,10 +301,10 @@ export default function RealTimeR3Visualization({
 
         // ── 1. Show sample point cloud from SSE immediately ──────
         let totalPcCount = 0;
-        const resultData = data.result || data;
+        const resultData = (data.result || data) as Record<string, unknown>;
         if (resultData) {
           const pc = resultData.pointcloud_sample || resultData.pointcloud;
-          totalPcCount = resultData.pointcloud_count || 0;
+          totalPcCount = Number(resultData.pointcloud_count) || 0;
           if (Array.isArray(pc) && pc.length > 0) {
             const validPc = pc.filter(p => Array.isArray(p) && p.length >= 3);
             if (validPc.length >= 50) {
@@ -226,14 +377,14 @@ export default function RealTimeR3Visualization({
         setErrorMessage(err);
         setStatusMessage(`Ошибка: ${err}`);
       },
-    });
+    }, { followActive: false });
 
     unsubscribeRef.current = unsub;
 
     return () => {
       unsub();
     };
-  }, [videoId]);
+  }, [videoId, followActiveAnalysis]);
 
   const handleClose = () => {
     unsubscribeRef.current?.();
@@ -241,6 +392,8 @@ export default function RealTimeR3Visualization({
   };
 
   const isLive = status === "connecting" || status === "processing";
+  // During production analyze, show only the plan draft — hide the 3D debug console.
+  const planFirstLive = followActiveAnalysis || isAnalyzing;
 
   const liveTrajectories = useMemo<TrajectoryData[]>(() => {
     if (points.length < 2) return [];
@@ -251,7 +404,7 @@ export default function RealTimeR3Visualization({
         z: Number(point[2]) || 0,
       })),
       turnPoints: [],
-      ownerName: "Live R³",
+      ownerName: "Черновик",
       color: "#38bdf8",
       videoId,
       method: "r3_reconstruction",
@@ -263,10 +416,10 @@ export default function RealTimeR3Visualization({
   }, [points, videoId]);
 
   const showFloorplanLive = Boolean(floorPlan || drawnPlan);
+  const pointLabel = (frameCount || points.length).toLocaleString("ru-RU");
 
   return (
-    <Card className={`w-full border-2 border-primary/20 ${isFullscreen3d ? "fixed inset-0 z-[99] rounded-none border-0" : ""}`}>
-      {/* Кнопка закрытия при fullscreen */}
+    <Card className={`w-full overflow-hidden border border-border/40 bg-card/60 ${isFullscreen3d ? "fixed inset-0 z-[99] rounded-none border-0" : ""}`}>
       {isFullscreen3d && (
         <Button
           variant="ghost"
@@ -278,130 +431,138 @@ export default function RealTimeR3Visualization({
           <EyeOff className="h-5 w-5" />
         </Button>
       )}
-      {!isFullscreen3d && (<>
-      <CardHeader className="pb-2">
-        <div className="flex items-center justify-between">
-          <CardTitle className="flex items-center gap-2 text-lg">
-            {isLive ? (
-              <>
-                <span className="relative flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500" />
-                </span>
-                Live — траектория рисуется по мере готовности
-              </>
-            ) : status === "complete" ? (
-              <>
-                <span className="h-3 w-3 rounded-full bg-green-500 inline-block" />
-                R³ реконструкция завершена
-              </>
-            ) : (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Ошибка
-              </>
-            )}
-          </CardTitle>
-          <div className="flex items-center gap-2">
-            {status === "complete" && (
-              <Badge variant="default" className="bg-green-500/20 text-green-500 border-green-500/30">
-                {frameCount} кадров
-              </Badge>
-            )}
-            <Button variant="ghost" size="icon" onClick={handleClose} className="h-8 w-8">
-              <EyeOff className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {statusMessage}
-          {errorMessage ? ` · ${errorMessage}` : ""}
-        </p>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {/* Progress */}
-        <Progress value={animProgress} className="w-full h-1.5" />
-
-        <div className={`grid gap-3 ${showFloorplanLive ? "xl:grid-cols-2" : "grid-cols-1"}`}>
-          {showFloorplanLive && (
-            <div className="overflow-hidden rounded-lg border border-primary/20 bg-background">
-              <div className="border-b border-border/40 px-3 py-2 text-sm font-medium">
-                План: live-траектория ({points.length.toLocaleString("ru-RU")} точек)
+      {!isFullscreen3d && (
+        <>
+          <CardHeader className="space-y-3 pb-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 space-y-1">
+                <CardTitle className="flex items-center gap-2.5 text-base font-semibold tracking-tight">
+                  {isLive ? (
+                    <span className="relative flex h-2.5 w-2.5 shrink-0">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400/70" />
+                      <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400" />
+                    </span>
+                  ) : status === "complete" ? (
+                    <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-emerald-400" />
+                  ) : (
+                    <Loader2 className="h-4 w-4 shrink-0 animate-spin text-destructive" />
+                  )}
+                  <span className="truncate">
+                    {status === "error"
+                      ? "Ошибка live-просмотра"
+                      : status === "complete"
+                        ? "Черновик маршрута"
+                        : "Live на плане"}
+                  </span>
+                </CardTitle>
+                <p className="text-sm text-muted-foreground">
+                  {status === "error"
+                    ? (errorMessage || statusMessage)
+                    : isLive
+                      ? "Черновик из уже посчитанных кадров · GPU ещё считает остальное видео"
+                      : statusMessage}
+                </p>
               </div>
-              <div className="h-[420px]">
-                {liveTrajectories.length > 0 ? (
-                  <TrajectoryMap
-                    trajectories={liveTrajectories}
-                    floorPlan={floorPlan}
-                    drawnPlan={drawnPlan}
-                    referencePoint={referencePoint}
-                    directionPoint={directionPoint}
-                    playbackPointLimit={points.length}
-                    compactMode
+              <div className="flex shrink-0 items-center gap-2">
+                {points.length > 0 && (
+                  <Badge
+                    variant="outline"
+                    className="border-border/50 bg-secondary/40 font-mono text-[11px] text-muted-foreground"
+                  >
+                    {pointLabel}
+                  </Badge>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={handleClose}
+                  className="h-8 w-8 text-muted-foreground"
+                  title="Скрыть"
+                >
+                  <EyeOff className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+            <Progress value={animProgress} className="h-1 w-full bg-secondary/60" />
+          </CardHeader>
+
+          <CardContent className="space-y-3 pt-0">
+            {showFloorplanLive ? (
+              <div className="overflow-hidden rounded-xl border border-border/40 bg-secondary/20">
+                <div className="h-[min(58vh,560px)] min-h-[360px]">
+                  {liveTrajectories.length > 0 ? (
+                    <TrajectoryMap
+                      trajectories={liveTrajectories}
+                      floorPlan={floorPlan}
+                      drawnPlan={drawnPlan}
+                      referencePoint={referencePoint}
+                      directionPoint={directionPoint}
+                      playbackPointLimit={points.length}
+                      compactMode
+                      minimalChrome
+                    />
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                      <div className="text-center">
+                        <Loader2 className="mx-auto mb-3 h-7 w-7 animate-spin text-primary/80" />
+                        <p>Ждём первые точки…</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            {/* Full 3D console only outside production live-follow */}
+            {!planFirstLive && (
+              <div className="relative overflow-hidden rounded-xl border border-border/30 bg-black/40">
+                {points.length > 0 ? (
+                  <R3Visualization3D
+                    videoId={videoId}
+                    points={points}
+                    poses={poses}
+                    pointCloud={pointCloud}
+                    totalFrames={totalFrames}
+                    distance={distance}
+                    onFullscreenChange={(full) => setIsFullscreen3d(full)}
                   />
                 ) : (
-                  <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                  <div className="flex h-[420px] items-center justify-center">
                     <div className="text-center">
-                      <Loader2 className="mx-auto mb-2 h-8 w-8 animate-spin text-primary" />
-                      Ждём первые точки R³…
+                      <Loader2 className="mx-auto mb-3 h-8 w-8 animate-spin text-primary" />
+                      <p className="text-sm text-muted-foreground">Ожидание 3D…</p>
                     </div>
                   </div>
                 )}
               </div>
-            </div>
-          )}
+            )}
 
-          {/* 3D Visualization */}
-          <div className="relative overflow-hidden rounded-lg border border-border/30 bg-black/40">
-            {points.length > 0 ? (
-              <R3Visualization3D
-                videoId={videoId}
-                points={points}
-                poses={poses}
-                pointCloud={pointCloud}
-                totalFrames={totalFrames}
-                distance={distance}
-                onFullscreenChange={(full) => setIsFullscreen3d(full)}
-              />
-            ) : (
-              <div
-                className="flex items-center justify-center"
-                style={{ height: showFloorplanLive ? 420 : 500 }}
-              >
-                <div className="text-center">
-                  <Loader2 className="h-10 w-10 animate-spin mx-auto mb-3 text-primary" />
-                  <p className="text-sm text-muted-foreground">Ожидание первой 3D точки...</p>
+            {!planFirstLive && (
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                <div className="flex items-center gap-2">
+                  {isLive && <Loader2 className="h-3 w-3 animate-spin" />}
+                  <span>{statusMessage}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {fps > 0 && (
+                    <Badge variant="outline" className="text-[10px]">
+                      {fps.toFixed(1)} кадр/с
+                    </Badge>
+                  )}
+                  {status === "complete" && processingTime > 0 && (
+                    <Badge
+                      variant="outline"
+                      className="border-emerald-500/30 text-[10px] text-emerald-400"
+                    >
+                      {processingTime.toFixed(1)} с
+                    </Badge>
+                  )}
                 </div>
               </div>
             )}
-          </div>
-        </div>
-
-        {/* Status */}
-        <div className="flex items-center justify-between text-xs text-muted-foreground">
-          <div className="flex items-center gap-2">
-            {isLive && <Loader2 className="h-3 w-3 animate-spin" />}
-            <span>
-              {isLive
-                ? "Линия на плане удлиняется по мере обработки кадров"
-                : statusMessage}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            {fps > 0 && (
-              <Badge variant="outline" className="text-[10px]">
-                {fps.toFixed(1)} кадр/с
-              </Badge>
-            )}
-            {status === "complete" && processingTime > 0 && (
-              <Badge variant="default" className="bg-green-500/20 text-green-500 border-green-500/30 text-[10px]">
-                {processingTime.toFixed(1)} с
-              </Badge>
-            )}
-          </div>
-        </div>
-      </CardContent>
-      </>)}
+          </CardContent>
+        </>
+      )}
     </Card>
   );
 }

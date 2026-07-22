@@ -27,6 +27,7 @@ export interface VideoAnalysisResult {
   success: boolean;
   status?: string;
   video_id?: string;
+  analysis_run_id?: string;
   data?: {
     method: string;
     trajectory: number[][];
@@ -413,11 +414,24 @@ export class ApiClient {
 
   /** Список загруженных на сервер видео (для выбора перед анализом) */
   async getUploadedVideosList(): Promise<VideoListResponse> {
-    const response = await agentFetch(`${this.baseUrl}/api/uploaded-videos`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch uploaded videos list');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await agentFetch(`${this.baseUrl}/api/uploaded-videos`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error('Failed to fetch uploaded videos list');
+      }
+      return response.json();
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error('Список видео не ответил вовремя — обновите страницу');
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
-    return response.json();
   }
 
   async getAdminTasks(): Promise<TrackingTask[]> {
@@ -572,6 +586,14 @@ export class ApiClient {
     start_time?: number;
     elapsed_seconds?: number;
     eta_seconds?: number;
+    stage_timings?: Record<string, number>;
+    stage_current_seconds?: number;
+    stage_fraction?: number;
+    gpu_frames_done?: number;
+    gpu_frames_total?: number;
+    gpu_frames_extracted?: number;
+    analysis_run_id?: string;
+    suppress_disk_completion?: boolean;
     result?: VideoAnalysisResult["data"];
   }> {
     const response = await agentFetch(`${this.baseUrl}/api/status/${videoId}`);
@@ -726,9 +748,12 @@ export class ApiClient {
       onComplete?: (data: Record<string, unknown>) => void;
       onError?: (error: string) => void;
       onStatus?: (data: Record<string, unknown>) => void;
-    }
+    },
+    options?: { followActive?: boolean },
   ): () => void {
-    const url = `${this.baseUrl}/api/r3-stream/${videoId}`;
+    // followActive=1: watch the production analyze job (no second R³ / no re-upload)
+    const followQs = options?.followActive ? "?follow=1" : "";
+    const url = `${this.baseUrl}/api/r3-stream/${videoId}${followQs}`;
     const eventSource = new EventSource(url);
 
     eventSource.addEventListener('frame_processed', (event) => {
@@ -787,6 +812,9 @@ export class ApiClient {
     });
     eventSource.addEventListener('replay', (event) => {
       try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'replay' }); } catch { return; }
+    });
+    eventSource.addEventListener('watching', (event) => {
+      try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'watching' }); } catch { return; }
     });
     eventSource.addEventListener('pointcloud_status', (event) => {
       try { callbacks.onStatus?.({ ...JSON.parse(event.data), event_type: 'pointcloud_status' }); } catch { return; }
@@ -937,6 +965,7 @@ export class ApiClient {
   async getR3Trajectory(
     videoId: string,
     trajectorySource: R3TrajectorySource = "raw",
+    options?: { livePreview?: boolean; signal?: AbortSignal; timeoutMs?: number },
   ): Promise<{
     success: boolean;
     video_id: string;
@@ -985,13 +1014,27 @@ export class ApiClient {
     scale_aware_candidate?: Record<string, unknown>;
   }> {
     const query = new URLSearchParams({ trajectory_source: trajectorySource });
-    const resp = await agentFetch(
-      `${this.baseUrl}/api/r3-trajectory/${videoId}?${query.toString()}`,
-    );
-    if (!resp.ok) {
-      throw new Error(`R3 trajectory fetch failed (HTTP ${resp.status})`);
+    if (options?.livePreview) {
+      query.set("live_preview", "1");
     }
-    return resp.json();
+    const timeoutMs = options?.timeoutMs ?? (options?.livePreview ? 5000 : 60000);
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    options?.signal?.addEventListener("abort", onAbort);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await agentFetch(
+        `${this.baseUrl}/api/r3-trajectory/${videoId}?${query.toString()}`,
+        { signal: controller.signal },
+      );
+      if (!resp.ok) {
+        throw new Error(`R3 trajectory fetch failed (HTTP ${resp.status})`);
+      }
+      return resp.json();
+    } finally {
+      clearTimeout(timer);
+      options?.signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   /** Диагностика R³ output: файлы, pointcloud shape, confidence percentiles. */
