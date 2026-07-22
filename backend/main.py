@@ -60,6 +60,24 @@ app = FastAPI(title="TrackAI Video Analysis API", version="1.0.0")
 processing_status = {}
 convert_dwg_status: Dict[str, Dict] = {}
 
+# Every state in which a fresh result is still being produced.  Keep this in
+# one place: omitting ``lingbot_fusion`` here previously made /api/status load
+# an older analysis file and report 100% while the new run was still at 92%.
+ANALYSIS_BUSY_STATUSES = {
+    "queued",
+    "processing",
+    "uploading_to_gpu",
+    "gpu_processing",
+    "running",
+    "lingbot_queued",
+    "lingbot_running",
+    "lingbot_fusion",
+}
+
+
+def _analysis_status_is_busy(value: Any) -> bool:
+    return str(value or "").strip().lower() in ANALYSIS_BUSY_STATUSES
+
 # Employee batch scheduling
 EMPLOYEE_BATCH_TS: Dict[str, float] = {}
 BATCH_WAIT_SECONDS = 1  # минимальная задержка — обработка начинается почти мгновенно
@@ -73,7 +91,9 @@ LINGBOT_FUSION_ENABLED = os.getenv("LINGBOT_FUSION_ENABLED", "true").strip().low
 LINGBOT_FUSION_TARGET_FRAMES = int(os.getenv("LINGBOT_FUSION_TARGET_FRAMES", "3000"))
 LINGBOT_FUSION_KEYFRAME_INTERVAL = int(os.getenv("LINGBOT_FUSION_KEYFRAME_INTERVAL", "6"))
 LINGBOT_FUSION_TIMEOUT_SECONDS = int(
-    os.getenv("LINGBOT_FUSION_TIMEOUT_SECONDS", str(3 * 60 * 60))
+    # LingBot is a non-fatal shadow observer.  R3 must still be published if
+    # the worker loses a session; do not hold a completed R3 run for 3 hours.
+    os.getenv("LINGBOT_FUSION_TIMEOUT_SECONDS", str(30 * 60))
 )
 
 #
@@ -242,6 +262,7 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
     """If analysis is already on disk / DB-completed, expose it even after restart."""
     analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
     db_completed = False
+    db_busy = False
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
@@ -249,10 +270,18 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
             (video_id,),
         ).fetchone()
         conn.close()
-        if row and str(row[0]).lower() in {"completed", "done", "success"}:
-            db_completed = True
+        if row:
+            db_state = str(row[0] or "").lower()
+            db_completed = db_state in {"completed", "done", "success"}
+            db_busy = _analysis_status_is_busy(db_state)
     except Exception:
         db_completed = False
+        db_busy = False
+    # A previous JSON may still exist while a forced re-run is active.  Never
+    # present it as the result of the fresh run, including after a backend
+    # restart where the in-memory progress dictionary has been lost.
+    if db_busy:
+        return None
     if not analysis_file.exists() and not db_completed:
         return None
     if not analysis_file.exists():
@@ -2048,15 +2077,7 @@ async def get_video_status(video_id: str):
 
     live = processing_status.get(video_id)
     live_state = str((live or {}).get("status") or "").lower()
-    live_busy = live_state in {
-        "queued",
-        "processing",
-        "uploading_to_gpu",
-        "gpu_processing",
-        "running",
-        "lingbot_queued",
-        "lingbot_running",
-    }
+    live_busy = _analysis_status_is_busy(live_state)
     # A stale in-memory payload (often with a non-serializable prior result)
     # must not block a finished analysis after restart / re-open.
     if not live_busy:

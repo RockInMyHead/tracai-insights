@@ -4,7 +4,10 @@ import path from "path";
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => ({
-  base: './',
+  // The web app may be opened from nested routes such as /downloads/.
+  // Absolute asset URLs prevent the browser from requesting
+  // /downloads/assets/* and receiving the HTML fallback instead of JS/CSS.
+  base: mode === 'desktop' ? './' : '/',
   server: {
     host: "::",
     port: 8081,

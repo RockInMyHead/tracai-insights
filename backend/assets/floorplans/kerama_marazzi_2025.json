@@ -18,7 +18,7 @@
   "person_radius_meters": 0.28,
   "walking_speed_mps": 1.2,
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
-  "obstacle_mask_sha256": "e1c650ab68868022a00ffec7463cc69a3ee6d67176153fe1c74c0f5566e8a034",
+  "obstacle_mask_sha256": "574ad4c6cac83aa2da968547cf46bdb29b782065884f4f1923328ccd6763e1d1",
   "support_mask_file": "kerama_marazzi_2025_support.png",
   "support_mask_sha256": "f1eed9806e2021124b01168f8b320f25ca4eca2d1e0595a29d168a15908a1ce5",
   "support_mask_generation": {
@@ -27,18 +27,18 @@
     "barrier_dilation_pixels": 2,
     "coverage_ratio": 0.3584644274194175
   },
-  "source_pdf_sha256": "61b08f3c6e41e31db0840ef975f4e3e6926e1481628274698fc4e5b7656d83f9",
-  "display_image_sha256": "63ee42dc236cd36be38cf00dcc82aabb6b687d5ce1306611d008cca25be24f14",
+  "source_pdf_sha256": "5c4d908c1b9832c81eceab914303da187e3935cbcabed19e9c9ff7321ee8e19e",
+  "display_image_sha256": "8b939e2684743cef463bf697308e48b78bce6eb797b73197cc77e89e0000716d",
   "source_pdf": "kerama-marazzi-2025.pdf",
   "display_image": "kerama-marazzi-2025.png",
-  "annotation_component_count": 44,
-  "annotation_pixel_count": 1352160,
+  "annotation_component_count": 104,
+  "annotation_pixel_count": 1841608,
   "reference_mask": {
     "method": "operator_ground_truth_corridor_v1",
     "reference_route_file": "kerama_marazzi_2025_reference_route.json",
     "verified_walkable_half_width_meters": 0.75,
     "corridor_pixel_count": 58207,
-    "obstacle_pixels_cleared": 16367,
+    "obstacle_pixels_cleared": 11459,
     "support_pixels_added": 0,
     "false_north_corridor_blocked": [
       600,

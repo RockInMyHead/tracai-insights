@@ -1,15 +1,15 @@
 {
   "name": "trackai",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.18.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "build:desktop": "vite build --mode desktop && npx electron-builder",
-    "build:desktop:win": "vite build --mode desktop && npx electron-builder --win",
-    "build:desktop:mac": "vite build --mode desktop && npx electron-builder --mac",
+    "build:desktop:win": "vite build --mode desktop && npx electron-builder --win --x64",
+    "build:desktop:mac": "vite build --mode desktop && npx electron-builder --mac --universal",
     "preview": "vite preview",
     "lint": "eslint .",
     "electron": "electron ."
@@ -118,6 +118,7 @@
       "target": [
         "dmg"
       ],
+      "icon": "public/icon.icns",
       "artifactName": "TrackAI-${version}.${ext}",
       "category": "public.app-category.business"
     }
