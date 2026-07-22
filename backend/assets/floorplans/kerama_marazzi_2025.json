@@ -17,34 +17,70 @@
   "grid_cell_pixels": 4,
   "person_radius_meters": 0.28,
   "walking_speed_mps": 1.2,
+  "default_start_anchor": {
+    "source": "fixed_plan_start_calibration",
+    "reference_pixels": [
+      2222.623,
+      684.183
+    ],
+    "direction_pixels": [
+      2291.383,
+      757.285
+    ],
+    "trajectory_points_used": false
+  },
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
-  "obstacle_mask_sha256": "574ad4c6cac83aa2da968547cf46bdb29b782065884f4f1923328ccd6763e1d1",
+  "obstacle_mask_sha256": "94559efb6afc79c3a35e45420480e5059a4c745a8a5907aafdf82f0556a5520a",
   "support_mask_file": "kerama_marazzi_2025_support.png",
-  "support_mask_sha256": "f1eed9806e2021124b01168f8b320f25ca4eca2d1e0595a29d168a15908a1ce5",
+  "support_mask_sha256": "d6bd00f432e0cb48a2673100a32756b7227a53aaf640dae02350d0efd4e04068",
   "support_mask_generation": {
-    "method": "page_exterior_flood_fill",
+    "method": "positive_green_corridors_only",
     "ink_threshold": 242,
     "barrier_dilation_pixels": 2,
-    "coverage_ratio": 0.3584644274194175
+    "coverage_ratio": 0.08499252713533868,
+    "green_corridor_margin_pixels": 24
   },
   "source_pdf_sha256": "5c4d908c1b9832c81eceab914303da187e3935cbcabed19e9c9ff7321ee8e19e",
   "display_image_sha256": "8b939e2684743cef463bf697308e48b78bce6eb797b73197cc77e89e0000716d",
   "source_pdf": "kerama-marazzi-2025.pdf",
   "display_image": "kerama-marazzi-2025.png",
   "annotation_component_count": 104,
-  "annotation_pixel_count": 1841608,
+  "annotation_pixel_count": 1416500,
+  "obstacle_annotation": {
+    "method": "changed_red_operator_annotation",
+    "boundary_cleanup_pixels": 2,
+    "physical_person_halo_applied_by_engine": true,
+    "reviewed_passage_openings": [
+      [
+        2485,
+        925,
+        2575,
+        1005
+      ],
+      [
+        2890,
+        1890,
+        2990,
+        1990
+      ]
+    ],
+    "reviewed_passage_policy": "remove_conflicting_red_inside_positive_green_only",
+    "remaining_red_is_absolute": true,
+    "route_specific_overrides": false
+  },
+  "walkable_annotation": {
+    "method": "changed_green_operator_annotation",
+    "component_count": 18,
+    "pixel_count": 858632,
+    "support_pixels_added": 1104219,
+    "closing_pixels": 10,
+    "opening_pixels": 3,
+    "dilation_pixels": 6,
+    "red_obstacles_take_precedence": true,
+    "route_specific_overrides": false
+  },
   "reference_mask": {
-    "method": "operator_ground_truth_corridor_v1",
-    "reference_route_file": "kerama_marazzi_2025_reference_route.json",
-    "verified_walkable_half_width_meters": 0.75,
-    "corridor_pixel_count": 58207,
-    "obstacle_pixels_cleared": 11459,
-    "support_pixels_added": 0,
-    "false_north_corridor_blocked": [
-      600,
-      500,
-      3050,
-      650
-    ]
+    "method": "none",
+    "route_specific_overrides": false
   }
 }

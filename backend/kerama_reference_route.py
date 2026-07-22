@@ -1,4 +1,4 @@
-"""Verified Kerama route data and deterministic mask overrides."""
+"""Offline Kerama route fixture used only to evaluate map-matching quality."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from scipy import ndimage
 
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 REFERENCE_ROUTE_FILE = ASSET_ROOT / "kerama_marazzi_2025_reference_route.json"
-FALSE_NORTH_CORRIDOR = (600, 500, 3050, 650)
 
 
 def load_reference_route(path: Optional[Path] = None) -> dict[str, Any]:
@@ -51,53 +50,3 @@ def reference_route_mask(
     disk = xx * xx + yy * yy <= radius_pixels * radius_pixels
     return ndimage.binary_dilation(route, structure=disk)
 
-
-def apply_reference_route_overrides(
-    obstacle_mask: np.ndarray,
-    support_mask: np.ndarray,
-    *,
-    meters_per_pixel: float,
-    payload: Optional[dict[str, Any]] = None,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Apply the verified passage and retained exterior protection."""
-    obstacles = np.asarray(obstacle_mask, dtype=bool).copy()
-    support = np.asarray(support_mask, dtype=bool).copy()
-    if obstacles.shape != support.shape:
-        raise ValueError("Kerama obstacle/support masks must have identical shapes")
-    if meters_per_pixel <= 0.0:
-        raise ValueError("meters_per_pixel must be positive")
-
-    route_payload = payload or load_reference_route()
-    points = np.asarray(route_payload["points"], dtype=np.float64)[:, :2]
-    if (
-        np.any(points[:, 0] < 0.0)
-        or np.any(points[:, 0] >= obstacles.shape[1])
-        or np.any(points[:, 1] < 0.0)
-        or np.any(points[:, 1] >= obstacles.shape[0])
-    ):
-        raise ValueError("Kerama reference route lies outside the canonical plan")
-
-    x1, y1, x2, y2 = FALSE_NORTH_CORRIDOR
-    obstacles[y1:y2, x1:x2] = True
-    half_width_meters = float(
-        route_payload.get("verified_walkable_half_width_meters", 0.75)
-    )
-    corridor = reference_route_mask(
-        obstacles.shape,
-        points,
-        radius_pixels=half_width_meters / meters_per_pixel,
-    )
-    blocked_before = int(np.count_nonzero(obstacles & corridor))
-    unsupported_before = int(np.count_nonzero((~support) & corridor))
-    obstacles[corridor] = False
-    support[corridor] = True
-    stats = {
-        "method": "operator_ground_truth_corridor_v1",
-        "reference_route_file": REFERENCE_ROUTE_FILE.name,
-        "verified_walkable_half_width_meters": half_width_meters,
-        "corridor_pixel_count": int(corridor.sum()),
-        "obstacle_pixels_cleared": blocked_before,
-        "support_pixels_added": unsupported_before,
-        "false_north_corridor_blocked": list(FALSE_NORTH_CORRIDOR),
-    }
-    return obstacles, support, stats

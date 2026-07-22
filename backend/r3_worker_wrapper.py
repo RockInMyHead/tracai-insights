@@ -29,9 +29,23 @@ except ImportError:  # pragma: no cover - package-style startup
     from backend.r3_trajectory import summarize_fallback_edges
 
 try:
-    from r3_pose_graph import load_pose_graph_summary
+    from r3_pose_graph import (
+        R3_ABSOLUTE_POSE_SPACE,
+        R3_CONFIDENCE_SEMANTICS,
+        R3_POSE_ENCODING,
+        R3_POSE_GRAPH_SCHEMA_VERSION,
+        R3_RELATIVE_TRANSFORM_CONVENTION,
+        load_pose_graph_summary,
+    )
 except ImportError:  # pragma: no cover - package-style startup
-    from backend.r3_pose_graph import load_pose_graph_summary
+    from backend.r3_pose_graph import (
+        R3_ABSOLUTE_POSE_SPACE,
+        R3_CONFIDENCE_SEMANTICS,
+        R3_POSE_ENCODING,
+        R3_POSE_GRAPH_SCHEMA_VERSION,
+        R3_RELATIVE_TRANSFORM_CONVENTION,
+        load_pose_graph_summary,
+    )
 
 try:
     from r3_pose_graph_optimizer import (
@@ -298,6 +312,19 @@ def _probe_video_frame_timestamps(video_path: str) -> tuple[list[float | None], 
     }
 
 
+def resolve_extraction_stride(
+    source_fps: float,
+    requested_frame_stride: int,
+    *,
+    long_video: bool,
+    long_target_fps: float,
+) -> int:
+    requested = max(1, int(requested_frame_stride or 1))
+    if long_video and source_fps > 0 and long_target_fps > 0:
+        return max(1, int(round(source_fps / long_target_fps)))
+    return requested
+
+
 def extract_frames(
     video_path: str,
     output_dir: str,
@@ -344,7 +371,17 @@ def extract_frames(
     segmented_selection = bool(segmented_long and long_video_selection)
     continuous_selection = bool(continuous_long and long_video_selection and not segmented_selection)
     if long_video_selection and fps > 0 and long_target_fps > 0:
-        frame_stride = max(requested_frame_stride, int(round(fps / long_target_fps)))
+        # Long-video quality is governed by the explicit target FPS. The API's
+        # historical frame_stride=5 default would otherwise cap a 30 FPS video
+        # at 6 FPS even when production asks for 8 FPS, dropping useful turn
+        # overlap. Keep the request in diagnostics but do not let that stale
+        # short-video throttle reduce long-route temporal coverage.
+        frame_stride = resolve_extraction_stride(
+            fps,
+            requested_frame_stride,
+            long_video=True,
+            long_target_fps=long_target_fps,
+        )
     else:
         frame_stride = requested_frame_stride
     # R3's native long mode has bounded memory and needs one continuous frame
@@ -380,9 +417,10 @@ def extract_frames(
     })
 
     selected_list = sorted(selected_indices)
-    saved_source_indices = []
-    saved_source_timestamps = []
-    saved_count = 0
+    selected_order = {source_idx: order for order, source_idx in enumerate(selected_list)}
+    saved_records: dict[int, float | None] = {}
+    actual_source_by_target: dict[int, int] = {}
+    recovered_source_indices: list[int] = []
     probed_timestamps, timestamp_probe = _probe_video_frame_timestamps(video_path)
 
     def source_timestamp(source_idx: int) -> float | None:
@@ -394,6 +432,20 @@ def extract_frames(
             return float(source_idx / fps)
         return None
 
+    def save_selected_frame(
+        target_source_idx: int,
+        frame,
+        *,
+        actual_source_idx: int | None = None,
+    ) -> None:
+        order = selected_order[target_source_idx]
+        out_path = frames_dir / f"frame_{order:06d}.jpg"
+        if not cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85]):
+            return
+        actual = int(target_source_idx if actual_source_idx is None else actual_source_idx)
+        saved_records[int(target_source_idx)] = source_timestamp(actual)
+        actual_source_by_target[int(target_source_idx)] = actual
+
     # For long MJPEG AVI files, sequential OpenCV decoding can stop early on
     # some FFmpeg builds. Seeking the selected source frames preserves full
     # video coverage when we intentionally sample across the whole route.
@@ -404,11 +456,7 @@ def extract_frames(
             ret, frame = cap.read()
             if not ret:
                 continue
-            out_path = frames_dir / f"frame_{saved_count:06d}.jpg"
-            cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            saved_source_indices.append(int(source_idx))
-            saved_source_timestamps.append(source_timestamp(int(source_idx)))
-            saved_count += 1
+            save_selected_frame(int(source_idx), frame)
     else:
         frame_idx = 0
         while True:
@@ -416,16 +464,51 @@ def extract_frames(
             if not ret:
                 break
             if frame_idx in selected_indices:
-                out_path = frames_dir / f"frame_{saved_count:06d}.jpg"
-                cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                saved_source_indices.append(int(frame_idx))
-                saved_source_timestamps.append(source_timestamp(int(frame_idx)))
-                saved_count += 1
-                if max_frames > 0 and saved_count >= len(selected_indices):
+                save_selected_frame(int(frame_idx), frame)
+                if max_frames > 0 and len(saved_records) >= len(selected_indices):
                     break
             frame_idx += 1
 
     cap.release()
+
+    # A long AVI can report its complete frame count and still stop sequential
+    # decoding hundreds of seconds before EOF. Recover only the missing
+    # selected frames by index, keeping the output numbering in source order.
+    missing_source_indices = [
+        source_idx for source_idx in selected_list if source_idx not in saved_records
+    ]
+    if missing_source_indices and long_video_selection:
+        recovery_cap = cv2.VideoCapture(video_path)
+        if recovery_cap.isOpened():
+            for source_idx in missing_source_indices:
+                lookback = max(8, int(round(fps * 2.0))) if fps > 0 else 60
+                lower_bound = max(0, source_idx - lookback)
+                ret = False
+                frame = None
+                actual_source_idx = source_idx
+                for candidate in range(source_idx, lower_bound - 1, -1):
+                    recovery_cap.set(cv2.CAP_PROP_POS_FRAMES, int(candidate))
+                    ret, frame = recovery_cap.read()
+                    if ret:
+                        actual_source_idx = candidate
+                        break
+                if not ret:
+                    continue
+                save_selected_frame(
+                    int(source_idx),
+                    frame,
+                    actual_source_idx=int(actual_source_idx),
+                )
+                if source_idx in saved_records:
+                    recovered_source_indices.append(int(source_idx))
+        recovery_cap.release()
+
+    saved_target_indices = [
+        source_idx for source_idx in selected_list if source_idx in saved_records
+    ]
+    saved_source_indices = [actual_source_by_target[source_idx] for source_idx in saved_target_indices]
+    saved_source_timestamps = [saved_records[source_idx] for source_idx in saved_target_indices]
+    saved_count = len(saved_target_indices)
 
     exact_timestamp_count = sum(
         1
@@ -458,9 +541,18 @@ def extract_frames(
         "selected_frames_requested": len(selected_list),
         "saved_frames": saved_count,
         "sampling_mode": sampling_mode,
-        "extraction_mode": "seek_selected" if use_seek_sampling else "sequential",
+        "extraction_mode": (
+            "seek_selected"
+            if use_seek_sampling
+            else "sequential_plus_seek_recovery"
+            if recovered_source_indices
+            else "sequential"
+        ),
+        "recovered_frames": len(recovered_source_indices),
+        "missing_frames": len(selected_list) - saved_count,
         "source_frame_min": min(saved_source_indices) if saved_source_indices else None,
         "source_frame_max": max(saved_source_indices) if saved_source_indices else None,
+        "requested_source_indices": selected_list,
         "source_indices": saved_source_indices,
         "source_timestamps_seconds": saved_source_timestamps,
         "timestamp_source": timestamp_source,
@@ -655,6 +747,8 @@ def _merge_segment_artifacts(
     global_indices: list[int],
     merged_poses: dict[int, object],
     merged_confidence,
+    *,
+    scale_prior: float | None = None,
 ) -> dict:
     """Align and copy one R3 segment into the combined output namespace."""
     import numpy as np
@@ -681,6 +775,7 @@ def _merge_segment_artifacts(
         local_poses,
         global_indices,
         merged_poses,
+        scale_prior=scale_prior,
     )
 
     for name in ("camera", "depth", "conf", "color"):
@@ -743,6 +838,136 @@ def _merge_segment_artifacts(
     }
 
 
+def _read_segment_pose_graph(
+    segment_output: Path,
+    global_indices: list[int],
+    scale: float,
+) -> dict[str, object] | None:
+    """Map one segment's measured relative edges into global frame indices."""
+    import numpy as np
+
+    path = segment_output / "pose_graph_edges.npz"
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as payload:
+            frame_i = np.asarray(payload["frame_i"], dtype=np.int64).reshape(-1)
+            frame_j = np.asarray(payload["frame_j"], dtype=np.int64).reshape(-1)
+            rel_pose = np.asarray(payload["rel_pose_enc"], dtype=np.float32)
+            confidence = np.asarray(payload["confidence"], dtype=np.float32).reshape(-1)
+            confidence_t = np.asarray(payload["confidence_t"], dtype=np.float32).reshape(-1)
+            confidence_r = np.asarray(payload["confidence_r"], dtype=np.float32).reshape(-1)
+            edge_type = np.asarray(payload["edge_type"], dtype=np.uint8).reshape(-1)
+    except Exception:
+        return None
+
+    count = len(frame_i)
+    if (
+        rel_pose.shape != (count, 9)
+        or any(len(values) != count for values in (frame_j, confidence, confidence_t, confidence_r, edge_type))
+    ):
+        return None
+    valid = (
+        (frame_i >= 0)
+        & (frame_j >= 0)
+        & (frame_i < len(global_indices))
+        & (frame_j < len(global_indices))
+        & (frame_i != frame_j)
+        & np.isfinite(rel_pose).all(axis=1)
+    )
+    if not valid.any():
+        return None
+    frame_i = frame_i[valid]
+    frame_j = frame_j[valid]
+    scaled_rel_pose = rel_pose[valid].copy()
+    # A world Sim(3) changes relative translation scale but its common world
+    # rotation/translation cancels between the two camera frames.
+    scaled_rel_pose[:, :3] *= float(scale)
+    quaternion_norm = np.linalg.norm(scaled_rel_pose[:, 3:7], axis=1)
+    usable_quaternion = np.isfinite(quaternion_norm) & (quaternion_norm > 1e-8)
+    if not usable_quaternion.all():
+        frame_i = frame_i[usable_quaternion]
+        frame_j = frame_j[usable_quaternion]
+        scaled_rel_pose = scaled_rel_pose[usable_quaternion]
+        confidence = confidence[valid][usable_quaternion]
+        confidence_t = confidence_t[valid][usable_quaternion]
+        confidence_r = confidence_r[valid][usable_quaternion]
+        edge_type = edge_type[valid][usable_quaternion]
+        quaternion_norm = quaternion_norm[usable_quaternion]
+    else:
+        confidence = confidence[valid]
+        confidence_t = confidence_t[valid]
+        confidence_r = confidence_r[valid]
+        edge_type = edge_type[valid]
+    scaled_rel_pose[:, 3:7] /= quaternion_norm[:, None]
+    index_array = np.asarray(global_indices, dtype=np.int32)
+    return {
+        "frame_i": index_array[frame_i],
+        "frame_j": index_array[frame_j],
+        "rel_pose_enc": scaled_rel_pose,
+        "confidence": confidence,
+        "confidence_t": confidence_t,
+        "confidence_r": confidence_r,
+        "edge_type": edge_type,
+    }
+
+
+def _save_merged_pose_graph(
+    combined_output: Path,
+    parts: list[dict[str, object]],
+) -> int:
+    """Persist a connected pose graph spanning every overlapping segment."""
+    import numpy as np
+
+    if not parts:
+        return 0
+    names = (
+        "frame_i",
+        "frame_j",
+        "rel_pose_enc",
+        "confidence",
+        "confidence_t",
+        "confidence_r",
+        "edge_type",
+    )
+    merged = {
+        name: np.concatenate([np.asarray(part[name]) for part in parts], axis=0)
+        for name in names
+    }
+    # Overlap windows export some identical measurements twice. Keep the
+    # highest-confidence copy so overlap does not receive artificial weight.
+    best_by_key: dict[tuple[int, int, int], int] = {}
+    for index, (left, right, kind, confidence) in enumerate(zip(
+        merged["frame_i"],
+        merged["frame_j"],
+        merged["edge_type"],
+        merged["confidence"],
+    )):
+        key = (int(left), int(right), int(kind))
+        previous = best_by_key.get(key)
+        if previous is None or float(confidence) > float(merged["confidence"][previous]):
+            best_by_key[key] = index
+    keep = np.asarray(sorted(best_by_key.values()), dtype=np.int64)
+    for name in names:
+        merged[name] = merged[name][keep]
+    count = len(keep)
+    np.savez_compressed(
+        combined_output / "pose_graph_edges.npz",
+        schema_version=np.asarray([R3_POSE_GRAPH_SCHEMA_VERSION], dtype=np.int32),
+        pose_encoding=np.asarray(R3_POSE_ENCODING),
+        transform_convention=np.asarray(R3_RELATIVE_TRANSFORM_CONVENTION),
+        frame_index_space=np.asarray("exported_camera_index"),
+        absolute_pose_space=np.asarray(R3_ABSOLUTE_POSE_SPACE),
+        confidence_semantics=np.asarray(R3_CONFIDENCE_SEMANTICS),
+        edge_type_names=np.asarray(["normal", "bridge", "anchor", "unknown"]),
+        edge_sequence=np.arange(count, dtype=np.int64),
+        model_frame_i=merged["frame_i"].astype(np.int64),
+        model_frame_j=merged["frame_j"].astype(np.int64),
+        **merged,
+    )
+    return count
+
+
 def run_r3_inference_segmented(
     frames_dir: str,
     output_dir: str,
@@ -766,6 +991,7 @@ def run_r3_inference_segmented(
     segments_root.mkdir(parents=True, exist_ok=True)
     merged_poses: dict[int, np.ndarray] = {}
     merged_confidence = np.full(len(source_frames), np.nan, dtype=np.float64)
+    segment_scales: list[float] = []
     manifest: dict = {
         "enabled": True,
         "total_selected_frames": len(source_frames),
@@ -774,6 +1000,7 @@ def run_r3_inference_segmented(
         "segments": [],
     }
     first_run_params: dict = {}
+    pose_graph_parts: list[dict[str, object]] = []
     keep_segments = (os.getenv("R3_KEEP_SEGMENT_OUTPUTS") or "false").lower() in {"1", "true", "yes", "on"}
 
     for window in windows:
@@ -840,7 +1067,19 @@ def run_r3_inference_segmented(
             global_indices,
             merged_poses,
             merged_confidence,
+            scale_prior=(
+                float(np.median(segment_scales[-3:]))
+                if segment_scales else None
+            ),
         )
+        segment_scales.append(float(stitch.get("scale") or 1.0))
+        pose_graph_part = _read_segment_pose_graph(
+            resolved_output,
+            global_indices,
+            float(stitch.get("scale") or 1.0),
+        )
+        if pose_graph_part is not None:
+            pose_graph_parts.append(pose_graph_part)
         new_global_indices = sorted(set(merged_poses) - previously_merged)
         for batch_start in range(0, len(new_global_indices), 100):
             batch_indices = new_global_indices[batch_start:batch_start + 100]
@@ -870,6 +1109,10 @@ def run_r3_inference_segmented(
 
     if np.isfinite(merged_confidence).any():
         np.save(combined_output / "pose_conf.npy", merged_confidence.astype(np.float32))
+    manifest["pose_graph_edges"] = _save_merged_pose_graph(
+        combined_output,
+        pose_graph_parts,
+    )
     manifest["merged_poses"] = len(merged_poses)
     (combined_output / "segment_manifest.json").write_text(
         json.dumps(sanitize_json(manifest), ensure_ascii=False, indent=2),
@@ -1012,6 +1255,26 @@ def run_r3_inference_live(frames_dir: str, output_dir: str, camera_dir: Path,
             emit("warning", {"message": f"failed to stamp live run params: {exc}"})
 
     return output_dir
+
+
+def resolve_long_execution_policy(mode: str) -> tuple[bool, bool, str]:
+    """Resolve the production long-video execution strategy.
+
+    R3's own long mode keeps one global keyframe bank and pose graph. The old
+    R3_ENABLE_EXTERNAL_SEGMENTATION flag ran independent models and then joined
+    them with pairwise Sim(3), which discards global loop edges. Keep that
+    implementation available only behind the new, explicit experimental
+    policy so stale service environments cannot silently re-enable it.
+    """
+    long_mode = (mode or "").lower() in {"long", "strided", "sampled", "sparse"}
+    if not long_mode:
+        return False, False, "short"
+    requested = (
+        os.getenv("R3_LONG_EXECUTION_POLICY") or "segmented_pose_graph"
+    ).strip().lower()
+    if requested in {"continuous", "continuous_experimental"}:
+        return True, False, "continuous_experimental"
+    return False, True, "segmented_pose_graph"
 
 
 def find_r3_output_dir(output_path: Path) -> Path:
@@ -1430,21 +1693,14 @@ def main():
 
     emit("start", {"video": args.video_path, "live": args.live})
 
-    long_mode = args.mode.lower() in {"long", "strided", "sampled", "sparse"}
-    # R3 is already a bounded-memory long/streaming model.  External
-    # independent segmentation loses the global keyframe bank and loop
-    # re-registration, so it is now an explicit experimental opt-in.  The new
-    # variable intentionally ignores stale R3_SEGMENTED_LONG=true values.
-    segmented_enabled = bool(
-        long_mode
-        and (os.getenv("R3_ENABLE_EXTERNAL_SEGMENTATION") or "false").lower()
-        in {"1", "true", "yes", "on"}
+    continuous_long_enabled, segmented_enabled, long_execution_policy = (
+        resolve_long_execution_policy(args.mode)
     )
-    continuous_long_enabled = bool(
-        long_mode
-        and (os.getenv("R3_CONTINUOUS_LONG") or "true").lower()
-        in {"1", "true", "yes", "on"}
-    )
+    emit("r3_long_execution_policy", {
+        "policy": long_execution_policy,
+        "continuous_long": continuous_long_enabled,
+        "external_segmentation": segmented_enabled,
+    })
     segment_min_duration = float(
         os.getenv(
             "R3_LONG_MIN_DURATION_SECONDS",
@@ -1476,8 +1732,21 @@ def main():
             frame_selection = json.loads(selection_path.read_text())
         except Exception:
             frame_selection = {}
-    segment_frames = max(256, int(os.getenv("R3_SEGMENT_FRAMES", str(args.max_frames or 1500))))
-    overlap_frames = max(16, int(os.getenv("R3_SEGMENT_OVERLAP_FRAMES", "90")))
+    selected_fps = 0.0
+    try:
+        selected_fps = float(frame_selection.get("fps") or 0.0) / max(
+            1, int(frame_selection.get("frame_stride") or 1)
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        selected_fps = max(1.0, long_target_fps)
+    segment_seconds = max(180.0, min(300.0, float(
+        os.getenv("R3_LONG_SEGMENT_SECONDS", "240")
+    )))
+    overlap_seconds = max(15.0, min(60.0, float(
+        os.getenv("R3_LONG_SEGMENT_OVERLAP_SECONDS", "30")
+    )))
+    segment_frames = max(256, int(round(selected_fps * segment_seconds)))
+    overlap_frames = max(16, int(round(selected_fps * overlap_seconds)))
     use_segmented = bool(frame_selection.get("segmented_long") and num_frames > segment_frames)
     inference_max_frames = 0 if frame_selection.get("long_video_sampling") else args.max_frames
     inference_mode = "long" if frame_selection.get("continuous_long") else args.mode
@@ -1488,7 +1757,7 @@ def main():
             frames_dir,
             args.output_dir,
             args.ckpt,
-            args.mode,
+            "long",
             args.size,
             segment_frames,
             overlap_frames,

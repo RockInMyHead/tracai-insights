@@ -60,24 +60,6 @@ app = FastAPI(title="TrackAI Video Analysis API", version="1.0.0")
 processing_status = {}
 convert_dwg_status: Dict[str, Dict] = {}
 
-# Every state in which a fresh result is still being produced.  Keep this in
-# one place: omitting ``lingbot_fusion`` here previously made /api/status load
-# an older analysis file and report 100% while the new run was still at 92%.
-ANALYSIS_BUSY_STATUSES = {
-    "queued",
-    "processing",
-    "uploading_to_gpu",
-    "gpu_processing",
-    "running",
-    "lingbot_queued",
-    "lingbot_running",
-    "lingbot_fusion",
-}
-
-
-def _analysis_status_is_busy(value: Any) -> bool:
-    return str(value or "").strip().lower() in ANALYSIS_BUSY_STATUSES
-
 # Employee batch scheduling
 EMPLOYEE_BATCH_TS: Dict[str, float] = {}
 BATCH_WAIT_SECONDS = 1  # минимальная задержка — обработка начинается почти мгновенно
@@ -91,9 +73,7 @@ LINGBOT_FUSION_ENABLED = os.getenv("LINGBOT_FUSION_ENABLED", "true").strip().low
 LINGBOT_FUSION_TARGET_FRAMES = int(os.getenv("LINGBOT_FUSION_TARGET_FRAMES", "3000"))
 LINGBOT_FUSION_KEYFRAME_INTERVAL = int(os.getenv("LINGBOT_FUSION_KEYFRAME_INTERVAL", "6"))
 LINGBOT_FUSION_TIMEOUT_SECONDS = int(
-    # LingBot is a non-fatal shadow observer.  R3 must still be published if
-    # the worker loses a session; do not hold a completed R3 run for 3 hours.
-    os.getenv("LINGBOT_FUSION_TIMEOUT_SECONDS", str(30 * 60))
+    os.getenv("LINGBOT_FUSION_TIMEOUT_SECONDS", str(3 * 60 * 60))
 )
 
 #
@@ -262,7 +242,6 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
     """If analysis is already on disk / DB-completed, expose it even after restart."""
     analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
     db_completed = False
-    db_busy = False
     try:
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
@@ -270,18 +249,10 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
             (video_id,),
         ).fetchone()
         conn.close()
-        if row:
-            db_state = str(row[0] or "").lower()
-            db_completed = db_state in {"completed", "done", "success"}
-            db_busy = _analysis_status_is_busy(db_state)
+        if row and str(row[0]).lower() in {"completed", "done", "success"}:
+            db_completed = True
     except Exception:
         db_completed = False
-        db_busy = False
-    # A previous JSON may still exist while a forced re-run is active.  Never
-    # present it as the result of the fresh run, including after a backend
-    # restart where the in-memory progress dictionary has been lost.
-    if db_busy:
-        return None
     if not analysis_file.exists() and not db_completed:
         return None
     if not analysis_file.exists():
@@ -634,13 +605,19 @@ def _parse_json_field(value: Any, default: Any = None) -> Any:
 
 
 def _extract_map_context(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Re-analysis payloads commonly contain only ``floorplan_id``.  Do not
+    # turn absent keys into explicit nulls: doing so erased the durable map
+    # anchor saved by the original upload and made an otherwise valid mask
+    # fail with ``missing_start_or_direction``.  Explicit null is still kept
+    # when a UI intentionally sends the key to clear an anchor.
     map_context = {
         "floorplan_id": payload.get("floorplan_id") or DEFAULT_FLOORPLAN_ID,
-        "floor_plan_data": payload.get("floor_plan_data"),
-        "drawn_plan": _parse_json_field(payload.get("drawn_plan")),
-        "reference_point": _parse_json_field(payload.get("reference_point")),
-        "direction_point": _parse_json_field(payload.get("direction_point")),
     }
+    if "floor_plan_data" in payload:
+        map_context["floor_plan_data"] = payload.get("floor_plan_data")
+    for key in ("drawn_plan", "reference_point", "direction_point"):
+        if key in payload:
+            map_context[key] = _parse_json_field(payload.get(key))
     return map_context
 
 
@@ -1874,6 +1851,7 @@ def _lingbot_to_trackai_result(
                 if isinstance(pose, dict) and isinstance(pose.get("c2w"), list):
                     camera_poses.append({
                         "frame_idx": pose.get("frame_idx", len(trajectory) - 1),
+                        "source_frame_idx": pose.get("source_frame_idx"),
                         "c2w": pose.get("c2w"),
                         "confidence": confidence_value,
                         "timestamp": timestamp_value,
@@ -1927,6 +1905,11 @@ def _lingbot_to_trackai_result(
         "lingbot_pose_confidence": pose_confidence,
         "lingbot_source_timestamps_seconds": source_timestamps_seconds,
         "source_timestamps_seconds": source_timestamps_seconds,
+        "lingbot_frame_selection": (
+            trajectory_payload.get("frame_selection", {})
+            if isinstance(trajectory_payload, dict)
+            else {}
+        ),
         "processing_stats": {
             "algorithm": "LingBot-Map",
             "session_id": session_id,
@@ -2077,7 +2060,15 @@ async def get_video_status(video_id: str):
 
     live = processing_status.get(video_id)
     live_state = str((live or {}).get("status") or "").lower()
-    live_busy = _analysis_status_is_busy(live_state)
+    live_busy = live_state in {
+        "queued",
+        "processing",
+        "uploading_to_gpu",
+        "gpu_processing",
+        "running",
+        "lingbot_queued",
+        "lingbot_running",
+    }
     # A stale in-memory payload (often with a non-serializable prior result)
     # must not block a finished analysis after restart / re-open.
     if not live_busy:

@@ -6,7 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Video, MapPin, Activity, Clock, Navigation, Loader2, User, X, Plus, FolderOpen, Eye } from "lucide-react";
 import { toast } from "sonner";
 import { apiClient, R3TrajectorySource, VideoAnalysisResult, VideoListItem } from "@/lib/api";
@@ -1181,6 +1181,9 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
               <DialogContent className="max-w-md max-h-[80vh] flex flex-col">
                 <DialogHeader>
                   <DialogTitle>Выбрать из загруженных видео</DialogTitle>
+                  <DialogDescription>
+                    Выберите ранее загруженное видео для текущего сотрудника.
+                  </DialogDescription>
                 </DialogHeader>
                 <p className="text-sm text-muted-foreground">
                   Сотрудник: <strong>{currentOwnerName || '— введите выше'}</strong>

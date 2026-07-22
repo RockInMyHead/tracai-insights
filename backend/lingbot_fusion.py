@@ -22,6 +22,7 @@ from typing import Any, Optional
 import numpy as np
 
 METHOD_TAG = "robust_similarity_confidence_blend_v4_progress_guard"
+INDEPENDENT_MIN_NET_PROGRESS_RATIO = 0.55
 
 
 def _finite_points(value: Any) -> np.ndarray:
@@ -285,7 +286,7 @@ def _independent_quality(
         reasons.append("nonplanar_motion")
     if method in {"unavailable", "pca_failed"}:
         reasons.append("projection_unavailable")
-    if net_progress_ratio < 0.64 and not loop_closure_verified:
+    if net_progress_ratio < INDEPENDENT_MIN_NET_PROGRESS_RATIO and not loop_closure_verified:
         reasons.append("insufficient_net_progress")
     return {
         "accepted": not reasons,
@@ -302,6 +303,112 @@ def _independent_quality(
         "secondary_condition": round(condition, 8),
         "plane_energy_ratio": round(plane_ratio, 8),
     }
+
+
+def _extract_global_motion_trend(
+    points: np.ndarray,
+    timestamps: Optional[np.ndarray],
+) -> tuple[np.ndarray, Optional[np.ndarray], dict[str, Any]]:
+    """Suppress stationary pose jitter while preserving plant-wide motion.
+
+    Long inspection videos contain many seconds where the operator stands or
+    rotates in place. Monocular frame poses then accumulate a large fake path
+    length. Robust 30-second block medians followed by a bounded 3–5 minute
+    mean recover the global translation trend. No plan or reference route is
+    used, and endpoints remain exact.
+    """
+    source = np.asarray(points, dtype=np.float64)
+    diagnostics: dict[str, Any] = {
+        "method": "robust_30s_blocks_bounded_5min_trend_v1",
+        "applied": False,
+        "input_points": int(len(source)),
+    }
+    if len(source) < 21:
+        return source, timestamps, diagnostics
+
+    valid_clock = (
+        timestamps is not None
+        and len(timestamps) == len(source)
+        and np.isfinite(timestamps).all()
+        and np.all(np.diff(timestamps) > 0.0)
+    )
+    blocks: list[np.ndarray] = []
+    block_times: list[float] = []
+    if valid_clock:
+        clock = np.asarray(timestamps, dtype=np.float64)
+        start_time = float(clock[0])
+        end_time = float(clock[-1])
+        boundaries = np.arange(start_time, end_time + 30.0, 30.0)
+        if boundaries[-1] <= end_time:
+            boundaries = np.append(boundaries, end_time + 1e-6)
+        for left, right in zip(boundaries[:-1], boundaries[1:]):
+            indices = np.flatnonzero((clock >= left) & (clock < right))
+            if len(indices) == 0:
+                continue
+            blocks.append(np.median(source[indices], axis=0))
+            block_times.append(float(np.median(clock[indices])))
+    else:
+        block_size = max(5, int(math.ceil(len(source) / 50.0)))
+        for left in range(0, len(source), block_size):
+            right = min(len(source), left + block_size)
+            blocks.append(np.median(source[left:right], axis=0))
+
+    coarse = np.asarray(blocks, dtype=np.float64)
+    if len(coarse) < 7:
+        return source, timestamps, diagnostics
+    # A 3--5 minute mean is useful while the camera is stationary, but it can
+    # also cut across several real aisle turns.  Pick the widest odd window
+    # that preserves the coarse (already robust, 30-second median) path
+    # length.  This keeps the filter scale-neutral in practice as well as in
+    # name: a long inspection may be smoothed, never collapsed into a chord.
+    requested_smooth_blocks = min(9, max(3, int(len(coarse) // 5)))
+    if requested_smooth_blocks % 2 == 0:
+        requested_smooth_blocks -= 1
+    coarse[0] = source[0]
+    coarse[-1] = source[-1]
+    coarse_length = _polyline_length(coarse)
+    minimum_retained_length_ratio = 0.72
+    trend = coarse.copy()
+    smooth_blocks = 1
+    for window in range(requested_smooth_blocks, 1, -2):
+        candidate = np.column_stack([
+            np.convolve(
+                np.pad(coarse[:, axis], window // 2, mode="edge"),
+                np.full(window, 1.0 / window),
+                mode="valid",
+            )
+            for axis in range(2)
+        ])
+        candidate[0] = source[0]
+        candidate[-1] = source[-1]
+        retained_ratio = _polyline_length(candidate) / max(coarse_length, 1e-12)
+        if retained_ratio >= minimum_retained_length_ratio:
+            trend = candidate
+            smooth_blocks = window
+            break
+    trend_timestamps: Optional[np.ndarray] = None
+    if valid_clock:
+        trend_timestamps = np.asarray(block_times, dtype=np.float64)
+        trend_timestamps[0] = float(timestamps[0])
+        trend_timestamps[-1] = float(timestamps[-1])
+    diagnostics.update({
+        "applied": True,
+        "output_points": int(len(trend)),
+        "block_seconds": 30.0 if valid_clock else None,
+        "coarse_length": round(coarse_length, 8),
+        "requested_smoothing_blocks": int(requested_smooth_blocks),
+        "smoothing_blocks": int(smooth_blocks),
+        "smoothing_seconds": float(smooth_blocks * 30.0) if valid_clock else None,
+        "raw_length": round(_polyline_length(source), 8),
+        "trend_length": round(_polyline_length(trend), 8),
+        "coarse_length_retained_ratio": round(
+            _polyline_length(trend) / max(coarse_length, 1e-12), 8
+        ),
+        "minimum_retained_length_ratio": minimum_retained_length_ratio,
+        "endpoint_preserved": True,
+        "scale_changed": False,
+    })
+    return trend, trend_timestamps, diagnostics
 
 
 def _weighted_similarity(
@@ -457,7 +564,6 @@ def build_lingbot_fusion_candidate(
     """Return a guarded fusion candidate in the R3 plan coordinate system."""
     r3 = _finite_points(r3_result.get("plan_trajectory") or r3_result.get("trajectory"))
     lingbot, projection = _lingbot_plan_projection(lingbot_result)
-    quality = _independent_quality(lingbot, projection)
     r3_timestamps = _finite_timestamps(
         r3_result.get("r3_source_timestamps_seconds")
         or r3_result.get("source_timestamps_seconds")
@@ -466,12 +572,18 @@ def build_lingbot_fusion_candidate(
         lingbot_result.get("lingbot_source_timestamps_seconds")
         or lingbot_result.get("source_timestamps_seconds")
     )
+    lingbot, lingbot_timestamps, trend = _extract_global_motion_trend(
+        lingbot,
+        lingbot_timestamps,
+    )
+    quality = _independent_quality(lingbot, projection)
     diagnostics: dict[str, Any] = {
         "method": METHOD_TAG,
         "accepted": False,
         "r3_points": int(len(r3)),
         "lingbot_points": int(len(lingbot)),
         "lingbot_projection": projection,
+        "lingbot_global_trend": trend,
         "independent_quality": quality,
         "selected_sign": 1.0,
         "reflection_applied": False,

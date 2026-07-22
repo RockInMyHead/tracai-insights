@@ -28,9 +28,6 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.kerama_reference_route import apply_reference_route_overrides
-
-
 PUBLIC = ROOT / "public" / "floorplans"
 BACKEND = ROOT / "backend" / "assets" / "floorplans"
 MAP_ID = "kerama_marazzi_2025"
@@ -72,6 +69,66 @@ def main() -> None:
         ids, sizes = np.unique(labels, return_counts=True)
         keep = ids[(ids != 0) & (sizes >= 20)]
         mask = np.isin(labels, keep)
+        # The free-space engine adds a physical 0.28 m safety halo later.
+        # Keeping the full antialiased brush fringe here applies the boundary
+        # margin twice and can close a visibly green doorway.  Remove only two
+        # raster pixels from annotation edges; filled machines remain intact
+        # and regain the physical halo during grid construction.
+        red_boundary_cleanup_pixels = 2
+        mask = ndimage.binary_erosion(
+            mask,
+            iterations=red_boundary_cleanup_pixels,
+        )
+
+        # Green operator paint is the positive counterpart of the red no-go
+        # annotation: it marks verified walkable floor even when the original
+        # CAD flood-fill classified that area as exterior or as a separate
+        # island.  Isolate only newly added green pixels so native green CAD
+        # layers cannot accidentally make machinery walkable.  A small close
+        # and dilation bridge antialiasing/text holes in the painted corridor;
+        # the red obstacle mask is still applied afterwards and therefore has
+        # final authority wherever the annotations overlap.
+        green = (
+            (marked[:, :, 1] > 190)
+            & (marked[:, :, 0] < 130)
+            & (marked[:, :, 2] < 130)
+        )
+        original_green = (
+            (original[:, :, 1] > 190)
+            & (original[:, :, 0] < 130)
+            & (original[:, :, 2] < 130)
+        )
+        green_seed = green & changed & ~original_green
+        green_labels, _ = ndimage.label(green_seed)
+        green_ids, green_sizes = np.unique(green_labels, return_counts=True)
+        green_keep = green_ids[(green_ids != 0) & (green_sizes >= 20)]
+        green_mask = np.isin(green_labels, green_keep)
+        # Operator paint is intentionally rough.  Convert it into a regular
+        # passage network instead of preserving every brush notch: close gaps
+        # smaller than about one metre, remove isolated edge whiskers, and add
+        # enough width for the downstream 0.28 m person-radius inflation.  No
+        # route coordinates are involved in this operation.
+        green_support_close_pixels = 10
+        green_support_open_pixels = 3
+        green_support_dilation_pixels = 6
+
+        def disk(radius: int) -> np.ndarray:
+            axis = np.arange(-radius, radius + 1)
+            yy, xx = np.meshgrid(axis, axis, indexing="ij")
+            return xx * xx + yy * yy <= radius * radius
+
+        green_support = ndimage.binary_closing(
+            green_mask,
+            structure=disk(green_support_close_pixels),
+        )
+        green_support = ndimage.binary_opening(
+            green_support,
+            structure=disk(green_support_open_pixels),
+        )
+        green_support = ndimage.binary_dilation(
+            green_support,
+            iterations=green_support_dilation_pixels,
+        )
 
         display_path = PUBLIC / "kerama-marazzi-2025.png"
         marked_image.save(display_path, optimize=True)
@@ -103,16 +160,21 @@ def main() -> None:
             blank_labels[:, -1],
         )))
         exterior = np.isin(blank_labels, border_labels)
-        support = ~exterior
+        # Positive-only walkability: CAD enclosures describe rooms,
+        # equipment, roofs and site boundaries, not traversable floor.  The
+        # previous ``~exterior`` union silently made every enclosed polygon a
+        # legal route and let A* escape through machinery or along the outer
+        # site contour.  Only the operator's green annotation is affirmative
+        # evidence of a corridor.  Red remains a hard obstacle in the engine.
+        green_corridor_margin_pixels = 24
+        support = ndimage.binary_dilation(
+            green_support,
+            iterations=green_corridor_margin_pixels,
+        )
         meters_per_pixel = math.sqrt(
             OFFICE_AREA_M2
             / ((OFFICE_INTERIOR[2] - OFFICE_INTERIOR[0])
                * (OFFICE_INTERIOR[3] - OFFICE_INTERIOR[1]))
-        )
-        mask, support, reference_override = apply_reference_route_overrides(
-            mask,
-            support,
-            meters_per_pixel=meters_per_pixel,
         )
         Image.fromarray((mask * 255).astype(np.uint8)).save(
             obstacle_path, optimize=True
@@ -145,10 +207,11 @@ def main() -> None:
         "support_mask_file": support_path.name,
         "support_mask_sha256": hashlib.sha256(support_path.read_bytes()).hexdigest(),
         "support_mask_generation": {
-            "method": "page_exterior_flood_fill",
+            "method": "positive_green_corridors_only",
             "ink_threshold": 242,
             "barrier_dilation_pixels": support_barrier_dilation_pixels,
             "coverage_ratio": float(support.mean()),
+            "green_corridor_margin_pixels": green_corridor_margin_pixels,
         },
         "source_pdf_sha256": hashlib.sha256(source_pdf.read_bytes()).hexdigest(),
         "display_image_sha256": hashlib.sha256(display_path.read_bytes()).hexdigest(),
@@ -156,7 +219,26 @@ def main() -> None:
         "display_image": display_path.name,
         "annotation_component_count": int(len(keep)),
         "annotation_pixel_count": int(mask.sum()),
-        "reference_mask": reference_override,
+        "obstacle_annotation": {
+            "method": "changed_red_operator_annotation",
+            "boundary_cleanup_pixels": red_boundary_cleanup_pixels,
+            "physical_person_halo_applied_by_engine": True,
+        },
+        "walkable_annotation": {
+            "method": "changed_green_operator_annotation",
+            "component_count": int(len(green_keep)),
+            "pixel_count": int(green_mask.sum()),
+            "support_pixels_added": int(np.count_nonzero(green_support)),
+            "closing_pixels": green_support_close_pixels,
+            "opening_pixels": green_support_open_pixels,
+            "dilation_pixels": green_support_dilation_pixels,
+            "red_obstacles_take_precedence": True,
+            "route_specific_overrides": False,
+        },
+        "reference_mask": {
+            "method": "none",
+            "route_specific_overrides": False,
+        },
     }
     (BACKEND / f"{MAP_ID}.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

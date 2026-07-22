@@ -55,6 +55,9 @@ def _project_rotation(matrix: np.ndarray) -> np.ndarray:
 def estimate_pose_similarity(
     global_poses: Sequence[np.ndarray],
     local_poses: Sequence[np.ndarray],
+    *,
+    scale_prior: float | None = None,
+    maximum_relative_scale_change: float = 1.25,
 ) -> tuple[np.ndarray, float, np.ndarray, dict[str, float | int]]:
     """Estimate global_t = scale * rotation @ local_t + translation.
 
@@ -84,10 +87,21 @@ def estimate_pose_similarity(
             global_distance = float(np.linalg.norm(global_points[right] - global_points[left]))
             if local_distance > 1e-6 and global_distance > 1e-6:
                 scale_candidates.append(global_distance / local_distance)
-    scale = float(np.median(scale_candidates)) if scale_candidates else 1.0
-    if not np.isfinite(scale) or scale <= 0.0:
-        scale = 1.0
-    # Prevent one weak overlap from catastrophically resizing the remainder.
+    raw_scale = float(np.median(scale_candidates)) if scale_candidates else 1.0
+    if not np.isfinite(raw_scale) or raw_scale <= 0.0:
+        raw_scale = 1.0
+    # Each block is allowed a local scale correction, but a weak overlap must
+    # not resize the entire remaining 25-minute route. Keep the new block near
+    # the robust scale of recent accepted blocks. This is a continuity prior,
+    # not a metric/global rescale of the reconstructed path.
+    scale = raw_scale
+    prior_applied = False
+    if scale_prior is not None and np.isfinite(scale_prior) and scale_prior > 0.0:
+        relative_limit = max(1.01, float(maximum_relative_scale_change))
+        lower = float(scale_prior) / relative_limit
+        upper = float(scale_prior) * relative_limit
+        scale = float(np.clip(scale, lower, upper))
+        prior_applied = not np.isclose(scale, raw_scale)
     scale = float(np.clip(scale, 0.25, 4.0))
 
     offsets = global_points - scale * rotated_local
@@ -97,6 +111,9 @@ def estimate_pose_similarity(
     diagnostics: dict[str, float | int] = {
         "overlap_pairs": len(global_points),
         "scale_candidates": len(scale_candidates),
+        "raw_scale": round(raw_scale, 8),
+        "scale_prior": round(float(scale_prior), 8) if scale_prior is not None else None,
+        "scale_prior_applied": prior_applied,
         "scale": round(scale, 8),
         "median_residual": round(float(np.median(residuals)), 8),
         "max_residual": round(float(np.max(residuals)), 8),
@@ -124,6 +141,8 @@ def align_segment_poses(
     local_poses: Mapping[int, np.ndarray],
     global_indices: Sequence[int],
     merged_poses: Mapping[int, np.ndarray],
+    *,
+    scale_prior: float | None = None,
 ) -> tuple[dict[int, np.ndarray], float, dict[str, float | int]]:
     """Align local segment poses to already merged overlap poses."""
     matched_global: list[np.ndarray] = []
@@ -150,6 +169,7 @@ def align_segment_poses(
         rotation, scale, translation, diagnostics = estimate_pose_similarity(
             matched_global,
             matched_local,
+            scale_prior=scale_prior,
         )
     else:
         # Defensive fallback: preserve local scale and attach the segment's

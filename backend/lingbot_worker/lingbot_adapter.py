@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -69,13 +71,140 @@ class LingBotMapAdapter:
             log.write(f"[lingbot] model={self.model_path}\n")
             log.write(f"[lingbot] input={options.input_video}\n")
 
-            self._run_subprocess(options, log)
+            input_frames, frame_selection = self._prepare_video_frames(options, log)
+            self._run_subprocess(options, log, input_frames=input_frames)
 
-        artifacts = self._normalize_outputs(options.output_dir)
+        artifacts = self._normalize_outputs(options.output_dir, frame_selection=frame_selection)
         artifacts["timings"] = {"total_seconds": round(time.time() - started, 3)}
         return artifacts
 
-    def _run_subprocess(self, options: LingBotRunOptions, log) -> None:
+    def _prepare_video_frames(self, options: LingBotRunOptions, log) -> tuple[Path, Dict[str, Any]]:
+        """Extract a complete, uniformly timed sequence for LingBot.
+
+        LingBot's upstream video loader uses one sequential OpenCV pass. Some
+        long MJPEG AVI files stop decoding before EOF even though their frame
+        table remains seekable. TrackAI extracts the source itself and retries
+        missing selected frames by index so inference never receives a silent
+        prefix of the route.
+        """
+        import cv2
+
+        frames_dir = options.output_dir / "_trackai_input_frames"
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        cap = cv2.VideoCapture(str(options.input_video))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open LingBot input video: {options.input_video}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if total_frames <= 0:
+            cap.release()
+            raise RuntimeError("LingBot input video reports no frames")
+
+        if options.target_frames > 0:
+            count = min(total_frames, int(options.target_frames))
+            selected = np.linspace(0, total_frames - 1, count).round().astype(int).tolist()
+            selected = sorted(set(int(value) for value in selected))
+            sampling_mode = "uniform_full_video"
+        else:
+            stride = max(1, int(round(source_fps / max(1, options.fps)))) if source_fps > 0 else 1
+            selected = list(range(0, total_frames, stride))
+            sampling_mode = "target_fps"
+
+        selected_order = {source_idx: order for order, source_idx in enumerate(selected)}
+        selected_set = set(selected)
+        saved: set[int] = set()
+        actual_source_by_target: dict[int, int] = {}
+
+        def save(target_source_idx: int, frame, *, actual_source_idx: Optional[int] = None) -> None:
+            path = frames_dir / f"frame_{selected_order[target_source_idx]:06d}.jpg"
+            if cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90]):
+                saved.add(target_source_idx)
+                actual_source_by_target[target_source_idx] = int(
+                    target_source_idx if actual_source_idx is None else actual_source_idx
+                )
+
+        source_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if source_idx in selected_set:
+                save(source_idx, frame)
+                if len(saved) == len(selected):
+                    break
+            source_idx += 1
+        cap.release()
+
+        missing = [source_idx for source_idx in selected if source_idx not in saved]
+        recovered: list[int] = []
+        if missing:
+            recovery = cv2.VideoCapture(str(options.input_video))
+            if recovery.isOpened():
+                for source_idx in missing:
+                    # AVI frame tables can overstate the final decodable frame
+                    # by a handful of entries. Prefer the requested frame, then
+                    # walk back at most two seconds to the closest valid one.
+                    lookback = max(8, int(round(source_fps * 2.0))) if source_fps > 0 else 60
+                    ret = False
+                    frame = None
+                    actual_source_idx = source_idx
+                    lower_bound = max(0, source_idx - lookback)
+                    for candidate in range(source_idx, lower_bound - 1, -1):
+                        recovery.set(cv2.CAP_PROP_POS_FRAMES, int(candidate))
+                        ret, frame = recovery.read()
+                        if ret:
+                            actual_source_idx = candidate
+                            break
+                    if not ret:
+                        continue
+                    save(source_idx, frame, actual_source_idx=actual_source_idx)
+                    if source_idx in saved:
+                        recovered.append(source_idx)
+            recovery.release()
+
+        unresolved = [source_idx for source_idx in selected if source_idx not in saved]
+        if unresolved:
+            raise RuntimeError(
+                "LingBot frame extraction did not cover the complete video: "
+                f"saved={len(saved)}/{len(selected)}, missing={len(unresolved)}, "
+                f"first_missing_source_frame={unresolved[0]}"
+            )
+
+        actual_source_indices = [actual_source_by_target[source_idx] for source_idx in selected]
+        timestamps = [
+            float(source_idx / source_fps) if source_fps > 0 else None
+            for source_idx in actual_source_indices
+        ]
+        selection = {
+            "source_video": str(options.input_video),
+            "total_source_frames": total_frames,
+            "source_fps": source_fps,
+            "duration_seconds": float(total_frames / source_fps) if source_fps > 0 else None,
+            "sampling_mode": sampling_mode,
+            "requested_target_frames": int(options.target_frames),
+            "requested_fps": int(options.fps),
+            "selected_frames": len(selected),
+            "recovered_frames": len(recovered),
+            "requested_source_indices": selected,
+            "source_indices": actual_source_indices,
+            "source_timestamps_seconds": timestamps,
+        }
+        (options.output_dir / "frame_selection.json").write_text(
+            json.dumps(selection, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log.write(
+            "[lingbot] prepared complete source sequence "
+            f"frames={len(selected)} recovered={len(recovered)} "
+            f"time={timestamps[0] if timestamps else None}..{timestamps[-1] if timestamps else None}\n"
+        )
+        log.flush()
+        return frames_dir, selection
+
+    def _run_subprocess(self, options: LingBotRunOptions, log, *, input_frames: Path) -> None:
         batch_demo_py = self.repo_path / "demo_render" / "batch_demo.py"
         if not batch_demo_py.exists():
             raise FileNotFoundError(f"LingBot-Map batch demo not found at {batch_demo_py}")
@@ -83,8 +212,8 @@ class LingBotMapAdapter:
         cmd = [
             self.python_bin,
             str(batch_demo_py),
-            "--video_path",
-            str(options.input_video),
+            "--input_folder",
+            str(input_frames),
             "--output_folder",
             str(options.output_dir),
             "--model_path",
@@ -102,11 +231,6 @@ class LingBotMapAdapter:
             "--video_suffix",
             "_lingbot_preview",
         ]
-        if options.target_frames > 0:
-            cmd.extend(["--target_frames", str(options.target_frames)])
-        else:
-            cmd.extend(["--fps", str(options.fps)])
-
         # RTX 3090 deployment currently has no FlashInfer package. LingBot-Map
         # falls back safely when --use_sdpa is passed, so keep it unconditional.
         cmd.append("--use_sdpa")
@@ -142,7 +266,12 @@ class LingBotMapAdapter:
         if return_code != 0:
             raise RuntimeError(f"LingBot-Map failed with exit code {return_code}")
 
-    def _normalize_outputs(self, output_dir: Path) -> Dict[str, Any]:
+    def _normalize_outputs(
+        self,
+        output_dir: Path,
+        *,
+        frame_selection: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         artifacts: Dict[str, Any] = {
             "trajectory": None,
             "pointcloud": None,
@@ -154,6 +283,7 @@ class LingBotMapAdapter:
         artifacts["raw_files"] = [str(p.relative_to(output_dir)) for p in raw_files[:500]]
 
         trajectory = self._discover_trajectory(raw_files)
+        trajectory = self._annotate_trajectory_timing(trajectory, frame_selection or {})
         trajectory_path = output_dir / "trajectory.json"
         trajectory_path.write_text(json.dumps(trajectory, ensure_ascii=False, indent=2), encoding="utf-8")
         artifacts["trajectory"] = str(trajectory_path)
@@ -161,6 +291,47 @@ class LingBotMapAdapter:
         pointcloud_path = self._discover_or_create_pointcloud(raw_files, output_dir)
         artifacts["pointcloud"] = str(pointcloud_path) if pointcloud_path else None
         return artifacts
+
+    def _annotate_trajectory_timing(
+        self,
+        trajectory: Dict[str, Any],
+        frame_selection: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        poses = trajectory.get("poses") if isinstance(trajectory, dict) else None
+        source_indices = frame_selection.get("source_indices") or []
+        timestamps = frame_selection.get("source_timestamps_seconds") or []
+        if not isinstance(poses, list):
+            return trajectory
+        for output_index, pose in enumerate(poses):
+            if not isinstance(pose, dict):
+                continue
+            raw_index = pose.get("frame_idx", output_index)
+            try:
+                frame_index = int(raw_index)
+            except (TypeError, ValueError):
+                frame_index = output_index
+            mapping_index = frame_index if 0 <= frame_index < len(source_indices) else output_index
+            if 0 <= mapping_index < len(source_indices):
+                pose["source_frame_idx"] = int(source_indices[mapping_index])
+            if 0 <= mapping_index < len(timestamps):
+                try:
+                    timestamp = float(timestamps[mapping_index])
+                except (TypeError, ValueError):
+                    timestamp = math.nan
+                if math.isfinite(timestamp):
+                    pose["timestamp_seconds"] = timestamp
+        trajectory["frame_selection"] = {
+            key: frame_selection.get(key)
+            for key in (
+                "total_source_frames",
+                "source_fps",
+                "duration_seconds",
+                "sampling_mode",
+                "selected_frames",
+                "recovered_frames",
+            )
+        }
+        return trajectory
 
     def _discover_trajectory(self, files: Iterable[Path]) -> Dict[str, Any]:
         candidates = list(files)
@@ -196,7 +367,7 @@ class LingBotMapAdapter:
                                 poses = self._poses_from_extrinsics(
                                     pose_array,
                                     confidence=confidence,
-                                    input_is_w2c=(key == "cam_T_world"),
+                                    input_is_w2c=(key in {"cam_T_world", "extrinsic"}),
                                     source_file=path.name,
                                 )
                                 if poses:
@@ -225,10 +396,11 @@ class LingBotMapAdapter:
                 data = np.load(path)
                 if "extrinsic" not in data:
                     continue
-                # Upstream demo.postprocess explicitly converts the camera
-                # prediction from w2c to c2w before --save_predictions.  Do
-                # not invert it a second time here.
-                c2w = self._as_4x4(data["extrinsic"].astype(np.float32))
+                # LingBot batch_demo and its official RGB-D loader define the
+                # saved ``extrinsic`` as world-to-camera. Camera position is
+                # therefore -R^T t, not the raw translation column.
+                w2c = self._as_4x4(data["extrinsic"].astype(np.float32))
+                c2w = np.linalg.inv(w2c)
                 confidence = self._frame_confidence(data.get("depth_conf"))
                 poses.append(
                     {
@@ -400,8 +572,9 @@ class LingBotMapAdapter:
                 x = (uu.astype(np.float32) - cx) / fx * z
                 y = (vv.astype(np.float32) - cy) / fy * z
                 cam = np.stack([x, y, z, np.ones_like(z)], axis=1)
-                # Saved LingBot predictions already use c2w extrinsics.
-                c2w = self._as_4x4(np.asarray(data["extrinsic"], dtype=np.float32))
+                # Upstream saves W2C; back-projection needs C2W.
+                w2c = self._as_4x4(np.asarray(data["extrinsic"], dtype=np.float32))
+                c2w = np.linalg.inv(w2c)
                 world = (c2w @ cam.T).T[:, :3].astype(np.float32)
 
                 if image is not None:
