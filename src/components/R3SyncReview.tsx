@@ -6,7 +6,6 @@ import { Slider } from "@/components/ui/slider";
 import TrajectoryMap, {
   type TrajectoryData,
   type TrajectoryPoint,
-  type TurnPoint,
 } from "@/components/TrajectoryMap";
 import { finiteNum } from "@/lib/numbers";
 
@@ -142,25 +141,82 @@ export default function R3SyncReview({
   onDirectionPointSet,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const routeAnimRef = useRef<number | null>(null);
   const [videoReloadKey, setVideoReloadKey] = useState(0);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [routeIndex, setRouteIndex] = useState(0);
+  const [routeMode, setRouteMode] = useState(true);
   const method = String(trajectories[0]?.method || stats?.method || stats?.algorithm || "").toLowerCase();
-  const algorithmName = method.includes("lingbot") ? "LingBot-Map" : method.includes("r3") || method.includes("r³") ? "R³" : "траектории";
+  const algorithmName = method.includes("lingbot")
+    ? "LingBot-Map"
+    : method.includes("r3") || method.includes("r³")
+      ? "R³"
+      : "траектории";
 
   const densePoints = useMemo(() => {
     const first = trajectories[0];
     return first ? normalizeTrajectory(first.trajectory) : [];
   }, [trajectories]);
 
+  const trajectorySignature = useMemo(() => {
+    if (densePoints.length === 0) return "empty";
+    const first = densePoints[0];
+    const last = densePoints[densePoints.length - 1];
+    return `${densePoints.length}:${first.x.toFixed(2)},${first.y.toFixed(2)}:${last.x.toFixed(2)},${last.y.toFixed(2)}`;
+  }, [densePoints]);
+
+  const videoCanDrive = duration > 0 && !videoError && !routeMode;
+
   const currentIndex = useMemo(() => {
     if (densePoints.length === 0) return 0;
-    const ratio = duration > 0 ? currentTime / duration : 0;
-    return Math.max(0, Math.min(densePoints.length - 1, Math.floor(ratio * densePoints.length)));
-  }, [currentTime, densePoints.length, duration]);
+    if (videoCanDrive && isPlaying) {
+      const ratio = duration > 0 ? currentTime / duration : 0;
+      return Math.max(0, Math.min(densePoints.length - 1, Math.floor(ratio * densePoints.length)));
+    }
+    return Math.max(0, Math.min(densePoints.length - 1, routeIndex));
+  }, [currentTime, densePoints.length, duration, isPlaying, routeIndex, videoCanDrive]);
+
+  const stopRouteAnimation = () => {
+    if (routeAnimRef.current !== null) {
+      cancelAnimationFrame(routeAnimRef.current);
+      routeAnimRef.current = null;
+    }
+  };
+
+  const startRouteAnimation = (fromIndex = 0) => {
+    stopRouteAnimation();
+    if (densePoints.length < 2) {
+      setRouteIndex(0);
+      setIsPlaying(false);
+      return;
+    }
+    setRouteMode(true);
+    setIsPlaying(true);
+    const startIndex = Math.max(0, Math.min(fromIndex, densePoints.length - 1));
+    const remaining = Math.max(1, densePoints.length - 1 - startIndex);
+    // ~28ms per point, clamped to a pleasant 2.5–14s reveal.
+    const durationMs = Math.min(14000, Math.max(2500, remaining * 28)) / Math.max(playbackRate, 0.25);
+    const startedAt = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - startedAt) / durationMs);
+      const eased = 1 - (1 - t) * (1 - t);
+      const next = startIndex + Math.floor(eased * remaining);
+      setRouteIndex(next);
+      if (t < 1) {
+        routeAnimRef.current = requestAnimationFrame(tick);
+      } else {
+        routeAnimRef.current = null;
+        setIsPlaying(false);
+        setRouteIndex(densePoints.length - 1);
+      }
+    };
+    setRouteIndex(startIndex);
+    routeAnimRef.current = requestAnimationFrame(tick);
+  };
 
   useEffect(() => {
     if (videoRef.current) {
@@ -168,27 +224,82 @@ export default function R3SyncReview({
     }
   }, [playbackRate]);
 
+  // When a new analysis arrives, smoothly draw the route on the floor plan.
+  useEffect(() => {
+    stopRouteAnimation();
+    videoRef.current?.pause();
+    setIsPlaying(false);
+    setCurrentTime(0);
+    if (densePoints.length < 2) {
+      setRouteIndex(0);
+      return;
+    }
+    const timer = window.setTimeout(() => startRouteAnimation(0), 120);
+    return () => {
+      window.clearTimeout(timer);
+      stopRouteAnimation();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trajectorySignature]);
+
+  useEffect(() => () => stopRouteAnimation(), []);
+
   const togglePlay = () => {
     const video = videoRef.current;
-    if (!video) return;
-    if (video.paused) {
-      video.play().catch(() => setIsPlaying(false));
-    } else {
-      video.pause();
+    if (isPlaying) {
+      stopRouteAnimation();
+      video?.pause();
+      setIsPlaying(false);
+      return;
     }
+    if (video && duration > 0 && !videoError && !routeMode) {
+      video.play().catch(() => {
+        startRouteAnimation(routeIndex);
+      });
+      return;
+    }
+    const from = routeIndex >= densePoints.length - 1 ? 0 : routeIndex;
+    startRouteAnimation(from);
   };
 
   const seekTo = (seconds: number) => {
     const video = videoRef.current;
-    if (!video) return;
+    if (!video || !(duration > 0)) return;
+    stopRouteAnimation();
+    setRouteMode(false);
     const next = Math.max(0, Math.min(seconds, duration || video.duration || 0));
     video.currentTime = next;
     setCurrentTime(next);
+    if (densePoints.length > 0) {
+      const ratio = duration > 0 ? next / duration : 0;
+      setRouteIndex(Math.max(0, Math.min(densePoints.length - 1, Math.floor(ratio * densePoints.length))));
+    }
+  };
+
+  const seekToPoint = (index: number) => {
+    stopRouteAnimation();
+    setRouteMode(true);
+    setIsPlaying(false);
+    const next = Math.max(0, Math.min(index, Math.max(densePoints.length - 1, 0)));
+    setRouteIndex(next);
+    if (duration > 0 && videoRef.current) {
+      const ratio = densePoints.length > 1 ? next / (densePoints.length - 1) : 0;
+      const seconds = ratio * duration;
+      videoRef.current.currentTime = seconds;
+      setCurrentTime(seconds);
+    }
   };
 
   const reset = () => {
-    seekTo(0);
-    videoRef.current?.pause();
+    stopRouteAnimation();
+    setIsPlaying(false);
+    setRouteMode(true);
+    setRouteIndex(0);
+    setCurrentTime(0);
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.currentTime = 0;
+    }
   };
 
   useEffect(() => {
@@ -205,7 +316,7 @@ export default function R3SyncReview({
           <div className="flex flex-wrap items-center gap-2">
             <Button type="button" size="sm" onClick={togglePlay}>
               {isPlaying ? <Pause className="mr-2 h-4 w-4" /> : <Play className="mr-2 h-4 w-4" />}
-              {isPlaying ? "Пауза" : "Старт"}
+              {isPlaying ? "Пауза" : "Рисовать маршрут"}
             </Button>
             <Button type="button" size="sm" variant="outline" onClick={reset}>
               <RotateCcw className="mr-2 h-4 w-4" />
@@ -213,23 +324,35 @@ export default function R3SyncReview({
             </Button>
           </div>
         </div>
+        <p className="text-xs text-muted-foreground">
+          После загрузки анализа маршрут плавно прорисовывается на плане. Кнопка «Рисовать маршрут»
+          повторяет анимацию; если preview видео доступен, можно синхронизировать ход с плеером.
+        </p>
 
         <div className="grid gap-3 lg:grid-cols-[1fr_auto] lg:items-center">
           <div className="space-y-1">
             <div className="flex justify-between text-xs text-muted-foreground">
-              <span>{currentTime.toFixed(1)} c</span>
+              <span>{videoCanDrive ? `${currentTime.toFixed(1)} c` : "анимация"}</span>
               <span>
                 точка {Math.min(currentIndex + 1, densePoints.length).toLocaleString("ru-RU")} /{" "}
                 {densePoints.length.toLocaleString("ru-RU")}
               </span>
-              <span>{duration.toFixed(1)} c</span>
+              <span>
+                {videoCanDrive
+                  ? `${duration.toFixed(1)} c`
+                  : `${Math.round(((currentIndex + 1) / Math.max(densePoints.length, 1)) * 100)}%`}
+              </span>
             </div>
             <Slider
-              value={[duration > 0 ? currentTime : 0]}
+              value={[videoCanDrive && !routeMode ? currentTime : currentIndex]}
               min={0}
-              max={Math.max(duration, 0.01)}
-              step={0.05}
-              onValueChange={(value) => seekTo(value[0] ?? 0)}
+              max={videoCanDrive && !routeMode ? Math.max(duration, 0.01) : Math.max(densePoints.length - 1, 1)}
+              step={videoCanDrive && !routeMode ? 0.05 : 1}
+              onValueChange={(value) => {
+                const next = value[0] ?? 0;
+                if (videoCanDrive && !routeMode) seekTo(next);
+                else seekToPoint(Math.round(next));
+              }}
             />
           </div>
           <div className="flex flex-wrap items-center gap-1">
@@ -292,13 +415,23 @@ export default function R3SyncReview({
                     video.playbackRate = playbackRate;
                     setVideoError(null);
                   }}
-                  onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-                  onPlay={() => setIsPlaying(true)}
-                  onPause={() => setIsPlaying(false)}
-                  onEnded={() => setIsPlaying(false)}
+                  onTimeUpdate={(event) => {
+                    if (!routeMode) setCurrentTime(event.currentTarget.currentTime);
+                  }}
+                  onPlay={() => {
+                    stopRouteAnimation();
+                    setRouteMode(false);
+                    setIsPlaying(true);
+                  }}
+                  onPause={() => {
+                    if (!routeMode) setIsPlaying(false);
+                  }}
+                  onEnded={() => {
+                    if (!routeMode) setIsPlaying(false);
+                  }}
                   onError={() => {
                     setIsPlaying(false);
-                    setVideoError("MP4 preview готовится. Повторная загрузка через 3 сек.");
+                    setVideoError("Preview видео недоступен — маршрут рисуется без синхронизации с плеером.");
                     window.setTimeout(() => setVideoReloadKey((value) => value + 1), 3000);
                   }}
                 >
