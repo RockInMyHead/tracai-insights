@@ -62,21 +62,53 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
         turn_points?: unknown;
         map_turn_points?: unknown;
         processing_stats?: unknown;
+        floorplan_constraint?: unknown;
       };
       const method = String(data.method || "");
-      let trajectory = data.map_trajectory ?? data.plan_trajectory ?? data.trajectory;
+      const floorplanConstraint =
+        data.floorplan_constraint && typeof data.floorplan_constraint === "object"
+          ? data.floorplan_constraint as Record<string, unknown>
+          : undefined;
+      const savedMap =
+        Array.isArray(data.map_trajectory) && data.map_trajectory.length >= 2
+          ? data.map_trajectory
+          : null;
+      // Prefer the published map route. Live /api/r3-trajectory can hang for
+      // multi-minute AVI and must never block library load.
+      let trajectory = savedMap ?? data.plan_trajectory ?? data.trajectory;
       let turnPoints = data.map_turn_points ?? data.turn_points ?? [];
       let trajectoryQuality: Record<string, unknown> | undefined;
+      let liveFloorplan = floorplanConstraint;
 
-      // Saved analysis JSON can outlive trajectory post-processing fixes. For
-      // R3, rebuild the lightweight plan from the original poses on every load.
-      if (method.toLowerCase().startsWith("r3")) {
+      if (method.toLowerCase().startsWith("r3") && !savedMap) {
         try {
-          const current = await apiClient.getR3Trajectory(video.video_id);
-          if (current.success && Array.isArray(current.plan_trajectory) && current.plan_trajectory.length > 0) {
-            trajectory = current.plan_trajectory;
-            turnPoints = current.turn_points ?? turnPoints;
+          const withTimeout = <T,>(promise: Promise<T>, ms: number): Promise<T> =>
+            new Promise<T>((resolve, reject) => {
+              const timer = window.setTimeout(() => reject(new Error("r3_library_timeout")), ms);
+              promise.then(
+                (value) => {
+                  window.clearTimeout(timer);
+                  resolve(value);
+                },
+                (error) => {
+                  window.clearTimeout(timer);
+                  reject(error);
+                },
+              );
+            });
+          const current = await withTimeout(apiClient.getR3Trajectory(video.video_id), 8000);
+          if (current.success) {
+            if (Array.isArray(current.map_trajectory) && current.map_trajectory.length >= 2) {
+              trajectory = current.map_trajectory;
+              turnPoints = current.map_turn_points ?? turnPoints;
+            } else if (Array.isArray(current.plan_trajectory) && current.plan_trajectory.length > 0) {
+              trajectory = current.plan_trajectory;
+              turnPoints = current.turn_points ?? turnPoints;
+            }
             trajectoryQuality = current.trajectory_quality;
+            if (current.floorplan_constraint && typeof current.floorplan_constraint === "object") {
+              liveFloorplan = current.floorplan_constraint as Record<string, unknown>;
+            }
           }
         } catch (error) {
           console.warn("Current R3 trajectory is unavailable; using saved analysis", error);
@@ -91,9 +123,15 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
         trajectoryQuality?.projection && typeof trajectoryQuality.projection === "object"
           ? trajectoryQuality.projection as Record<string, unknown>
           : undefined;
+      const mapAccepted = Boolean(liveFloorplan?.accepted);
       const stats: Record<string, unknown> = {
         ...processingStats,
         method,
+        floorplan_constraint: liveFloorplan,
+        map_matching_applied:
+          mapAccepted
+          || Boolean(processingStats.map_matching_applied)
+          || Boolean(savedMap),
         ...(trajectoryQuality ? {
           trajectory_quality: trajectoryQuality,
           r3_trajectory_quality: trajectoryQuality,

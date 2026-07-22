@@ -476,7 +476,14 @@ const TrajectoryAnalysisPage = () => {
         || projection?.plan_coordinate_convention
         || "",
     );
-    const mapAligned = Boolean(newStats?.map_matching_applied) || manualOverride;
+    const floorplanConstraint =
+      newStats?.floorplan_constraint && typeof newStats.floorplan_constraint === "object"
+        ? newStats.floorplan_constraint as Record<string, unknown>
+        : undefined;
+    const mapAligned =
+      Boolean(newStats?.map_matching_applied)
+      || Boolean(floorplanConstraint?.accepted)
+      || manualOverride;
     const isR3 = method.toLowerCase().startsWith("r3")
       || coordinateConvention === "x_forward_y_left_z_up";
     const trajectoriesData = [{
