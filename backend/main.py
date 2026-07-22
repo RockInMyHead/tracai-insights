@@ -3962,9 +3962,15 @@ async def get_videos_list():
                 video_path = VIDEOS_DIR / video_filename if video_filename else None
                 uploaded_at = data.get("uploaded_at")
                 if not uploaded_at:
+                    # Prefer the video file mtime, then the analysis JSON mtime.
+                    stamp = (
+                        video_path.stat().st_mtime
+                        if video_path and video_path.exists()
+                        else json_file.stat().st_mtime
+                    )
                     uploaded_at = time.strftime(
                         "%Y-%m-%dT%H:%M:%S",
-                        time.localtime(json_file.stat().st_mtime),
+                        time.localtime(stamp),
                     )
                 videos.append({
                     "video_id": video_id,

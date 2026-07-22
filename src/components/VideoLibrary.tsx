@@ -134,8 +134,12 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
 
   const formatDate = (dateString: string): string => {
     if (!dateString) return '—';
-    const ts = parseFloat(dateString);
-    const date = !isNaN(ts) ? new Date(ts * 1000) : new Date(dateString);
+    // Pure numeric values are Unix seconds; ISO strings like "2026-07-22T..."
+    // must NOT go through parseFloat — that yields year "2026" → epoch+2026s.
+    const trimmed = String(dateString).trim();
+    const date = /^\d+(\.\d+)?$/.test(trimmed)
+      ? new Date(parseFloat(trimmed) * 1000)
+      : new Date(trimmed);
     if (isNaN(date.getTime())) return '—';
     return date.toLocaleString('ru-RU', {
       year: 'numeric',
