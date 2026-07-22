@@ -3948,22 +3948,37 @@ async def get_videos_list():
     videos = []
     try:
         for json_file in OUTPUT_DIR.glob("*_analysis.json"):
+            name = json_file.name
+            if ".pre-" in name or ".before_" in name:
+                continue
             try:
                 import json
                 with open(json_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    videos.append({
-                        "video_id": data["video_id"],
-                        "filename": data["original_filename"],
-                        "uploaded_at": data["uploaded_at"],
-                        "file_size": Path(VIDEOS_DIR / data["video_filename"]).stat().st_size if (VIDEOS_DIR / data["video_filename"]).exists() else 0,
-                        "scale_factor": data["scale_factor"],
-                        "stabilized": data["stabilized"],
-                        "has_analysis": True
-                    })
+                video_id = str(data.get("video_id") or "").strip()
+                if not video_id:
+                    continue
+                video_filename = str(data.get("video_filename") or "")
+                video_path = VIDEOS_DIR / video_filename if video_filename else None
+                uploaded_at = data.get("uploaded_at")
+                if not uploaded_at:
+                    uploaded_at = time.strftime(
+                        "%Y-%m-%dT%H:%M:%S",
+                        time.localtime(json_file.stat().st_mtime),
+                    )
+                videos.append({
+                    "video_id": video_id,
+                    "filename": data.get("original_filename") or video_filename or video_id,
+                    "uploaded_at": uploaded_at,
+                    "file_size": video_path.stat().st_size if video_path and video_path.exists() else 0,
+                    "scale_factor": data.get("scale_factor", 1.0),
+                    "stabilized": bool(data.get("stabilized", False)),
+                    "has_analysis": True
+                })
             except Exception as e:
                 logger.warning(f"Error reading analysis file {json_file}: {e}")
 
+        videos.sort(key=lambda item: item.get("uploaded_at") or "", reverse=True)
         return {"success": True, "videos": videos}
     except Exception as e:
         logger.error(f"Error getting videos list: {e}")
