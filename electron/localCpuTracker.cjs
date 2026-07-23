@@ -105,7 +105,7 @@ function buildTrajectory(frames) {
     points.push([Math.round(x * 10) / 10, Math.round(y * 10) / 10, 0]);
   }
   if (points.length < 3 || movement < 3) {
-    throw new Error('Локальный CPU-трекер не увидел устойчивого движения. Проверьте видео или подключитесь к интернету для анализа на RTX 3090.');
+    throw new Error('Не удалось увидеть устойчивое движение в видео. Проверьте запись и попробуйте ещё раз.');
   }
   const stride = Math.max(1, Math.ceil(points.length / 400));
   return points.filter((_point, index) => index % stride === 0 || index === points.length - 1);
@@ -118,7 +118,7 @@ function extractFrames(videoPath, onProgress) {
     try {
       ffmpegPath = require('ffmpeg-static');
     } catch {
-      throw new Error('Локальный модуль CPU-трекинга не установлен. Переустановите TrackAI.');
+      throw new Error('Модуль обработки видео не установлен. Переустановите TrackAI.');
     }
   }
   return new Promise((resolve, reject) => {
@@ -162,7 +162,7 @@ async function processLocalVideo(video) {
   const history = readHistory();
   const item = history.find((entry) => entry.video_id === video.video_id);
   const sourcePath = video.localPath || item?.localPath;
-  if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error('Локальная копия видео не найдена');
+  if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error('Копия видео не найдена');
   const raw = await extractFrames(sourcePath);
   const trajectory = buildTrajectory(decodeFrames(raw));
   const result = {
@@ -185,7 +185,7 @@ function getHistory() {
 
 function getAnalysis(videoId) {
   const item = readHistory().find((entry) => entry.video_id === videoId);
-  if (!item?.data) throw new Error('Локальный результат не найден');
+  if (!item?.data) throw new Error('Результат анализа не найден');
   return { success: true, video_id: videoId, data: item.data };
 }
 
