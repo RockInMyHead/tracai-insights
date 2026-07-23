@@ -10,8 +10,8 @@ let mainWindow = null;
 let cameraImportService = null;
 
 const cameraImportSettings = {
-  enabled: true,
-  ownerName: '',
+  enabled: false,
+  ownerName: 'Экшен-камера',
 };
 
 function broadcastToRenderer(channel, payload) {
@@ -33,6 +33,7 @@ function setupCameraImport() {
         message: error instanceof Error ? error.message : String(error),
       });
     },
+    manualOnly: true,
   });
 
   ipcMain.handle('camera-import:get-settings', () => ({

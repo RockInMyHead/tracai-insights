@@ -18,6 +18,7 @@ import PlanEditor from "@/components/PlanEditor";
 import PlanLibrary from "@/components/PlanLibrary";
 import { PenTool, Library as LibraryIcon } from "lucide-react";
 import { finiteNum } from "@/lib/numbers";
+import WindowsCameraDesktop from "@/components/WindowsCameraDesktop";
 
 /** Линия/прямоугольник с плана из PlanEditor */
 interface DrawnPlanShape {
@@ -33,7 +34,7 @@ const FIXED_FLOORPLAN_FILE = {
   type: 'image/png',
 };
 
-const TrajectoryAnalysisPage = () => {
+const LegacyTrajectoryAnalysisPage = () => {
   const [trajectory, setTrajectory] = useState<unknown[]>([]);
   const [turnPoints, setTurnPoints] = useState<Record<string, unknown>[]>([]);
   const [stats, setStats] = useState<Record<string, unknown> | null>(null);
@@ -1135,6 +1136,14 @@ const TrajectoryAnalysisPage = () => {
       )}
     </div>
   );
+};
+
+const TrajectoryAnalysisPage = () => {
+  const isDesktop = typeof window !== "undefined" && (
+    (window as unknown as { trackai?: { isDesktop?: boolean } }).trackai?.isDesktop === true
+    || new URLSearchParams(window.location.search).get("desktop") === "1"
+  );
+  return isDesktop ? <WindowsCameraDesktop /> : <LegacyTrajectoryAnalysisPage />;
 };
 
 export default TrajectoryAnalysisPage;

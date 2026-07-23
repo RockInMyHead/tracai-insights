@@ -253,6 +253,7 @@ function createCameraImportService(options) {
     onProgress,
     onBatchComplete,
     onError,
+    manualOnly = false,
   } = options;
 
   let pollTimer = null;
@@ -394,6 +395,11 @@ function createCameraImportService(options) {
 
   const start = () => {
     if (pollTimer) return;
+    if (manualOnly) {
+      currentStatus.enabled = isEnabled();
+      emitStatus();
+      return;
+    }
     pollTimer = setInterval(() => {
       scanNow().catch((error) => {
         currentStatus.lastError = error instanceof Error ? error.message : String(error);
@@ -413,7 +419,7 @@ function createCameraImportService(options) {
   const setEnabled = (enabled) => {
     currentStatus.enabled = enabled;
     emitStatus();
-    if (enabled) {
+    if (enabled && !manualOnly) {
       scanNow({ forceImport: true }).catch(() => {});
     }
   };
