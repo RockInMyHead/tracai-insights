@@ -77,6 +77,49 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertAlmostEqual(points[0, 1], 60.0, delta=1.0)
         self.assertTrue(np.any(np.abs(points[:, 1] - 60.0) > 15.0))
 
+    def test_distant_parallel_branch_is_not_a_valid_r3_repair(self) -> None:
+        support = np.zeros((100, 180), dtype=bool)
+        support[28:33, 10:170] = True
+        support[68:73, 10:170] = True
+        support[28:73, 160:165] = True
+        mask = np.zeros_like(support)
+        mask[28:33, 55:95] = True
+        engine = FloorplanConstraintEngine(
+            FloorplanConfig(
+                map_id="parallel_branch_test",
+                width=180,
+                height=100,
+                meters_per_pixel=0.1,
+                grid_cell_pixels=1,
+                person_radius_meters=0.0,
+                obstacle_mask_file="",
+            ),
+            mask,
+            support,
+        )
+        observed = [[float(x), 30.0] for x in range(20, 141, 10)]
+        result = engine.align(
+            observed,
+            {"x": 20 / 180 * 100, "y": 30},
+            {"x": 40 / 180 * 100, "y": 30},
+            coordinate_convention="x_right_y_down",
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+            allow_safe_shape_fallback=True,
+        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertIn(
+            result["diagnostics"]["reason"],
+            {
+                "constraint_solution_not_found",
+                "map_correction_exceeds_observation_budget",
+            },
+        )
+        if "shape_gate_details" in result["diagnostics"]:
+            self.assertFalse(
+                result["diagnostics"]["shape_gate_details"]["p95_within_budget"]
+            )
+
     def test_start_inside_restricted_area_is_projected_to_walkable_mask(self) -> None:
         mask = np.zeros((100, 100), dtype=bool)
         mask[40:60, 40:60] = True
@@ -370,7 +413,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             },
         )
 
-    def test_authoritative_safe_fallback_returns_bounded_collision_free_route(self) -> None:
+    def test_authoritative_safe_fallback_rejects_topology_destroying_route(self) -> None:
         height, width = 100, 220
         support = np.zeros((height, width), dtype=bool)
         support[44:57, 5:215] = True
@@ -399,16 +442,16 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
             allow_safe_shape_fallback=True,
         )
-        self.assertTrue(result["accepted"], result["diagnostics"])
-        self.assertTrue(result["diagnostics"]["shape_fallback_used"])
+        self.assertFalse(result["accepted"], result["diagnostics"])
         self.assertEqual(
-            result["diagnostics"]["shape_fallback_policy"],
-            "authoritative_plan_connectivity_v2",
+            result["diagnostics"]["reason"],
+            "map_correction_exceeds_observation_budget",
         )
-        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
-        self.assertIn(
-            "authoritative_safe_map_fallback",
-            result["diagnostics"]["quality_warnings"],
+        self.assertFalse(
+            result["diagnostics"]["shape_gate_details"]["p95_within_budget"]
+        )
+        self.assertFalse(
+            result["diagnostics"]["shape_gate_details"]["turn_topology_preserved"]
         )
 
     def test_fixed_floorplan_routes_around_real_annotated_machine(self) -> None:

@@ -367,7 +367,7 @@ class LingBotMapAdapter:
                                 poses = self._poses_from_extrinsics(
                                     pose_array,
                                     confidence=confidence,
-                                    input_is_w2c=(key in {"cam_T_world", "extrinsic"}),
+                                    input_is_w2c=(key == "cam_T_world"),
                                     source_file=path.name,
                                 )
                                 if poses:
@@ -396,11 +396,8 @@ class LingBotMapAdapter:
                 data = np.load(path)
                 if "extrinsic" not in data:
                     continue
-                # LingBot batch_demo and its official RGB-D loader define the
-                # saved ``extrinsic`` as world-to-camera. Camera position is
-                # therefore -R^T t, not the raw translation column.
-                w2c = self._as_4x4(data["extrinsic"].astype(np.float32))
-                c2w = np.linalg.inv(w2c)
+                # Upstream LingBot stores ``extrinsic`` as camera-to-world.
+                c2w = self._as_4x4(data["extrinsic"].astype(np.float32))
                 confidence = self._frame_confidence(data.get("depth_conf"))
                 poses.append(
                     {
@@ -572,9 +569,8 @@ class LingBotMapAdapter:
                 x = (uu.astype(np.float32) - cx) / fx * z
                 y = (vv.astype(np.float32) - cy) / fy * z
                 cam = np.stack([x, y, z, np.ones_like(z)], axis=1)
-                # Upstream saves W2C; back-projection needs C2W.
-                w2c = self._as_4x4(np.asarray(data["extrinsic"], dtype=np.float32))
-                c2w = np.linalg.inv(w2c)
+                # Upstream LingBot stores ``extrinsic`` as camera-to-world.
+                c2w = self._as_4x4(np.asarray(data["extrinsic"], dtype=np.float32))
                 world = (c2w @ cam.T).T[:, :3].astype(np.float32)
 
                 if image is not None:

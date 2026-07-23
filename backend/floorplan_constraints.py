@@ -47,8 +47,15 @@ INDEPENDENT_LONG_INSPECTION_SPEED_RATIO_BOUNDS = (0.04, 1.80)
 LONG_INSPECTION_MIN_SECONDS = 480.0
 # Maximum search envelope for a local obstacle correction.  The route must
 # never explore another aisle merely because it is connected in the mask.
-LOCAL_ASTAR_INITIAL_MARGIN_METERS = 6.0
-LOCAL_ASTAR_MAX_MARGIN_METERS = 12.0
+LOCAL_ASTAR_INITIAL_MARGIN_METERS = 4.0
+LOCAL_ASTAR_MAX_MARGIN_METERS = 6.0
+MAX_LOCAL_MAP_CORRECTION_METERS = 4.0
+MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION = 0.06
+MAX_LOCAL_MAP_CORRECTION_HARD_METERS = 6.0
+TURN_TOPOLOGY_MIN_DEGREES = 18.0
+MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES = 28.0
+MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO = 0.0
+MAX_AUTHORITATIVE_SHARP_REVERSE_RATIO = 0.18
 INDEPENDENT_LOOP_CLOSED_MIN_LENGTH_RATIO = 0.65
 STANDARD_YAW_OFFSETS_DEGREES = (
     -20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0
@@ -206,6 +213,70 @@ def _polyline_progress_metrics(
         "net_progress_ratio": endpoint_ratio,
         "span_length_ratio": span_ratio,
         "tortuosity": length_pixels / max(endpoint_pixels, 1e-12),
+    }
+
+
+def _turn_topology_metrics(
+    source: np.ndarray,
+    corrected: np.ndarray,
+    *,
+    samples: int = 64,
+    min_turn_degrees: float = TURN_TOPOLOGY_MIN_DEGREES,
+) -> dict[str, float | int]:
+    """Compare route turn sequence without requiring equal point counts.
+
+    Local obstacle repair may add or remove vertices.  What it must not do is
+    turn a measured right/left sequence into another branch of the map.  The
+    comparison is therefore arc-normalised and only meaningful turns vote.
+    """
+    if len(source) < 3 or len(corrected) < 3:
+        return {
+            "turn_count": 0,
+            "mean_abs_turn_error_degrees": 0.0,
+            "max_abs_turn_error_degrees": 0.0,
+            "sign_mismatch_ratio": 0.0,
+        }
+    fractions = np.linspace(0.0, 1.0, int(samples))
+    source_points = _resample_polyline(source, fractions)
+    corrected_points = _resample_polyline(corrected, fractions)
+
+    def local_turns(points: np.ndarray) -> np.ndarray:
+        before = points[1:-1] - points[:-2]
+        after = points[2:] - points[1:-1]
+        before_norm = np.linalg.norm(before, axis=1)
+        after_norm = np.linalg.norm(after, axis=1)
+        valid = (before_norm > 1e-6) & (after_norm > 1e-6)
+        turns = np.zeros(len(before), dtype=np.float64)
+        cross = before[:, 0] * after[:, 1] - before[:, 1] * after[:, 0]
+        dot = np.sum(before * after, axis=1)
+        turns[valid] = np.degrees(np.arctan2(cross[valid], dot[valid]))
+        return turns
+
+    source_turns = local_turns(source_points)
+    corrected_turns = local_turns(corrected_points)
+    meaningful = np.abs(source_turns) >= float(min_turn_degrees)
+    if not np.any(meaningful):
+        return {
+            "turn_count": 0,
+            "mean_abs_turn_error_degrees": 0.0,
+            "max_abs_turn_error_degrees": 0.0,
+            "sign_mismatch_ratio": 0.0,
+        }
+    delta = corrected_turns[meaningful] - source_turns[meaningful]
+    # Wrap signed angle errors to [-180, 180].
+    delta = (delta + 180.0) % 360.0 - 180.0
+    source_sign = np.sign(source_turns[meaningful])
+    corrected_sign = np.sign(corrected_turns[meaningful])
+    sign_mismatch = (
+        (corrected_sign != 0.0)
+        & (source_sign != 0.0)
+        & (corrected_sign != source_sign)
+    )
+    return {
+        "turn_count": int(np.sum(meaningful)),
+        "mean_abs_turn_error_degrees": float(np.mean(np.abs(delta))),
+        "max_abs_turn_error_degrees": float(np.max(np.abs(delta))),
+        "sign_mismatch_ratio": float(np.mean(sign_mismatch)),
     }
 
 
@@ -2176,24 +2247,33 @@ class FloorplanConstraintEngine:
                 float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
             )
             # A floor plan may select scale/yaw and make local obstacle
-            # repairs; it may not invent a different route.  The former
-            # production weights made a 12 m displacement almost free
-            # (0.005 * p95), so a geometrically absurd route could outrank a
-            # faithful observation merely because it had more clearance.
-            # Cap stays below the ~13–15 m "mask-legal spike" regime that still
-            # looked wrong on Kerama despite length_ratio ≈ 1.17.
+            # repairs; it may not invent a different route.  Keep the
+            # correction budget deliberately local: once the fix needs a
+            # multi-metre branch change, the observation and mask disagree and
+            # the result must not be published as if it were measured by R3.
             correction_budget = max(
-                2.5,
-                min(11.0, float(hypothesis["length_meters"]) * 0.09),
+                MAX_LOCAL_MAP_CORRECTION_METERS,
+                min(
+                    MAX_LOCAL_MAP_CORRECTION_HARD_METERS,
+                    float(hypothesis["length_meters"])
+                    * MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION,
+                ),
             )
             sharp_reverse_ratio = _polyline_sharp_reverse_ratio(
                 repaired,
                 meters_per_pixel=self.config.meters_per_pixel,
             )
+            turn_topology = _turn_topology_metrics(hypothesis["points"], repaired)
+            turn_topology_preserved = (
+                float(turn_topology["mean_abs_turn_error_degrees"])
+                <= MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES
+                and float(turn_topology["sign_mismatch_ratio"])
+                <= MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO
+            )
             maximum_sharp_reverse_ratio = (
                 INDEPENDENT_LOOP_CLOSED_MAX_SHARP_REVERSE_RATIO
                 if observation_policy == "independent" and loop_closure_verified
-                else 0.08
+                else MAX_AUTHORITATIVE_SHARP_REVERSE_RATIO
             )
             max_residual_collision_meters = self._max_collision_run_meters(repaired)
             # Mild aisle repairs are OK; long invented detours and zig-zag
@@ -2201,6 +2281,8 @@ class FloorplanConstraintEngine:
             minimum_length_ratio = (
                 INDEPENDENT_LOOP_CLOSED_MIN_LENGTH_RATIO
                 if observation_policy == "independent" and loop_closure_verified
+                else 0.60
+                if self._support_mask is None
                 else 0.70
             )
             shape_preserved = (
@@ -2209,16 +2291,19 @@ class FloorplanConstraintEngine:
                 and sharp_reverse_ratio <= maximum_sharp_reverse_ratio
                 and corrected_metrics["collision_ratio"] <= residual_collision_budget
                 and max_residual_collision_meters <= residual_segment_budget_meters
+                and turn_topology_preserved
                 and metric_preserved
                 and progress_preserved
             )
             constrained_score = (
                 float(hypothesis["score"])
                 + 0.15 * median_correction
-                + 0.08 * p95_correction
+                + 0.22 * p95_correction
                 + 0.75 * abs(math.log(max(length_ratio, 1e-9)))
                 + 0.08 * rerouted_segments
                 + 4.0 * sharp_reverse_ratio
+                + 0.03 * float(turn_topology["mean_abs_turn_error_degrees"])
+                + 3.0 * float(turn_topology["sign_mismatch_ratio"])
                 + (
                     1.25 * _speed_prior_penalty(
                         corrected_speed_ratio,
@@ -2247,6 +2332,8 @@ class FloorplanConstraintEngine:
                 "correction_budget_meters": correction_budget,
                 "sharp_reverse_ratio": sharp_reverse_ratio,
                 "maximum_sharp_reverse_ratio": maximum_sharp_reverse_ratio,
+                "turn_topology": turn_topology,
+                "turn_topology_preserved": turn_topology_preserved,
                 "max_residual_collision_meters": max_residual_collision_meters,
                 "shape_preserved": shape_preserved,
                 "minimum_length_ratio": minimum_length_ratio,
@@ -2283,14 +2370,15 @@ class FloorplanConstraintEngine:
             }
 
         feasible.sort(key=lambda item: item["constrained_score"])
-        # With a positive support mask, accepting an arbitrary collision-free
-        # path is worse than reporting that the visual observation and map do
-        # not agree.  Only shape-preserving candidates are authoritative.
+        # Accepting an arbitrary collision-free path is worse than reporting
+        # that the visual observation and map do not agree.  Only
+        # shape-preserving candidates are authoritative; otherwise A*/Viterbi
+        # can turn R3 into a different green branch of the same mask.
         production_feasible = [
             item for item in feasible
             if bool(item["metric_preserved"])
             and bool(item["progress_preserved"])
-            and (self._support_mask is None or bool(item["shape_preserved"]))
+            and bool(item["shape_preserved"])
         ]
         shape_fallback_used = False
         shape_fallback_budget = None
@@ -2300,14 +2388,9 @@ class FloorplanConstraintEngine:
             and allow_safe_shape_fallback
         ):
             # An authoritative R3/fusion observation may disagree with an
-            # immutable CAD mask.  At this stage every item in ``feasible``
-            # has already passed local A* detour-spike rejection plus the hard
-            # outside/collision budgets.  A second global shape veto used to
-            # erase that valid route and left production with no trajectory.
-            # Prefer plan connectivity here and report degraded fidelity as a
-            # warning.  This escape hatch is deliberately unavailable to an
-            # independent LingBot observation, so it cannot revive the former
-            # wall-crossing/U-turn regression.
+            # immutable CAD mask.  The fallback can only accept routes that
+            # still preserve R3 topology; it is not allowed to publish a
+            # different green branch just because the branch is collision-free.
             safe_fallbacks: list[dict[str, Any]] = []
             for item in feasible:
                 metrics = item["corrected_metrics"]
@@ -2319,10 +2402,7 @@ class FloorplanConstraintEngine:
                     <= residual_segment_budget_meters
                     and bool(item["metric_preserved"])
                     and bool(item["progress_preserved"])
-                    and (
-                        item.get("topology_recovery") is None
-                        or bool(item["shape_preserved"])
-                    )
+                    and bool(item["shape_preserved"])
                 ):
                     safe_fallbacks.append(item)
             if safe_fallbacks:
@@ -2397,8 +2477,20 @@ class FloorplanConstraintEngine:
                         "sharp_reverse_within_budget": float(
                             closest.get("sharp_reverse_ratio", 0.0)
                         ) <= float(closest["maximum_sharp_reverse_ratio"]),
+                        "turn_topology_preserved": bool(
+                            closest.get("turn_topology_preserved", True)
+                        ),
                         "metric_preserved": bool(closest["metric_preserved"]),
                         "progress_preserved": bool(closest["progress_preserved"]),
+                    },
+                    "turn_topology": {
+                        key: (
+                            round(float(value), 6)
+                            if isinstance(value, (float, np.floating)) else value
+                        )
+                        for key, value in (
+                            closest.get("turn_topology") or {}
+                        ).items()
                     },
                     "corrected_progress": {
                         key: round(float(value), 6)

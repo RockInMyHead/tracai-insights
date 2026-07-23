@@ -10,6 +10,8 @@ Output:
     JSON в stdout с результатами: camera poses, depth maps, point cloud
     В --live режиме: поток frame_processed событий, затем complete
 """
+from __future__ import annotations
+
 import os, sys, json, time, shutil, subprocess, tempfile, math, threading
 from pathlib import Path
 
