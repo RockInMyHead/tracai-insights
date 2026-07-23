@@ -18,26 +18,26 @@
   "person_radius_meters": 0.28,
   "walking_speed_mps": 1.2,
   "default_start_anchor": {
-    "source": "fixed_plan_start_left_heading_v2",
+    "source": "fixed_plan_start_left_heading_red_safe_v3",
     "reference_pixels": [
-      2222.623,
-      684.183
+      2190.0,
+      686.0
     ],
     "direction_pixels": [
-      2153.863,
-      611.081
+      2170.0,
+      666.0
     ],
     "trajectory_points_used": false
   },
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
-  "obstacle_mask_sha256": "313cb5dbc4989e6ebda09a2715541c595bab6983a4dd1a1df6e5b154cecdd912",
+  "obstacle_mask_sha256": "e977fd8eda9c64fd2a5083543eb13d7410a6012da902a74832a4349ce26e4da5",
   "support_mask_file": "kerama_marazzi_2025_support.png",
-  "support_mask_sha256": "d6bd00f432e0cb48a2673100a32756b7227a53aaf640dae02350d0efd4e04068",
+  "support_mask_sha256": "14f0a39c3556ef194a80c60c8ba4cbb37473c048ded71e1f78b29b091cf57470",
   "support_mask_generation": {
     "method": "positive_green_corridors_only",
     "ink_threshold": 242,
     "barrier_dilation_pixels": 2,
-    "coverage_ratio": 0.08499252713533868,
+    "coverage_ratio": 0.06992849468498237,
     "green_corridor_margin_pixels": 24
   },
   "source_pdf_sha256": "5c4d908c1b9832c81eceab914303da187e3935cbcabed19e9c9ff7321ee8e19e",
@@ -50,25 +50,9 @@
     "method": "changed_red_operator_annotation",
     "boundary_cleanup_pixels": 2,
     "physical_person_halo_applied_by_engine": true,
-    "reviewed_passage_openings": [
-      [
-        2485,
-        925,
-        2575,
-        1005
-      ],
-      [
-        2890,
-        1890,
-        2990,
-        1990
-      ]
-    ],
-    "reviewed_passage_policy": "remove_conflicting_red_inside_positive_green_only",
     "remaining_red_is_absolute": true,
-    "route_specific_overrides": false,
-    "remaining_red_is_absolute_outside_positive_green": true,
-    "overlap_policy": "positive_green_corridor_has_precedence"
+    "overlap_policy": "red_obstacles_have_absolute_precedence",
+    "route_specific_overrides": false
   },
   "walkable_annotation": {
     "method": "changed_green_operator_annotation",
@@ -78,10 +62,10 @@
     "closing_pixels": 10,
     "opening_pixels": 3,
     "dilation_pixels": 6,
-    "red_obstacles_take_precedence": false,
-    "route_specific_overrides": false,
-    "precedence": "positive_green_corridor_over_overlapping_red_markup",
-    "reconciliation": "green_support_authoritative_v1"
+    "red_obstacles_take_precedence": true,
+    "precedence": "red_obstacles_over_positive_green",
+    "reconciliation": "absolute_red_priority_v2",
+    "route_specific_overrides": false
   },
   "reference_mask": {
     "method": "none",

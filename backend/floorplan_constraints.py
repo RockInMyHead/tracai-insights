@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_green_authoritative_mask_and_polarity_v28"
+    "kerama_absolute_red_priority_local_repair_v29"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -581,6 +581,10 @@ class FloorplanConstraintEngine:
         support = None if support_mask is None else np.asarray(support_mask, dtype=bool)
         if support is not None and support.shape != mask.shape:
             raise ValueError("Floorplan support mask shape does not match obstacle mask")
+        # Obstacles are authoritative even for programmatically constructed
+        # engines whose input layers overlap.
+        if support is not None:
+            support = support & ~mask
         self._full_mask = mask | (~support if support is not None else False)
         self._support_mask = support
         self._build_grid(self._full_mask, annotation_mask=mask)

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Reconcile the fixed Kerama walkability layers.
+"""Enforce the Kerama floor-plan mask precedence invariant.
 
-The green annotation is the operator's affirmative statement that a part of
-the plan is traversable.  Red paint outside that layer remains a no-go area,
-but red CAD/markup strokes which overlap a verified green corridor must not
-split that corridor.  The previous global red-over-green rule did exactly
-that: it even made the approved initial heading point an obstacle.
-
-This is a plan-layer reconciliation, not a trajectory-specific edit.
+Red pixels in the operator obstacle layer are immutable. Green is positive
+walkability evidence only where it does not overlap that layer. Native red CAD
+ink is deliberately excluded by ``prepare_kerama_floorplan.py``.
 """
 
 from __future__ import annotations
@@ -30,30 +26,43 @@ METADATA_PATH = ASSET_ROOT / f"{MAP_ID}.json"
 def main() -> None:
     obstacle = np.asarray(Image.open(OBSTACLE_PATH).convert("L")) >= 128
     support = np.asarray(Image.open(SUPPORT_PATH).convert("L")) >= 128
+    reconciled_obstacle = obstacle
+    reconciled_support = support & ~reconciled_obstacle
+    if np.any(reconciled_obstacle & reconciled_support):
+        raise AssertionError("Red obstacle/support overlap survived reconciliation")
 
-    # The final engine already excludes every pixel outside ``support``.
-    # Keeping an obstacle there is harmless, while an obstacle *inside* the
-    # positive layer contradicts the operator-provided corridor topology.
-    reconciled = obstacle & ~support
-    Image.fromarray((reconciled * 255).astype(np.uint8)).save(
+    Image.fromarray((reconciled_obstacle * 255).astype(np.uint8)).save(
         OBSTACLE_PATH, optimize=True
+    )
+    Image.fromarray((reconciled_support * 255).astype(np.uint8)).save(
+        SUPPORT_PATH, optimize=True
     )
 
     metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
     metadata["obstacle_mask_sha256"] = hashlib.sha256(
         OBSTACLE_PATH.read_bytes()
     ).hexdigest()
+    metadata["support_mask_sha256"] = hashlib.sha256(
+        SUPPORT_PATH.read_bytes()
+    ).hexdigest()
+    metadata["support_mask_generation"] = {
+        **dict(metadata.get("support_mask_generation") or {}),
+        "coverage_ratio": float(reconciled_support.mean()),
+    }
     metadata["walkable_annotation"] = {
         **dict(metadata.get("walkable_annotation") or {}),
-        "red_obstacles_take_precedence": False,
-        "precedence": "positive_green_corridor_over_overlapping_red_markup",
-        "reconciliation": "green_support_authoritative_v1",
+        "red_obstacles_take_precedence": True,
+        "precedence": "red_obstacles_over_positive_green",
+        "reconciliation": "absolute_red_priority_v2",
         "route_specific_overrides": False,
     }
     metadata["obstacle_annotation"] = {
         **dict(metadata.get("obstacle_annotation") or {}),
-        "remaining_red_is_absolute_outside_positive_green": True,
-        "overlap_policy": "positive_green_corridor_has_precedence",
+        "method": "changed_red_operator_annotation",
+        "annotation_pixel_count": int(reconciled_obstacle.sum()),
+        "remaining_red_is_absolute": True,
+        "remaining_red_is_absolute_outside_positive_green": False,
+        "overlap_policy": "red_obstacles_have_absolute_precedence",
         "route_specific_overrides": False,
     }
     METADATA_PATH.write_text(
