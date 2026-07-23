@@ -247,6 +247,7 @@ function scanConnectedCameraVolumes() {
 function createCameraImportService(options) {
   const {
     serverUrl,
+    importFile,
     getOwnerName,
     isEnabled,
     onStatus,
@@ -318,9 +319,10 @@ function createCameraImportService(options) {
           });
         }
 
-        const result = await uploadFileFromPath({
-          serverUrl,
+        const importer = importFile || ((input) => uploadFileFromPath({ serverUrl, ...input }));
+        const result = await importer({
           filePath: file.path,
+          fileName: file.name,
           employeeName: ownerName.trim(),
           onProgress: (percent) => {
             if (typeof onProgress === 'function') {

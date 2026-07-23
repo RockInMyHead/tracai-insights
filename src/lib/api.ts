@@ -1,5 +1,14 @@
 // API client for TrackAI backend
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+function getRuntimeApiBaseUrl(): string {
+  if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
+  if (typeof window !== 'undefined') {
+    const desktopUrl = (window as unknown as { trackai?: { serverUrl?: string } }).trackai?.serverUrl;
+    if (desktopUrl) return desktopUrl;
+  }
+  return '';
+}
+
+const API_BASE_URL = getRuntimeApiBaseUrl();
 
 async function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   return globalThis.fetch(input, init);

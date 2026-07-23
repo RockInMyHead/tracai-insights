@@ -1,6 +1,7 @@
 const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const path = require('path');
 const { createCameraImportService } = require('./cameraImport.cjs');
+const localCpuTracker = require('./localCpuTracker.cjs');
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 const APP_URL = 'http://93.189.231.189';
@@ -8,6 +9,7 @@ const DESKTOP_APP_URL = `${APP_URL}/trajectory?desktop=1`;
 
 let mainWindow = null;
 let cameraImportService = null;
+let processingMode = 'online';
 
 const cameraImportSettings = {
   enabled: false,
@@ -23,6 +25,9 @@ function broadcastToRenderer(channel, payload) {
 function setupCameraImport() {
   cameraImportService = createCameraImportService({
     serverUrl: APP_URL,
+    importFile: (input) => processingMode === 'local'
+      ? localCpuTracker.copyToLocal(input)
+      : require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input }),
     getOwnerName: () => cameraImportSettings.ownerName,
     isEnabled: () => cameraImportSettings.enabled,
     onStatus: (status) => broadcastToRenderer('camera-import:status', status),
@@ -62,6 +67,23 @@ function setupCameraImport() {
   });
 
   ipcMain.handle('camera-import:get-status', () => cameraImportService.getStatus());
+
+  ipcMain.handle('processing:resolve-mode', async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    try {
+      const response = await fetch(`${APP_URL}/api/health`, { signal: controller.signal });
+      processingMode = response.ok ? 'online' : 'local';
+    } catch {
+      processingMode = 'local';
+    } finally {
+      clearTimeout(timer);
+    }
+    return { mode: processingMode, label: processingMode === 'online' ? 'RTX 3090' : 'Локально (CPU)' };
+  });
+  ipcMain.handle('local-cpu:process', (_event, video) => localCpuTracker.processLocalVideo(video));
+  ipcMain.handle('local-cpu:history', () => localCpuTracker.getHistory());
+  ipcMain.handle('local-cpu:analysis', (_event, videoId) => localCpuTracker.getAnalysis(videoId));
 
   cameraImportService.start();
 }
@@ -135,7 +157,7 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith(APP_URL) && !url.startsWith('http://localhost:8081')) {
+    if (!url.startsWith(APP_URL) && !url.startsWith('http://localhost:8081') && !url.startsWith('file:')) {
       event.preventDefault();
       shell.openExternal(url);
     }
@@ -150,7 +172,7 @@ function createWindow() {
       detail: `${errorDescription}\n${url}`,
       buttons: ['Повторить', 'Закрыть'],
     }).then(({ response }) => {
-      if (response === 0) mainWindow.loadURL(DESKTOP_APP_URL);
+      if (response === 0) mainWindow.loadFile(path.join(__dirname, '../dist/index.html'), { hash: '/trajectory?desktop=1' });
       else mainWindow.close();
     });
   });
@@ -158,7 +180,9 @@ function createWindow() {
   if (isDev) {
     mainWindow.loadURL('http://localhost:8081/trajectory?desktop=1');
   } else {
-    mainWindow.loadURL(DESKTOP_APP_URL);
+    // Интерфейс входит в дистрибутив. Поэтому он открывается и без сети,
+    // а сетевой backend используется только когда проверка выбрала RTX 3090.
+    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'), { hash: '/trajectory?desktop=1' });
   }
 
   mainWindow.on('closed', () => { mainWindow = null; });

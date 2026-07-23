@@ -42,6 +42,7 @@ export interface CameraImportedVideo {
   ownerName: string;
   sourcePath: string;
   volumeName: string | null;
+  localPath?: string;
 }
 
 export interface CameraImportSettings {

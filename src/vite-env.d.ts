@@ -19,6 +19,12 @@ interface TrackAIWindowBridge {
   copyToClipboard?: (text: string) => void;
   readFromClipboard?: () => string;
   cameraImport?: TrackAICameraImportBridge;
+  processing?: { resolveMode: () => Promise<{ mode: 'online' | 'local'; label: string }> };
+  localCpu?: {
+    process: (video: unknown) => Promise<unknown>;
+    history: () => Promise<unknown[]>;
+    analysis: (videoId: string) => Promise<unknown>;
+  };
 }
 
 interface Window {

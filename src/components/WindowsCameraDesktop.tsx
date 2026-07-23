@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import TrajectoryMap, { type TrajectoryData, type TurnPoint } from "@/components/TrajectoryMap";
 import { apiClient, type VideoAnalysisResult, type VideoListItem } from "@/lib/api";
@@ -9,6 +9,11 @@ const FLOORPLAN_URL = "/floorplans/kerama-marazzi-2025.png";
 const CAMERA_OWNER = "Экшен-камера";
 
 type DesktopState = "ready" | "looking" | "copying" | "processing" | "done" | "needs_camera" | "error";
+type ProcessingMode = "online" | "local";
+
+function getDesktopBridge() {
+  return (window as unknown as { trackai?: Window["trackai"] }).trackai;
+}
 
 function getDesktopTrajectory(data: VideoAnalysisResult["data"], videoId: string): TrajectoryData[] {
   if (!data) return [];
@@ -34,19 +39,35 @@ export default function WindowsCameraDesktop() {
   const [history, setHistory] = useState<VideoListItem[]>([]);
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [stats, setStats] = useState<Record<string, unknown>>({});
+  const [processingMode, setProcessingMode] = useState<ProcessingMode>("online");
+  const processingModeRef = useRef<ProcessingMode>("online");
+
+  const resolveProcessingMode = useCallback(async () => {
+    const bridge = getDesktopBridge();
+    const next = await bridge?.processing?.resolveMode?.();
+    const mode = next?.mode === "local" ? "local" : "online";
+    processingModeRef.current = mode;
+    setProcessingMode(mode);
+    return mode;
+  }, []);
 
   const refreshHistory = useCallback(async () => {
     try {
-      const response = await apiClient.getUploadedVideosList();
-      setHistory(response.videos || []);
+      if (processingModeRef.current === "local") {
+        const items = await getDesktopBridge()?.localCpu?.history?.();
+        setHistory((items || []) as VideoListItem[]);
+      } else {
+        const response = await apiClient.getUploadedVideosList();
+        setHistory(response.videos || []);
+      }
     } catch {
       setHistory([]);
     }
   }, []);
 
   useEffect(() => {
-    void refreshHistory();
-  }, [refreshHistory]);
+    void resolveProcessingMode().then(() => refreshHistory());
+  }, [refreshHistory, resolveProcessingMode]);
 
   const processImportedVideos = useCallback(async (videos: CameraImportedVideo[]) => {
     if (!videos.length) return;
@@ -58,6 +79,14 @@ export default function WindowsCameraDesktop() {
       for (let index = 0; index < videos.length; index += 1) {
         const video = videos[index];
         setMessage(`Анализируем ${index + 1} из ${videos.length}: ${video.original_filename || video.filename}`);
+        if (processingModeRef.current === "local") {
+          const local = await getDesktopBridge()?.localCpu?.process(video);
+          const nextTrajectory = getDesktopTrajectory((local as VideoAnalysisResult | undefined)?.data, video.video_id);
+          if (!nextTrajectory.length) throw new Error("Локальный CPU-трекер не вернул траекторию");
+          setTrajectories((current) => [...current, ...nextTrajectory]);
+          setStats(((local as VideoAnalysisResult).data?.processing_stats || {}) as Record<string, unknown>);
+          continue;
+        }
         const started = await apiClient.analyzeVideoById(
           video.video_id,
           12.306,
@@ -94,7 +123,7 @@ export default function WindowsCameraDesktop() {
         setStats((result?.processing_stats || {}) as Record<string, unknown>);
       }
       setState("done");
-      setMessage("Готово. Траектория показана на плане Kerama Marazzi.");
+      setMessage(processingModeRef.current === "local" ? "Готово. Локальная ориентировочная траектория показана на плане Kerama Marazzi." : "Готово. Траектория показана на плане Kerama Marazzi.");
       await refreshHistory();
     } catch (error) {
       setState("error");
@@ -131,8 +160,9 @@ export default function WindowsCameraDesktop() {
       return;
     }
     setState("looking");
-    setMessage("Ищем подключённую экшен-камеру...");
+    setMessage("Проверяем подключение и ищем экшен-камеру...");
     try {
+      const mode = await resolveProcessingMode();
       await cameraImport.setSettings({ enabled: true, ownerName: CAMERA_OWNER });
       const status = await cameraImport.scanNow({ forceImport: true });
       if (!status.volumes?.length) {
@@ -140,7 +170,7 @@ export default function WindowsCameraDesktop() {
         setMessage("Камера не найдена. Подключите её по USB, разблокируйте накопитель и нажмите «Загрузить» ещё раз.");
       } else if (!status.pendingFiles?.length && !status.importing) {
         setState("ready");
-        setMessage("На подключённой камере нет новых видео.");
+        setMessage(mode === "local" ? "Нет новых видео. Локальный CPU-режим готов." : "На подключённой камере нет новых видео. Готова обработка на RTX 3090.");
       }
     } catch (error) {
       setState("error");
@@ -150,11 +180,14 @@ export default function WindowsCameraDesktop() {
 
   const openHistoryItem = async (video: VideoListItem) => {
     try {
-      const result = await apiClient.getVideoAnalysis(video.video_id);
+      const result = processingModeRef.current === "local"
+        ? await getDesktopBridge()?.localCpu?.analysis(video.video_id) as { data?: VideoAnalysisResult["data"] }
+        : await apiClient.getVideoAnalysis(video.video_id);
+      if (!result) throw new Error("Результат анализа не найден");
       const next = getDesktopTrajectory(result.data, video.video_id);
       if (!next.length) throw new Error("Для этого видео ещё нет готовой траектории");
       setTrajectories(next);
-      setStats((result.data?.processing_stats || {}) as Record<string, unknown>);
+      setStats((result?.data?.processing_stats || {}) as Record<string, unknown>);
       setState("done");
       setMessage(`Открыта траектория: ${video.filename}`);
       setHistoryOpen(false);
@@ -171,13 +204,16 @@ export default function WindowsCameraDesktop() {
     <main className="min-h-[100dvh] bg-slate-950 text-slate-50">
       <header className="flex h-16 items-center justify-between border-b border-slate-800 px-6">
         <div className="flex items-center gap-3 font-semibold tracking-tight"><MapPinned className="h-5 w-5 text-teal-400" />TrackAI</div>
-        <div className="relative">
+        <div className="flex items-center gap-3">
+          <span className={`text-xs ${processingMode === "online" ? "text-teal-300" : "text-amber-300"}`}>{processingMode === "online" ? "RTX 3090" : "Локально (CPU)"}</span>
+          <div className="relative">
           <Button variant="ghost" className="gap-2 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => { setHistoryOpen((open) => !open); void refreshHistory(); }}>
             <History className="h-4 w-4" />История<ChevronDown className="h-4 w-4" />
           </Button>
           {historyOpen && <div className="absolute right-0 top-11 z-10 w-96 overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
             {history.length ? history.slice(0, 12).map((video) => <button key={video.video_id} onClick={() => void openHistoryItem(video)} className="block w-full border-b border-slate-800 px-4 py-3 text-left text-sm last:border-0 hover:bg-slate-800"><span className="block truncate text-slate-100">{video.filename}</span><span className="text-xs text-slate-400">{video.has_analysis ? "Траектория готова" : "В обработке"}</span></button>) : <p className="px-4 py-5 text-sm text-slate-400">История пока пуста</p>}
           </div>}
+          </div>
         </div>
       </header>
 
@@ -185,12 +221,12 @@ export default function WindowsCameraDesktop() {
         <div className="flex min-h-[430px] flex-col justify-center">
           <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-400 text-slate-950"><Camera className="h-6 w-6" /></div>
           <h1 className="text-4xl font-semibold tracking-tight">Видео с камеры</h1>
-          <p className="mt-3 max-w-sm leading-6 text-slate-400">Подключите экшен-камеру. TrackAI сам скопирует новые видео, запустит трекинг и покажет маршрут на плане.</p>
+          <p className="mt-3 max-w-sm leading-6 text-slate-400">Подключите экшен-камеру. При доступной сети анализ идёт на RTX 3090, без сети - локально на CPU.</p>
           <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-400 text-base font-semibold text-slate-950 hover:bg-teal-300 active:translate-y-px" disabled={busy} onClick={() => void handleUpload()}>
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Upload className="h-5 w-5" />}{buttonText}
           </Button>
           <p className={`mt-4 text-sm ${state === "error" ? "text-rose-300" : state === "needs_camera" ? "text-amber-300" : "text-slate-400"}`}>{message}</p>
-          {progress && <p className="mt-2 text-xs text-teal-300">{Math.round(progress.percent)}% загружено</p>}
+          {progress && <p className="mt-2 text-xs text-teal-300">{Math.round(progress.percent)}% скопировано</p>}
         </div>
         <div className="min-h-[520px] overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 p-2">
           {trajectories.length ? <TrajectoryMap trajectories={trajectories} stats={stats} floorPlan={FLOORPLAN_URL} compactMode /> : <div className="flex h-full min-h-[500px] items-center justify-center bg-slate-950/40 text-center text-sm text-slate-500">После обработки здесь появится траектория<br />на плане Kerama Marazzi</div>}

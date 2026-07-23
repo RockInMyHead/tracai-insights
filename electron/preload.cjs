@@ -9,6 +9,14 @@ contextBridge.exposeInMainWorld('trackai', {
   isDesktop: true,
   version: process.env.npm_package_version || '1.18.1',
   serverUrl: 'http://93.189.231.189',
+  processing: {
+    resolveMode: () => ipcRenderer.invoke('processing:resolve-mode'),
+  },
+  localCpu: {
+    process: (video) => ipcRenderer.invoke('local-cpu:process', video),
+    history: () => ipcRenderer.invoke('local-cpu:history'),
+    analysis: (videoId) => ipcRenderer.invoke('local-cpu:analysis', videoId),
+  },
   openExternal: (url) => shell.openExternal(url),
   copyToClipboard: (text) => clipboard.writeText(String(text)),
   readFromClipboard: () => clipboard.readText(),
