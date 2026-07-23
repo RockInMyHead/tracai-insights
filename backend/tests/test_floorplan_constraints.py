@@ -285,7 +285,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["route_observed_length_ratio"], 1.0)
         self.assertFalse(metrics["spike"], metrics)
 
-    def test_authoritative_spike_can_reach_graph_recovery_before_rejection(self) -> None:
+    def test_authoritative_spike_is_rejected_without_global_route_rewrite(self) -> None:
         mask = np.zeros((120, 120), dtype=bool)
         mask[10:110, 55:65] = True
         engine = FloorplanConstraintEngine.from_mask(
@@ -298,28 +298,10 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             [45.5, 60.5], [53.0, 60.5], [60.5, 60.5],
             [68.0, 60.5], [75.5, 60.5],
         ])
-        diagnostics: dict[str, object] = {}
-        provisional, _ = engine._repair_collisions(
-            observed,
-            allow_provisional_spikes=True,
-            repair_diagnostics=diagnostics,
-        )
-        self.assertIsNotNone(provisional)
-        self.assertGreater(int(diagnostics.get("provisional_spike_count", 0)), 0)
         with patch.object(
             engine,
             "_multilevel_viterbi_map_match",
-            return_value=(
-                provisional,
-                {
-                    "attempted": True,
-                    "accepted": False,
-                    "method": "corridor_graph_multilevel_viterbi_v3_second_order",
-                    "reason": None,
-                    "post_repair_segments": 0,
-                },
-            ),
-        ):
+        ) as matcher:
             result = engine.align(
                 observed.tolist(),
                 {"x": 45.5 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
@@ -328,13 +310,9 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 scale_candidates=[1.0],
                 yaw_offsets_degrees=[0.0],
             )
-        self.assertTrue(result["accepted"], result["diagnostics"])
-        self.assertGreater(result["diagnostics"]["topology_recovery_attempted"], 0)
-        self.assertGreater(result["diagnostics"]["topology_recovery_accepted"], 0)
-        self.assertEqual(
-            result["diagnostics"]["nonlinear_map_matching"]["phase"],
-            "preselection_spike_recovery",
-        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertEqual(result["diagnostics"]["topology_recovery_attempted"], 0)
+        matcher.assert_not_called()
 
     def test_sharp_reverse_ratio_flags_triangular_spike(self) -> None:
         # Straight walk with one large triangular detour (classic bad A* spike).
@@ -1131,20 +1109,19 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(engine._collision_runs(matched), [])
         self.assertGreater(diagnostics["corridor_graph_nodes"], 0)
 
-    def test_second_order_hmm_is_enabled_in_production(self) -> None:
+    def test_second_order_hmm_is_disabled_in_production(self) -> None:
         mask = np.zeros((120, 180), dtype=bool)
         mask[42:78, 78:102] = True
         engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
-        with patch.dict(os.environ, {"TRACKAI_ENABLE_MULTILEVEL_HMM": "1"}):
-            result = engine.align(
-                [[0, 0], [20, 0], [40, 0], [60, 0], [80, 0]],
-                {"x": 10, "y": 50}, {"x": 30, "y": 50},
-                scale_candidates=[2.0], yaw_offsets_degrees=[0.0],
-            )
+        result = engine.align(
+            [[0, 0], [20, 0], [40, 0], [60, 0], [80, 0]],
+            {"x": 10, "y": 50}, {"x": 30, "y": 50},
+            scale_candidates=[2.0], yaw_offsets_degrees=[0.0],
+        )
         self.assertTrue(result["accepted"], result["diagnostics"])
         nonlinear = result["diagnostics"]["nonlinear_map_matching"]
-        self.assertTrue(nonlinear["attempted"])
-        self.assertTrue(nonlinear["production_enabled"])
+        self.assertFalse(nonlinear["attempted"])
+        self.assertFalse(nonlinear["production_enabled"])
         self.assertEqual(
             nonlinear["method"],
             "corridor_graph_multilevel_viterbi_v3_second_order",

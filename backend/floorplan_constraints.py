@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_dense_publication_repair_v26"
+    "kerama_shape_preserving_local_repair_v27"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -45,6 +45,10 @@ INDEPENDENT_SPEED_RATIO_BOUNDS = (0.72, 1.80)
 INDEPENDENT_LOOP_CLOSED_SPEED_RATIO_BOUNDS = (0.55, 1.80)
 INDEPENDENT_LONG_INSPECTION_SPEED_RATIO_BOUNDS = (0.04, 1.80)
 LONG_INSPECTION_MIN_SECONDS = 480.0
+# Maximum search envelope for a local obstacle correction.  The route must
+# never explore another aisle merely because it is connected in the mask.
+LOCAL_ASTAR_INITIAL_MARGIN_METERS = 6.0
+LOCAL_ASTAR_MAX_MARGIN_METERS = 12.0
 INDEPENDENT_LOOP_CLOSED_MIN_LENGTH_RATIO = 0.65
 STANDARD_YAW_OFFSETS_DEGREES = (
     -20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0
@@ -935,11 +939,13 @@ class FloorplanConstraintEngine:
             return None
 
         raw_cells = np.asarray([self._pixel_to_cell(point) for point in raw_segment], dtype=np.int32)
-        # Large production machines can require a detour around their entire
-        # footprint.  Thirty metres covers the wider Kerama equipment islands
-        # where a 12 m local window left start/end in the same global component
-        # but still made A* report no path.  On failure the search still doubles.
-        initial_margin = max(24, int(round(30.0 / max(self.cell_meters, 1e-9))))
+        # This is deliberately a local repair window.  A larger search can
+        # find a legal but unrelated aisle and thereby replace an R3 walk with
+        # a plausible-looking route through the plant.
+        initial_margin = max(
+            24,
+            int(round(LOCAL_ASTAR_INITIAL_MARGIN_METERS / max(self.cell_meters, 1e-9))),
+        )
         margin = initial_margin if _search_margin_cells is None else _search_margin_cells
         min_x = max(0, min(start[0], end[0], int(raw_cells[:, 0].min())) - margin)
         max_x = min(self.cols - 1, max(start[0], end[0], int(raw_cells[:, 0].max())) + margin)
@@ -1028,9 +1034,12 @@ class FloorplanConstraintEngine:
                 previous[key] = current
                 heuristic = math.hypot(end[0] - nx, end[1] - ny) * self.cell_meters
                 heappush(queue, (candidate + heuristic, candidate, key))
-        # Expand locally for large machines, but never to the whole plant:
-        # full-map search invents mask-legal spikes through distant CAD gaps.
-        max_margin = max(initial_margin, int(round(50.0 / max(self.cell_meters, 1e-9))))
+        # One bounded expansion handles a wide local obstruction without
+        # crossing into a remote corridor.
+        max_margin = max(
+            initial_margin,
+            int(round(LOCAL_ASTAR_MAX_MARGIN_METERS / max(self.cell_meters, 1e-9))),
+        )
         if margin < max_margin:
             return self._astar(
                 start_point,
@@ -1173,7 +1182,6 @@ class FloorplanConstraintEngine:
                 return None, len(merged)
             rebuilt.extend(points[cursor:left])
             raw_segment = points[left:right + 1]
-            segment_m = _polyline_length(raw_segment) * self.config.meters_per_pixel
             start_cell = self._nearest_free(self._pixel_to_cell(points[left]))
             end_cell = self._nearest_free(self._pixel_to_cell(points[right]))
             connectivity_reason = None
@@ -1784,8 +1792,15 @@ class FloorplanConstraintEngine:
         if observation_policy not in {"authoritative", "independent"}:
             observation_policy = "authoritative"
         raw = _normalise_points(trajectory)
+        # Global graph matching is kept as an explicit diagnostic tool only.
+        # Production must preserve the R3 curve and may make only short local
+        # obstacle repairs; otherwise a valid-looking route can jump to a
+        # completely different green corridor on the plan.
+        topology_recovery_enabled = os.getenv(
+            "TRACKAI_ENABLE_EXPERIMENTAL_TOPOLOGY_RECOVERY", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v8_topology_recovery",
+            "engine": "floorplan_constraint_engine_v9_shape_preserving",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -1796,8 +1811,9 @@ class FloorplanConstraintEngine:
             "observation_policy": observation_policy,
             "loop_closure_verified": bool(loop_closure_verified),
             "independent_corridor_recovery_enabled": bool(
-                allow_independent_corridor_recovery
+                allow_independent_corridor_recovery and topology_recovery_enabled
             ),
+            "topology_recovery_enabled": topology_recovery_enabled,
             "support_mask_enabled": self._support_mask is not None,
             "support_coverage_ratio": (
                 round(float(np.mean(self._support_mask)), 8)
@@ -1952,13 +1968,15 @@ class FloorplanConstraintEngine:
             repaired, rerouted_segments = self._repair_collisions(
                 hypothesis["points"],
                 failure_reasons=route_failures,
-                allow_provisional_spikes=observation_policy == "authoritative",
+                allow_provisional_spikes=topology_recovery_enabled,
                 repair_diagnostics=repair_diagnostics,
             )
             record_route_failures(route_failures)
             segmented_recovery: Optional[dict[str, Any]] = None
             if repaired is None:
                 can_repair_in_segments = (
+                    topology_recovery_enabled
+                    and
                     (
                         observation_policy == "authoritative"
                         or allow_independent_corridor_recovery
@@ -1996,6 +2014,8 @@ class FloorplanConstraintEngine:
                 # leaving genuine ``local_search_exhausted`` cases with zero
                 # topology-recovery attempts.
                     can_recover_exhausted_search = (
+                        topology_recovery_enabled
+                        and
                         (
                             observation_policy == "authoritative"
                             or allow_independent_corridor_recovery
@@ -2046,7 +2066,10 @@ class FloorplanConstraintEngine:
                     )
             else:
                 topology_recovery = None
-            if int(repair_diagnostics.get("provisional_spike_count", 0)) > 0:
+            if (
+                topology_recovery_enabled
+                and int(repair_diagnostics.get("provisional_spike_count", 0)) > 0
+            ):
                 topology_recovery_attempted += 1
                 nonlinear, topology_recovery = self._multilevel_viterbi_map_match(
                     hypothesis["points"],
@@ -2448,9 +2471,7 @@ class FloorplanConstraintEngine:
         rerouted_segments = int(best["rerouted_segments"])
         p95_correction = float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
         speed = float(best["corrected_speed_mps"])
-        nonlinear_map_matching_enabled = os.getenv(
-            "TRACKAI_ENABLE_MULTILEVEL_HMM", "1"
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        nonlinear_map_matching_enabled = topology_recovery_enabled
         preselection_recovery = best.get("topology_recovery")
         if isinstance(preselection_recovery, dict):
             # This route entered the feasible set only after the graph matcher
