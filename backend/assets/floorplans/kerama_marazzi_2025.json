@@ -18,14 +18,14 @@
   "person_radius_meters": 0.28,
   "walking_speed_mps": 1.2,
   "default_start_anchor": {
-    "source": "fixed_plan_start_calibration",
+    "source": "fixed_plan_start_left_heading_v2",
     "reference_pixels": [
       2222.623,
       684.183
     ],
     "direction_pixels": [
-      2291.383,
-      757.285
+      2153.863,
+      611.081
     ],
     "trajectory_points_used": false
   },

@@ -2991,9 +2991,15 @@ def apply_floorplan_constraints(
         "source_prior": 0.45 if fragmented_r3 else 0.05,
     }]
 
+    # R3 is the authoritative motion observation.  LingBot can be useful for
+    # diagnostics, but must not silently replace the direction/topology of a
+    # measured R3 path on the production floor plan.
+    fusion_map_candidate_enabled = os.getenv(
+        "TRACKAI_ENABLE_FUSION_MAP_CANDIDATE", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     fusion_points = (
         candidate_payload.get("plan_trajectory") or []
-        if candidate_payload.get("accepted")
+        if candidate_payload.get("accepted") and fusion_map_candidate_enabled
         else []
     )
     if fusion_points:
@@ -3126,7 +3132,8 @@ def apply_floorplan_constraints(
         "reason": "no_candidate_satisfied_floorplan",
         "r3_severely_fragmented": bool(fragmented_r3),
         "fragmentation_policy": "soft_prior_not_veto",
-        "selection_policy": "metric_authoritative_then_guarded_independent_v5_heading_fallback",
+        "selection_policy": "r3_primary_only_left_heading_v6",
+        "fusion_map_candidate_enabled": fusion_map_candidate_enabled,
         "candidate_results": [],
     }
     selected_observation: Optional[dict[str, Any]] = None

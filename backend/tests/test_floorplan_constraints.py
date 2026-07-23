@@ -616,11 +616,12 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 },
             },
         }
-        updated = apply_floorplan_constraints(source, {
-            "floorplan_id": "kerama_marazzi_2025",
-            "reference_point": {"x": 2226 / 5298 * 100, "y": 678 / 3743 * 100},
-            "direction_point": {"x": 2145 / 5298 * 100, "y": 705 / 3743 * 100},
-        })
+        with patch.dict(os.environ, {"TRACKAI_ENABLE_FUSION_MAP_CANDIDATE": "1"}):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "kerama_marazzi_2025",
+                "reference_point": {"x": 2226 / 5298 * 100, "y": 678 / 3743 * 100},
+                "direction_point": {"x": 2145 / 5298 * 100, "y": 705 / 3743 * 100},
+            })
 
         self.assertTrue(updated["processing_stats"]["map_matching_applied"])
         self.assertEqual(
