@@ -199,32 +199,32 @@ export default function WindowsCameraDesktop() {
   const buttonText = busy ? "Выполняется" : "Загрузить";
 
   return (
-    <main className="min-h-[100dvh] bg-slate-950 text-slate-50">
-      <header className="flex h-16 items-center justify-between border-b border-slate-800 px-6">
-        <div className="flex items-center gap-3 font-semibold tracking-tight"><MapPinned className="h-5 w-5 text-teal-400" />TrackAI</div>
+    <main className="min-h-[100dvh] bg-slate-50 text-slate-950">
+      <header className="flex h-16 items-center justify-between border-b border-slate-200 bg-slate-50 px-6">
+        <div className="flex items-center gap-3 font-semibold tracking-tight"><MapPinned className="h-5 w-5 text-teal-700" />TrackAI</div>
         <div className="relative">
-          <Button variant="ghost" className="gap-2 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => { setHistoryOpen((open) => !open); void refreshHistory(); }}>
+          <Button variant="ghost" className="gap-2 text-slate-700 hover:bg-slate-200 hover:text-slate-950" onClick={() => { setHistoryOpen((open) => !open); void refreshHistory(); }}>
             <History className="h-4 w-4" />История<ChevronDown className="h-4 w-4" />
           </Button>
-          {historyOpen && <div className="absolute right-0 top-11 z-10 w-96 overflow-hidden rounded-xl border border-slate-700 bg-slate-900 shadow-2xl">
-            {history.length ? history.slice(0, 12).map((video) => <button key={video.video_id} onClick={() => void openHistoryItem(video)} className="block w-full border-b border-slate-800 px-4 py-3 text-left text-sm last:border-0 hover:bg-slate-800"><span className="block truncate text-slate-100">{video.filename}</span><span className="text-xs text-slate-400">{video.has_analysis ? "Траектория готова" : "В обработке"}</span></button>) : <p className="px-4 py-5 text-sm text-slate-400">История пока пуста</p>}
+          {historyOpen && <div className="absolute right-0 top-11 z-10 w-96 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-xl shadow-slate-300/40">
+            {history.length ? history.slice(0, 12).map((video) => <button key={video.video_id} onClick={() => void openHistoryItem(video)} className="block w-full border-b border-slate-200 px-4 py-3 text-left text-sm last:border-0 hover:bg-slate-100"><span className="block truncate text-slate-900">{video.filename}</span><span className="text-xs text-slate-500">{video.has_analysis ? "Траектория готова" : "В обработке"}</span></button>) : <p className="px-4 py-5 text-sm text-slate-500">История пока пуста</p>}
           </div>}
         </div>
       </header>
 
       <section className="mx-auto grid max-w-6xl gap-8 px-6 py-10 lg:grid-cols-[360px_1fr]">
         <div className="flex min-h-[430px] flex-col justify-center">
-          <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-400 text-slate-950"><Camera className="h-6 w-6" /></div>
+          <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-100 text-teal-800"><Camera className="h-6 w-6" /></div>
           <h1 className="text-4xl font-semibold tracking-tight">Видео с камеры</h1>
-          <p className="mt-3 max-w-sm leading-6 text-slate-400">Подключите экшен-камеру. TrackAI скопирует новые видео, обработает их и покажет маршрут на плане.</p>
-          <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-400 text-base font-semibold text-slate-950 hover:bg-teal-300 active:translate-y-px" disabled={busy} onClick={() => void handleUpload()}>
+          <p className="mt-3 max-w-sm leading-6 text-slate-600">Подключите экшен-камеру. TrackAI скопирует новые видео, обработает их и покажет маршрут на плане.</p>
+          <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-700 text-base font-semibold text-slate-50 hover:bg-teal-800 active:translate-y-px" disabled={busy} onClick={() => void handleUpload()}>
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Upload className="h-5 w-5" />}{buttonText}
           </Button>
-          <p className={`mt-4 text-sm ${state === "error" ? "text-rose-300" : state === "needs_camera" ? "text-amber-300" : "text-slate-400"}`}>{message}</p>
-          {progress && <p className="mt-2 text-xs text-teal-300">{Math.round(progress.percent)}% скопировано</p>}
+          <p className={`mt-4 text-sm ${state === "error" ? "text-rose-700" : state === "needs_camera" ? "text-amber-700" : "text-slate-600"}`}>{message}</p>
+          {progress && <p className="mt-2 text-xs text-teal-700">{Math.round(progress.percent)}% скопировано</p>}
         </div>
-        <div className="min-h-[520px] overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 p-2">
-          {trajectories.length ? <TrajectoryMap trajectories={trajectories} stats={stats} floorPlan={FLOORPLAN_URL} compactMode /> : <div className="flex h-full min-h-[500px] items-center justify-center bg-slate-950/40 text-center text-sm text-slate-500">После обработки здесь появится траектория<br />на плане Kerama Marazzi</div>}
+        <div className="min-h-[520px] overflow-hidden rounded-2xl border border-slate-200 bg-slate-100 p-2 shadow-sm shadow-slate-300/40">
+          {trajectories.length ? <TrajectoryMap trajectories={trajectories} stats={stats} floorPlan={FLOORPLAN_URL} compactMode /> : <div className="flex h-full min-h-[500px] items-center justify-center bg-slate-100 text-center text-sm text-slate-500">После обработки здесь появится траектория<br />на плане Kerama Marazzi</div>}
         </div>
       </section>
     </main>
