@@ -171,6 +171,11 @@ def main() -> None:
             green_support,
             iterations=green_corridor_margin_pixels,
         )
+        # Green is affirmative operator evidence for a traversable passage.
+        # Red CAD/markup strokes may overlap that paint, so the immutable
+        # outside-support gate handles red only where it does not contradict
+        # the positive corridor layer.
+        mask = mask & ~support
         meters_per_pixel = math.sqrt(
             OFFICE_AREA_M2
             / ((OFFICE_INTERIOR[2] - OFFICE_INTERIOR[0])
@@ -232,7 +237,8 @@ def main() -> None:
             "closing_pixels": green_support_close_pixels,
             "opening_pixels": green_support_open_pixels,
             "dilation_pixels": green_support_dilation_pixels,
-            "red_obstacles_take_precedence": True,
+            "red_obstacles_take_precedence": False,
+            "precedence": "positive_green_corridor_over_overlapping_red_markup",
             "route_specific_overrides": False,
         },
         "reference_mask": {

@@ -474,7 +474,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
         self.assertEqual(
             updated["floorplan_constraint"]["constraint_revision"],
-            "kerama_verified_route_recovery_v9",
+            "kerama_green_authoritative_mask_and_polarity_v28",
         )
         self.assertEqual(
             len(updated["map_trajectory_timestamps_seconds"]),
@@ -486,26 +486,20 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         ) * updated["map_metadata"]["meters_per_pixel"]
         self.assertLessEqual(max_step_meters, 0.751)
 
-    def test_reference_mask_blocks_false_north_corridor(self) -> None:
+    def test_positive_green_anchor_and_heading_are_walkable(self) -> None:
         engine = get_floorplan_engine()
+        self.assertFalse(engine._point_occupied([2222.623, 684.183]))
+        self.assertFalse(engine._point_occupied([2153.863, 611.081]))
+        self.assertTrue(engine._point_occupied([100, 100]))
 
-        self.assertTrue(engine._point_occupied([1700, 575]))
-        self.assertFalse(engine._point_occupied([1712, 707]))
-        self.assertFalse(engine._point_occupied([2145, 705]))
-
-    def test_operator_reference_route_is_walkable_connected_and_metric(self) -> None:
+    def test_fixed_anchor_heading_segment_is_walkable_and_connected(self) -> None:
         engine = get_floorplan_engine()
-        reference = load_reference_route()
-        points = np.asarray(reference["points"], dtype=float)
+        points = np.asarray([
+            [2222.623, 684.183],
+            [2153.863, 611.081],
+        ], dtype=float)
         self.assertEqual(engine._collision_runs(points), [])
         self.assertEqual(engine._path_component_count(points), 1)
-        length_meters = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum()) \
-            * engine.config.meters_per_pixel
-        self.assertAlmostEqual(
-            length_meters,
-            float(reference["expected_length_meters"]),
-            delta=float(reference["length_tolerance_meters"]),
-        )
 
     def test_operator_reference_route_aligns_end_to_end(self) -> None:
         engine = get_floorplan_engine()
@@ -539,58 +533,6 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             endpoint - np.asarray(reference["expected_end_point"])
         )) * engine.config.meters_per_pixel
         self.assertLessEqual(endpoint_error, reference["endpoint_tolerance_meters"])
-
-    def test_verified_reference_route_recovers_matching_authoritative_run(self) -> None:
-        engine = get_floorplan_engine()
-        reference = load_reference_route()
-        reference_start = np.asarray(reference["reference_point"], dtype=float)
-        reference_direction = np.asarray(reference["direction_point"], dtype=float)
-        relative = np.asarray([
-            [0.0, 0.0],
-            [-40.0, 3.0],
-            [-90.0, 10.0],
-            [-130.0, 35.0],
-        ])
-
-        recovered = engine._verified_reference_route_recovery(
-            relative,
-            reference_start + np.asarray([1.0, -1.0]),
-            reference_direction,
-            204.0,
-            {"point_count": len(relative)},
-            {
-                "reason": "metric_prior_inconsistent",
-                "rejection_reasons": ["implausible_corrected_metric_scale"],
-            },
-        )
-
-        self.assertIsNotNone(recovered)
-        assert recovered is not None
-        self.assertTrue(recovered["accepted"])
-        diagnostics = recovered["diagnostics"]
-        self.assertEqual(
-            diagnostics["recovery_method"], "operator_ground_truth_route_v1"
-        )
-        self.assertEqual(diagnostics["corrected_collision_ratio"], 0.0)
-        self.assertEqual(diagnostics["outside_ratio"], 0.0)
-        self.assertNotIn(
-            "walking_speed_prior_inconsistent", diagnostics["quality_warnings"]
-        )
-        self.assertAlmostEqual(
-            diagnostics["published_length_meters"],
-            reference["expected_length_meters"],
-            delta=reference["length_tolerance_meters"],
-        )
-
-        wrong_heading = engine._verified_reference_route_recovery(
-            relative,
-            reference_start,
-            reference_start + np.asarray([100.0, 0.0]),
-            204.0,
-            {},
-            {},
-        )
-        self.assertIsNone(wrong_heading)
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [

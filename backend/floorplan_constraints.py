@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_shape_preserving_local_repair_v27"
+    "kerama_green_authoritative_mask_and_polarity_v28"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -2990,6 +2990,26 @@ def apply_floorplan_constraints(
         # route from competition.
         "source_prior": 0.45 if fragmented_r3 else 0.05,
     }]
+
+    if method.startswith("r3") and primary_convention == "x_forward_y_left_z_up":
+        # R3's recovered floor plane has a chirality, but the display plan is
+        # rasterised with image Y pointing down.  The camera metadata reports
+        # the former convention and therefore cannot, by itself, prove the
+        # correct raster polarity.  Evaluate the other *global* polarity as
+        # an equal R3 observation; the fixed start/direction and hard green
+        # corridor mask decide it.  This changes only one similarity transform
+        # for the whole curve -- it does not mirror individual turns or invoke
+        # a route-inventing A* fallback.
+        observations.append({
+            "source": primary_source,
+            "variant": "r3_image_y_down",
+            "points": primary_points,
+            "timestamps": source_timestamps,
+            "coordinate_convention": "x_right_y_down",
+            "selection_tier": 0,
+            "source_prior": (0.46 if fragmented_r3 else 0.06),
+            "polarity_candidate": "unflipped_r3_plan_y",
+        })
 
     # R3 is the authoritative motion observation.  LingBot can be useful for
     # diagnostics, but must not silently replace the direction/topology of a

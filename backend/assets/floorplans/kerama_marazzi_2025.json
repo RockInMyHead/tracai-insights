@@ -30,7 +30,7 @@
     "trajectory_points_used": false
   },
   "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
-  "obstacle_mask_sha256": "94559efb6afc79c3a35e45420480e5059a4c745a8a5907aafdf82f0556a5520a",
+  "obstacle_mask_sha256": "313cb5dbc4989e6ebda09a2715541c595bab6983a4dd1a1df6e5b154cecdd912",
   "support_mask_file": "kerama_marazzi_2025_support.png",
   "support_mask_sha256": "d6bd00f432e0cb48a2673100a32756b7227a53aaf640dae02350d0efd4e04068",
   "support_mask_generation": {
@@ -66,7 +66,9 @@
     ],
     "reviewed_passage_policy": "remove_conflicting_red_inside_positive_green_only",
     "remaining_red_is_absolute": true,
-    "route_specific_overrides": false
+    "route_specific_overrides": false,
+    "remaining_red_is_absolute_outside_positive_green": true,
+    "overlap_policy": "positive_green_corridor_has_precedence"
   },
   "walkable_annotation": {
     "method": "changed_green_operator_annotation",
@@ -76,8 +78,10 @@
     "closing_pixels": 10,
     "opening_pixels": 3,
     "dilation_pixels": 6,
-    "red_obstacles_take_precedence": true,
-    "route_specific_overrides": false
+    "red_obstacles_take_precedence": false,
+    "route_specific_overrides": false,
+    "precedence": "positive_green_corridor_over_overlapping_red_markup",
+    "reconciliation": "green_support_authoritative_v1"
   },
   "reference_mask": {
     "method": "none",
