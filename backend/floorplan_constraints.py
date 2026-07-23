@@ -220,7 +220,7 @@ def _turn_topology_metrics(
     source: np.ndarray,
     corrected: np.ndarray,
     *,
-    samples: int = 64,
+    samples: int = 128,
     min_turn_degrees: float = TURN_TOPOLOGY_MIN_DEGREES,
 ) -> dict[str, float | int]:
     """Compare route turn sequence without requiring equal point counts.
@@ -229,54 +229,113 @@ def _turn_topology_metrics(
     turn a measured right/left sequence into another branch of the map.  The
     comparison is therefore arc-normalised and only meaningful turns vote.
     """
-    if len(source) < 3 or len(corrected) < 3:
+    if len(source) < 3:
         return {
             "turn_count": 0,
             "mean_abs_turn_error_degrees": 0.0,
             "max_abs_turn_error_degrees": 0.0,
             "sign_mismatch_ratio": 0.0,
+        }
+    if len(corrected) < 2:
+        return {
+            "turn_count": 0,
+            "mean_abs_turn_error_degrees": 180.0,
+            "max_abs_turn_error_degrees": 180.0,
+            "sign_mismatch_ratio": 1.0,
         }
     fractions = np.linspace(0.0, 1.0, int(samples))
     source_points = _resample_polyline(source, fractions)
     corrected_points = _resample_polyline(corrected, fractions)
 
-    def local_turns(points: np.ndarray) -> np.ndarray:
-        before = points[1:-1] - points[:-2]
-        after = points[2:] - points[1:-1]
-        before_norm = np.linalg.norm(before, axis=1)
-        after_norm = np.linalg.norm(after, axis=1)
-        valid = (before_norm > 1e-6) & (after_norm > 1e-6)
-        turns = np.zeros(len(before), dtype=np.float64)
-        cross = before[:, 0] * after[:, 1] - before[:, 1] * after[:, 0]
-        dot = np.sum(before * after, axis=1)
-        turns[valid] = np.degrees(np.arctan2(cross[valid], dot[valid]))
-        return turns
+    def turn_events(points: np.ndarray) -> list[tuple[float, float]]:
+        vectors = np.diff(points, axis=0)
+        headings = np.unwrap(np.arctan2(vectors[:, 1], vectors[:, 0]))
+        if len(headings) >= 5:
+            kernel = np.ones(5, dtype=np.float64) / 5.0
+            headings = np.convolve(
+                np.pad(headings, (2, 2), mode="edge"),
+                kernel,
+                mode="valid",
+            )
+        increments = np.degrees(np.diff(headings))
+        active = np.abs(increments) >= 1.25
+        events: list[tuple[float, float]] = []
+        index = 0
+        while index < len(increments):
+            if not active[index]:
+                index += 1
+                continue
+            sign = math.copysign(1.0, float(increments[index]))
+            end = index + 1
+            gap = 0
+            while end < len(increments):
+                same_sign = (
+                    active[end]
+                    and math.copysign(1.0, float(increments[end])) == sign
+                )
+                if same_sign:
+                    gap = 0
+                    end += 1
+                    continue
+                gap += 1
+                if gap > 2:
+                    break
+                end += 1
+            stop = max(index + 1, end - gap)
+            angle = float(np.sum(increments[index:stop]))
+            if abs(angle) >= float(min_turn_degrees):
+                center = (index + stop) / 2.0 / max(len(increments), 1)
+                events.append((center, angle))
+            index = max(end, index + 1)
+        return events
 
-    source_turns = local_turns(source_points)
-    corrected_turns = local_turns(corrected_points)
-    meaningful = np.abs(source_turns) >= float(min_turn_degrees)
-    if not np.any(meaningful):
+    source_events = turn_events(source_points)
+    corrected_events = turn_events(corrected_points)
+    if not source_events:
         return {
             "turn_count": 0,
             "mean_abs_turn_error_degrees": 0.0,
             "max_abs_turn_error_degrees": 0.0,
             "sign_mismatch_ratio": 0.0,
         }
-    delta = corrected_turns[meaningful] - source_turns[meaningful]
-    # Wrap signed angle errors to [-180, 180].
-    delta = (delta + 180.0) % 360.0 - 180.0
-    source_sign = np.sign(source_turns[meaningful])
-    corrected_sign = np.sign(corrected_turns[meaningful])
-    sign_mismatch = (
-        (corrected_sign != 0.0)
-        & (source_sign != 0.0)
-        & (corrected_sign != source_sign)
-    )
+
+    # Match events in order and tolerate a local arc-length displacement.
+    # Obstacle repair changes the distance around a corner, but it may not
+    # reorder corners or substitute an opposite branch.
+    cursor = 0
+    errors: list[float] = []
+    mismatches = 0
+    for source_fraction, source_angle in source_events:
+        candidates = [
+            (candidate_index, event)
+            for candidate_index, event in enumerate(
+                corrected_events[cursor:],
+                start=cursor,
+            )
+            if abs(event[0] - source_fraction) <= 0.12
+        ]
+        if not candidates:
+            errors.append(min(180.0, abs(source_angle)))
+            mismatches += 1
+            continue
+        best_index, (_, corrected_angle) = min(
+            candidates,
+            key=lambda item: (
+                (2.0 if np.sign(item[1][1]) != np.sign(source_angle) else 0.0)
+                + abs(item[1][0] - source_fraction)
+                + abs(abs(item[1][1]) - abs(source_angle)) / 180.0
+            ),
+        )
+        cursor = best_index + 1
+        delta = (corrected_angle - source_angle + 180.0) % 360.0 - 180.0
+        errors.append(abs(float(delta)))
+        mismatches += int(np.sign(corrected_angle) != np.sign(source_angle))
+
     return {
-        "turn_count": int(np.sum(meaningful)),
-        "mean_abs_turn_error_degrees": float(np.mean(np.abs(delta))),
-        "max_abs_turn_error_degrees": float(np.max(np.abs(delta))),
-        "sign_mismatch_ratio": float(np.mean(sign_mismatch)),
+        "turn_count": len(source_events),
+        "mean_abs_turn_error_degrees": float(np.mean(errors)),
+        "max_abs_turn_error_degrees": float(np.max(errors)),
+        "sign_mismatch_ratio": float(mismatches / len(source_events)),
     }
 
 

@@ -145,6 +145,25 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertGreater(result["raw_trajectory_3d"][8][0], 7.0)
         self.assertEqual(result["turn_points"], [])
 
+    def test_low_confidence_multi_pose_excursion_is_repaired(self) -> None:
+        coordinates = [[float(i), 0.0, 0.0] for i in range(24)]
+        coordinates[10] = [10.0, 5.0, 0.0]
+        coordinates[11] = [11.0, 7.0, 0.0]
+        coordinates[12] = [12.0, 5.0, 0.0]
+        poses = [make_pose(i, *point) for i, point in enumerate(coordinates)]
+        confidence = [2.0] * len(poses)
+        confidence[10:13] = [0.01, 0.01, 0.01]
+
+        result = build_r3_trajectory(poses, confidence)
+
+        cleaned = np.asarray(result["raw_trajectory_3d"], dtype=np.float64)
+        self.assertLess(float(np.max(np.abs(cleaned[10:13, 1]))), 0.1)
+        self.assertGreaterEqual(
+            result["trajectory_quality"]["island_outlier_points"],
+            1,
+        )
+        self.assertEqual(result["turn_points"], [])
+
     def test_detects_full_angle_of_gradual_ninety_degree_turn(self) -> None:
         # A rounded 90-degree turn spread across 24 R3 poses used to produce
         # no event because no short local window exceeded the threshold.
@@ -272,7 +291,7 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(correction["applied_count"], 0)
         self.assertEqual(correction["suppressed_count"], 0)
         self.assertEqual(correction["observations"], [])
-        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 5)
+        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 6)
 
     def test_trajectory_plane_prevents_pitch_dependent_scale(self) -> None:
         # A downward-looking camera makes camera-local up tilt backward.  Using

@@ -450,7 +450,9 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertFalse(
             result["diagnostics"]["shape_gate_details"]["p95_within_budget"]
         )
-        self.assertFalse(
+        # The fallback preserves the two measured turns, but still requires a
+        # non-local translation and is rejected by the correction budget.
+        self.assertTrue(
             result["diagnostics"]["shape_gate_details"]["turn_topology_preserved"]
         )
 

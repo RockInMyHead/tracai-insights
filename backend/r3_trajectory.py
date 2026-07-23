@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-R3_TRAJECTORY_POSTPROCESS_VERSION = 5
+R3_TRAJECTORY_POSTPROCESS_VERSION = 6
 
 
 def summarize_fallback_edges(
@@ -226,6 +226,45 @@ def _clean_positions(points: np.ndarray, confidence: np.ndarray) -> tuple[np.nda
             if continues_after_flip and is_large_excursion and pose_is_weak:
                 outlier[i] = True
 
+    # Reconstruction failures may persist for several poses, so none of the
+    # affected points is an isolated spike. Detect short excursions which
+    # leave and return to the same local chord. Genuine corners remain on one
+    # side of their chord and are deliberately retained.
+    island_radius = min(6, max(2, len(filled) // 150))
+    island_limit = max(median_step * 4.0, p75_step * 2.2, 1e-6)
+    island_outliers = 0
+    for radius in range(2, island_radius + 1):
+        for i in range(radius, len(filled) - radius):
+            if outlier[i]:
+                continue
+            left = filled[i - radius]
+            right = filled[i + radius]
+            chord = right - left
+            chord_norm_sq = float(np.dot(chord, chord))
+            if chord_norm_sq <= 1e-12:
+                continue
+            fraction = float(np.dot(filled[i] - left, chord) / chord_norm_sq)
+            projection = left + np.clip(fraction, 0.0, 1.0) * chord
+            excursion = float(np.linalg.norm(filled[i] - projection))
+            shoulder_span = float(np.linalg.norm(right - left))
+            local_path = float(
+                np.linalg.norm(
+                    np.diff(filled[i - radius:i + radius + 1], axis=0),
+                    axis=1,
+                ).sum()
+            )
+            returns_to_route = local_path > max(
+                shoulder_span * 1.8,
+                median_step * radius * 2.5,
+            )
+            pose_is_weak = (
+                not np.isfinite(confidence[i])
+                or confidence[i] <= low_confidence
+            )
+            if excursion > island_limit and returns_to_route and pose_is_weak:
+                outlier[i] = True
+                island_outliers += 1
+
     clean = filled.copy()
     good = ~outlier
     if good.any() and not good.all():
@@ -254,6 +293,7 @@ def _clean_positions(points: np.ndarray, confidence: np.ndarray) -> tuple[np.nda
         "quality": "ok" if int(outlier.sum()) <= max(2, len(points) // 8) else "unstable_pose",
         "raw_points": int(len(points)),
         "outlier_points": int(outlier.sum()),
+        "island_outlier_points": island_outliers,
         "smoothed_points": smoothed,
         "raw_step_median": round(median_step, 6),
         "raw_step_p75": round(p75_step, 6),
@@ -262,6 +302,17 @@ def _clean_positions(points: np.ndarray, confidence: np.ndarray) -> tuple[np.nda
         "jump_limit": round(jump_limit, 6),
         "low_confidence_threshold": round(low_confidence, 6) if math.isfinite(low_confidence) else None,
     }
+
+
+def _valid_rotation(rotation: np.ndarray) -> bool:
+    """Accept only finite, approximately rigid camera rotations."""
+    if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
+        return False
+    if float(np.max(np.abs(rotation))) > 1.5:
+        return False
+    gram_error = float(np.linalg.norm(rotation.T @ rotation - np.eye(3)))
+    determinant = float(np.linalg.det(rotation))
+    return gram_error <= 0.08 and 0.85 <= determinant <= 1.15
 
 
 def _camera_up_normal(rotations: Sequence[np.ndarray]) -> tuple[np.ndarray | None, float]:
@@ -274,7 +325,7 @@ def _camera_up_normal(rotations: Sequence[np.ndarray]) -> tuple[np.ndarray | Non
     """
     vectors: list[np.ndarray] = []
     for rotation in rotations:
-        if rotation.shape != (3, 3) or not np.isfinite(rotation).all():
+        if not _valid_rotation(rotation):
             continue
         vectors.append(_normalize(-rotation[:, 1]))
     if len(vectors) < 3:
@@ -285,7 +336,8 @@ def _camera_up_normal(rotations: Sequence[np.ndarray]) -> tuple[np.ndarray | Non
     reference = vectors[0]
     aligned = np.array([v if float(np.dot(v, reference)) >= 0 else -v for v in vectors])
     normal = _normalize(np.median(aligned, axis=0))
-    coherence = float(np.median(aligned @ normal))
+    coherence_values = np.sum(aligned * normal.reshape(1, 3), axis=1)
+    coherence = float(np.median(coherence_values))
     return normal, coherence
 
 
@@ -323,8 +375,8 @@ def _camera_rotation_axis_normal(
             if (
                 first.shape != (3, 3)
                 or second.shape != (3, 3)
-                or not np.isfinite(first).all()
-                or not np.isfinite(second).all()
+                or not _valid_rotation(first)
+                or not _valid_rotation(second)
             ):
                 continue
             relative = second @ first.T
@@ -495,7 +547,13 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
     # plan basis; the SVG renderer performs the separate Y-up -> Y-down change.
     e2 = _normalize(np.cross(normal, e1))
     e1 = _normalize(np.cross(e2, normal))
-    plan = np.column_stack((centered @ e1, centered @ e2, centered @ normal))
+    # Element-wise reductions avoid platform BLAS overflow warnings observed
+    # for otherwise finite 3-vectors on some NumPy/OpenBLAS combinations.
+    plan = np.column_stack((
+        np.sum(centered * e1.reshape(1, 3), axis=1),
+        np.sum(centered * e2.reshape(1, 3), axis=1),
+        np.sum(centered * normal.reshape(1, 3), axis=1),
+    ))
 
     return plan, {
         "method": method,
