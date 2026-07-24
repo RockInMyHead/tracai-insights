@@ -353,6 +353,25 @@ class R3TrajectoryTests(unittest.TestCase):
         normal = np.asarray(projection["normal"], dtype=np.float64)
         self.assertGreater(float(np.dot(normal, np.array([0.0, -1.0, 0.0]))), 0.99)
 
+    def test_plan_basis_ignores_centimetre_scale_start_jitter(self) -> None:
+        poses = [make_pose(0, 0.0, 0.0, 0.0)]
+        # A tiny sideways first displacement must not define X+ for the whole
+        # run.  The actual walk is a long straight movement along world Z.
+        poses.append(make_pose(1, 0.02, 0.0, 0.0))
+        for index in range(2, 82):
+            poses.append(make_pose(index, 0.02, 0.0, float(index - 1)))
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+
+        plan = np.asarray(result["plan_trajectory"], dtype=np.float64)
+        displacement = plan[-1, :2] - plan[0, :2]
+        self.assertGreater(displacement[0], 75.0)
+        self.assertLess(abs(displacement[1]), 0.3)
+        self.assertEqual(
+            result["trajectory_quality"]["projection"]["initial_heading_source"],
+            "first_8_percent_planar_arc",
+        )
+
     def test_repairs_persistent_scale_reset_at_forced_fallback(self) -> None:
         poses = []
         z = 0.0
@@ -418,9 +437,9 @@ class R3TrajectoryTests(unittest.TestCase):
         scale = result["trajectory_quality"]["scale_stability"]
         self.assertEqual(scale["motion_time_base"], "presentation_timestamp_seconds")
         self.assertFalse(scale["applied"])
-        self.assertEqual(scale["quality"], "stable_epochs")
+        self.assertEqual(scale["quality"], "diagnostic_only_non_metric")
 
-    def test_repeated_fallbacks_do_not_compound_one_scale_epoch(self) -> None:
+    def test_non_metric_fallbacks_do_not_warp_walking_speed_changes(self) -> None:
         poses = []
         z = 0.0
         poses.append(make_pose(0, 0.0, 0.0, z))
@@ -447,12 +466,15 @@ class R3TrajectoryTests(unittest.TestCase):
             np.diff(np.asarray(result["plan_trajectory"])[:, :2], axis=0),
             axis=1,
         ).sum())
-        self.assertTrue(scale["applied"])
-        self.assertEqual(scale["applied_count"], 1)
+        self.assertFalse(scale["applied"])
+        self.assertEqual(scale["applied_count"], 0)
         self.assertFalse(scale["cumulative_scaling"])
-        self.assertEqual(len(scale["regimes"]), 2)
-        self.assertAlmostEqual(scale["regime_changes"][0]["applied_scale"], 2.5, delta=0.05)
-        self.assertAlmostEqual(distance, 208.0, delta=4.0)
+        self.assertEqual(scale["quality"], "diagnostic_only_non_metric")
+        self.assertFalse(scale["geometry_mutated"])
+        self.assertEqual(
+            scale["reason"], "velocity_is_not_a_monocular_scale_observable"
+        )
+        self.assertAlmostEqual(distance, 114.0, delta=2.0)
 
     def test_pose_edge_log_yields_only_explicit_fallback_boundaries(self) -> None:
         summary = summarize_fallback_edges(

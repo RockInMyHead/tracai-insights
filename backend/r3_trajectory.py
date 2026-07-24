@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
-R3_TRAJECTORY_POSTPROCESS_VERSION = 6
+R3_TRAJECTORY_POSTPROCESS_VERSION = 7
 
 
 def summarize_fallback_edges(
@@ -528,16 +528,30 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
         method = "opencv_axis_fallback"
         normal_sign_source = "opencv_axis_convention"
 
-    # Preserve initial walking direction as X+.  PCA alone leaves this sign
-    # arbitrary and is one source of apparent 180-degree flips on the map.
+    # Preserve initial walking direction as X+, but do not use the first
+    # non-zero pose: centimetre-scale start jitter used to rotate the whole
+    # canonical basis.  Estimate the heading from the first 8% of travelled
+    # planar arc, matching the robust heading used by the map aligner.
+    planar = centered - np.outer(centered @ normal, normal)
+    planar_steps = np.linalg.norm(np.diff(planar, axis=0), axis=1)
+    planar_arc = np.concatenate(([0.0], np.cumsum(planar_steps)))
     heading = np.zeros(3, dtype=np.float64)
-    for index in range(1, len(centered)):
-        candidate = centered[index] - np.dot(centered[index], normal) * normal
-        if np.linalg.norm(candidate) > 1e-6:
-            heading = candidate
-            break
+    if planar_arc[-1] > 1e-8:
+        target = 0.08 * float(planar_arc[-1])
+        right = int(np.searchsorted(planar_arc, target, side="right"))
+        right = min(max(right, 1), len(planar) - 1)
+        left = right - 1
+        width = float(planar_arc[right] - planar_arc[left])
+        fraction = (
+            (target - float(planar_arc[left])) / width
+            if width > 1e-12 else 0.0
+        )
+        heading = (
+            planar[left] * (1.0 - fraction)
+            + planar[right] * fraction
+        )
     if np.linalg.norm(heading) <= 1e-6 and len(points) >= 2:
-        heading = centered[-1] - np.dot(centered[-1], normal) * normal
+        heading = planar[-1]
     if np.linalg.norm(heading) <= 1e-6:
         alternatives = [np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])]
         heading = next((axis for axis in alternatives if abs(float(np.dot(axis, normal))) < 0.9), alternatives[0])
@@ -561,6 +575,7 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
         "camera_coordinate_convention": "opencv_x_right_y_down_z_forward",
         "plan_coordinate_convention": "x_forward_y_left_z_up",
         "normal_sign_source": normal_sign_source,
+        "initial_heading_source": "first_8_percent_planar_arc",
         "chirality_confidence": "high" if normal_sign_source == "camera_physical_up" else "low",
         "camera_rotation_axis": rotation_axis_diagnostics,
         "trajectory_plane": pca_diagnostics,
@@ -578,15 +593,15 @@ def _stabilize_scale_regimes(
     run_params: Mapping[str, Any] | None,
     source_timestamps: Sequence[float | None] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Normalize confirmed fallback scale epochs without cumulative drift.
+    """Normalize *metric-confirmed* fallback scale epochs without drift.
 
-    The previous guard searched every point for a step-size change and then
-    multiplied the *entire remaining tail*.  Several detections therefore
-    compounded (2.74x × 1.78x × ... in the production run).  Here boundaries
-    must come from R3's actual bridge-edge log, motion is normalized by exact
-    presentation time when available, adjacent fallback segments with the same
-    scale are grouped, and every epoch is scaled independently against the
-    first stable epoch.
+    A bridge boundary proves that R3 restarted its local reconstruction, but a
+    change in camera velocity does *not* prove that its gauge scale changed:
+    the operator may simply have walked faster, slowed down, or paused.  Thus
+    velocity-derived epoch factors are allowed to mutate geometry only when
+    upstream explicitly marks the reconstruction as metric-scaled.  Monocular
+    runs remain diagnostics-only and receive one global similarity scale later
+    in the floor-plan aligner.
     """
     diagnostics: dict[str, Any] = {
         "method": "explicit_fallback_scale_epochs",
@@ -681,6 +696,18 @@ def _stabilize_scale_regimes(
             "output_step_median": round(float(np.median(positive)), 6),
             "fallback_enabled": fallback_enabled,
             "metric_scale_enabled": metric_enabled,
+        })
+        return plan_points.copy(), diagnostics
+
+    if not metric_enabled:
+        diagnostics.update({
+            "quality": "diagnostic_only_non_metric",
+            "input_step_median": round(float(np.median(positive)), 6),
+            "output_step_median": round(float(np.median(positive)), 6),
+            "fallback_enabled": fallback_enabled,
+            "metric_scale_enabled": False,
+            "geometry_mutated": False,
+            "reason": "velocity_is_not_a_monocular_scale_observable",
         })
         return plan_points.copy(), diagnostics
 
