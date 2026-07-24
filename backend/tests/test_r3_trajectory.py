@@ -291,7 +291,7 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(correction["applied_count"], 0)
         self.assertEqual(correction["suppressed_count"], 0)
         self.assertEqual(correction["observations"], [])
-        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 6)
+        self.assertEqual(result["trajectory_quality"]["postprocess_version"], 7)
 
     def test_trajectory_plane_prevents_pitch_dependent_scale(self) -> None:
         # A downward-looking camera makes camera-local up tilt backward.  Using

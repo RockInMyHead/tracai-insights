@@ -151,6 +151,71 @@ R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPO
                     )
 '''
 
+R3_EDGE_HISTORY_MARKER = "# TRACKAI_R3_PRESERVE_MEASURED_EDGE_HISTORY_V2"
+R3_EDGE_HISTORY_RESET_ANCHOR = "        self._historical_bridge_edges.clear()\n"
+R3_EDGE_HISTORY_RESET_INSERTION = (
+    "        # TRACKAI_R3_PRESERVE_MEASURED_EDGE_HISTORY_V2\n"
+    "        self._historical_pose_edges = []\n"
+    "        self._historical_pose_edge_keys = set()\n"
+)
+R3_EDGE_HISTORY_ACCEPT_ANCHOR = '''        # Snapshot bridge edges before the live log is replaced. Without this, every accepted
+        # fallback wipes out earlier bridges and only the most recent bridge survives in the
+        # exported log.
+        self._historical_bridge_edges.extend(
+            edge for edge in trial_pose_edge_log._edges if edge.edge_type == "bridge"
+        )
+        self._pose_edge_log = trial_pose_edge_log
+'''
+R3_EDGE_HISTORY_V1_ACCEPT = '''        # TRACKAI_R3_PRESERVE_MEASURED_EDGE_HISTORY_V1
+        # An accepted fallback replaces the live log. Preserve every measured edge from
+        # the accepted trial, not only bridge edges, so final global PGO still observes
+        # the geometry of all preceding segments. These are real R3 measurements; no
+        # synthetic temporal constraints are introduced here.
+        self._historical_pose_edges.extend(trial_pose_edge_log._edges)
+        self._historical_bridge_edges.extend(
+            edge for edge in trial_pose_edge_log._edges if edge.edge_type == "bridge"
+        )
+        self._pose_edge_log = trial_pose_edge_log
+'''
+R3_EDGE_HISTORY_ACCEPT_REPLACEMENT = '''        # TRACKAI_R3_PRESERVE_MEASURED_EDGE_HISTORY_V2
+        # Accepted fallback replaces the live log. The measurements that would be lost
+        # are in old_pose_edge_log; trial_pose_edge_log is the new live replay graph.
+        # Archive unique real R3 measurements only, never synthetic temporal edges.
+        for edge in old_pose_edge_log._edges:
+            edge_key = (int(edge.frame_i), int(edge.frame_j), str(edge.edge_type))
+            if edge_key not in self._historical_pose_edge_keys:
+                self._historical_pose_edge_keys.add(edge_key)
+                self._historical_pose_edges.append(edge)
+        self._historical_bridge_edges.extend(
+            edge for edge in trial_pose_edge_log._edges if edge.edge_type == "bridge"
+        )
+        self._pose_edge_log = trial_pose_edge_log
+'''
+R3_EDGE_HISTORY_EXPORT_ANCHOR = (
+    '        historical = list(getattr(model, "_historical_bridge_edges", []))\n'
+)
+R3_EDGE_HISTORY_EXPORT_REPLACEMENT = '''        historical = list(
+            getattr(
+                model,
+                "_historical_pose_edges",
+                getattr(model, "_historical_bridge_edges", []),
+            )
+        )
+'''
+R3_EDGE_QUATERNION_NORMALIZATION_MARKER = (
+    "# TRACKAI_R3_NORMALIZE_EDGE_QUATERNIONS_V1"
+)
+R3_EDGE_QUATERNION_NORMALIZATION_ANCHOR = '''                    if rel_pose_values.size != 9 or not np.isfinite(rel_pose_values).all():
+                        continue
+'''
+R3_EDGE_QUATERNION_NORMALIZATION_INSERTION = '''                    # TRACKAI_R3_NORMALIZE_EDGE_QUATERNIONS_V1
+                    quaternion_norm = float(np.linalg.norm(rel_pose_values[3:7]))
+                    if quaternion_norm <= 1e-8:
+                        continue
+                    rel_pose_values = rel_pose_values.copy()
+                    rel_pose_values[3:7] /= quaternion_norm
+'''
+
 
 def emit(event_type, data=None):
     """Print JSON event to stdout with flush."""
@@ -202,6 +267,104 @@ def _patch_r3_infer_source(source: str) -> tuple[str, dict]:
     return patched, {"status": "patched", "changed": True}
 
 
+def _patch_r3_online_source(source: str) -> tuple[str, dict]:
+    """Preserve measured pose edges that accepted fallbacks would otherwise discard."""
+    if R3_EDGE_HISTORY_MARKER in source:
+        return source, {"status": "already_available", "changed": False}
+    accept_anchor = (
+        R3_EDGE_HISTORY_V1_ACCEPT
+        if R3_EDGE_HISTORY_V1_ACCEPT in source
+        else R3_EDGE_HISTORY_ACCEPT_ANCHOR
+    )
+    reset_anchor = (
+        "        self._historical_pose_edges = []\n"
+        if "        self._historical_pose_edges = []\n" in source
+        else R3_EDGE_HISTORY_RESET_ANCHOR
+    )
+    required = (reset_anchor, accept_anchor)
+    missing = [anchor.strip().splitlines()[0] for anchor in required if anchor not in source]
+    if missing:
+        return source, {
+            "status": "unsupported_online_source",
+            "changed": False,
+            "reason": f"edge history anchors not found: {missing}",
+        }
+    patched = source.replace(
+        reset_anchor,
+        (
+            reset_anchor + "        self._historical_pose_edge_keys = set()\n"
+            if reset_anchor != R3_EDGE_HISTORY_RESET_ANCHOR
+            else R3_EDGE_HISTORY_RESET_ANCHOR + R3_EDGE_HISTORY_RESET_INSERTION
+        ),
+        1,
+    ).replace(
+        accept_anchor,
+        R3_EDGE_HISTORY_ACCEPT_REPLACEMENT,
+        1,
+    )
+    try:
+        compile(patched, "online_inference.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
+def _patch_r3_edge_history_export(source: str) -> tuple[str, dict]:
+    """Make infer.py export the preserved full history instead of bridge-only history."""
+    if R3_EDGE_HISTORY_EXPORT_REPLACEMENT in source:
+        return source, {"status": "already_available", "changed": False}
+    if R3_EDGE_HISTORY_EXPORT_ANCHOR not in source:
+        return source, {
+            "status": "unsupported_infer_source",
+            "changed": False,
+            "reason": "historical pose edge export anchor not found",
+        }
+    patched = source.replace(
+        R3_EDGE_HISTORY_EXPORT_ANCHOR,
+        R3_EDGE_HISTORY_EXPORT_REPLACEMENT,
+        1,
+    )
+    try:
+        compile(patched, "infer.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
+def _patch_r3_edge_quaternion_normalization(source: str) -> tuple[str, dict]:
+    if R3_EDGE_QUATERNION_NORMALIZATION_MARKER in source:
+        return source, {"status": "already_available", "changed": False}
+    if R3_EDGE_QUATERNION_NORMALIZATION_ANCHOR not in source:
+        return source, {
+            "status": "unsupported_infer_source",
+            "changed": False,
+            "reason": "relative pose validation anchor not found",
+        }
+    patched = source.replace(
+        R3_EDGE_QUATERNION_NORMALIZATION_ANCHOR,
+        R3_EDGE_QUATERNION_NORMALIZATION_ANCHOR
+        + R3_EDGE_QUATERNION_NORMALIZATION_INSERTION,
+        1,
+    )
+    try:
+        compile(patched, "infer.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
 def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
     """Patch the external R3 exporter atomically, or report why it was skipped."""
     enabled = (os.getenv("R3_EXPORT_POSE_GRAPH_EDGES") or "true").strip().lower()
@@ -217,19 +380,56 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
             "path": str(infer_path),
             "reason": f"{type(exc).__name__}: {exc}",
         }
-    patched, diagnostics = _patch_r3_infer_source(source)
-    diagnostics = {"path": str(infer_path), **diagnostics}
-    if not diagnostics["changed"]:
+    patched, export_diagnostics = _patch_r3_infer_source(source)
+    patched, history_export_diagnostics = _patch_r3_edge_history_export(patched)
+    patched, quaternion_diagnostics = _patch_r3_edge_quaternion_normalization(patched)
+    online_path = Path(r3_dir) / "R3/models/r3_wrapper/online_inference.py"
+    try:
+        online_source = online_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {
+            "status": "online_source_read_failed",
+            "changed": False,
+            "path": str(online_path),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    patched_online, online_diagnostics = _patch_r3_online_source(online_source)
+    changed = any(
+        item["changed"]
+        for item in (
+            export_diagnostics,
+            history_export_diagnostics,
+            quaternion_diagnostics,
+            online_diagnostics,
+        )
+    )
+    diagnostics = {
+        "path": str(infer_path),
+        "online_path": str(online_path),
+        "status": "patched" if changed else "already_available",
+        "changed": changed,
+        "pose_graph_export": export_diagnostics,
+        "history_export": history_export_diagnostics,
+        "quaternion_normalization": quaternion_diagnostics,
+        "edge_history": online_diagnostics,
+    }
+    if not changed:
         return diagnostics
     temporary_path = infer_path.with_name(
         f".{infer_path.name}.trackai.{os.getpid()}.tmp"
     )
     try:
+        temporary_online_path = online_path.with_name(
+            f".{online_path.name}.trackai.{os.getpid()}.tmp"
+        )
         temporary_path.write_text(patched, encoding="utf-8")
+        temporary_online_path.write_text(patched_online, encoding="utf-8")
         os.replace(temporary_path, infer_path)
+        os.replace(temporary_online_path, online_path)
     except Exception as exc:
         try:
             temporary_path.unlink(missing_ok=True)
+            temporary_online_path.unlink(missing_ok=True)
         except Exception:
             pass
         return {
@@ -654,7 +854,38 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
     # Match R3 demo.py release presets: long/strided need confidence fallback
     # re-anchoring. Without it, long indoor videos often produce pose teleports.
     if mode in {"long", "strided"} and env_enabled("R3_ENABLE_FALLBACK", True):
-        max_segment_frames = "300" if mode == "long" else "100"
+        default_max_segment_frames = "300" if mode == "long" else "100"
+        max_segment_frames = (
+            default_max_segment_frames
+            if release_preset
+            else env_number(
+                "R3_MAX_SEGMENT_FRAMES", default_max_segment_frames, 0.0
+            )
+        )
+        drought_length = (
+            "3"
+            if release_preset
+            else env_number("R3_FALLBACK_DROUGHT_LENGTH", "3", 1.0)
+        )
+        drought_threshold_pct = (
+            "45.0"
+            if release_preset
+            else env_number(
+                "R3_FALLBACK_DROUGHT_THRESHOLD_PCT", "45.0", 0.0
+            )
+        )
+        bridge_frames = (
+            "10"
+            if release_preset
+            else env_number("R3_FALLBACK_NUM_BRIDGE_FRAMES", "10", 2.0)
+        )
+        fallback_ref_mode = (
+            "bridge"
+            if release_preset
+            else env_choice(
+                "R3_FALLBACK_REF_MODE", "bridge", {"bridge", "keyframe"}
+            )
+        )
         bridge_baseline_ratio = (
             "0.35"
             if release_preset
@@ -667,14 +898,14 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         )
         cmd += [
             "--online_fallback_enabled",
-            "--fallback_drought_length", "3",
+            "--fallback_drought_length", drought_length,
             "--fallback_drought_threshold", "0",
-            "--fallback_drought_threshold_pct", "45.0",
-            "--fallback_num_bridge_frames", "10",
+            "--fallback_drought_threshold_pct", drought_threshold_pct,
+            "--fallback_num_bridge_frames", bridge_frames,
             "--fallback_min_bridge_baseline_ratio", bridge_baseline_ratio,
             "--fallback_max_bridge_lookback", bridge_lookback,
             "--evict_low_conf_threshold", "0",
-            "--fallback_ref_mode", "bridge",
+            "--fallback_ref_mode", fallback_ref_mode,
             "--min_segment_frames", "16",
             "--max_segment_frames", max_segment_frames,
             "--fallback_replay_attention", "full",
@@ -1481,6 +1712,20 @@ def backproject_depth_pointcloud(
 
 # ─── NEW: Collect results with point cloud ─────────────────────────────
 
+def _homogeneous_camera_poses(poses: list[dict]) -> "np.ndarray":
+    """Return camera poses as [N,4,4], accepting R3's native [3,4] export."""
+    import numpy as np
+
+    matrices = np.asarray([pose["pose"] for pose in poses], dtype=np.float64)
+    if matrices.ndim != 3 or matrices.shape[1:] not in {(3, 4), (4, 4)}:
+        raise ValueError("camera poses must have shape [N,3,4] or [N,4,4]")
+    if matrices.shape[1:] == (4, 4):
+        return matrices
+    homogeneous = np.broadcast_to(np.eye(4, dtype=np.float64), (len(matrices), 4, 4)).copy()
+    homogeneous[:, :3, :] = matrices
+    return homogeneous
+
+
 def collect_results(output_dir: str, export_pointcloud: bool = True):
     """Collect all R³ results into a JSON-serializable dict, with optional point cloud."""
     import numpy as np
@@ -1556,7 +1801,7 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
         })
         pose_graph_candidate = run_pose_graph_shadow(
             r3_output,
-            np.asarray([pose["pose"] for pose in poses], dtype=np.float64),
+            _homogeneous_camera_poses(poses),
         )
         emit("r3_pose_graph_optimizer_complete", {
             "accepted": pose_graph_candidate.get("accepted", False),
@@ -1575,7 +1820,7 @@ def collect_results(output_dir: str, export_pointcloud: bool = True):
     scale_aware_candidate = load_scale_aware_candidate_summary(r3_output)
     floor_scale_diagnostics: dict = {"available": False, "reason": "disabled"}
     if scale_aware_mode == "shadow" and len(poses) >= 2 and (r3_output / "depth").exists():
-        raw_c2w = np.asarray([pose["pose"] for pose in poses], dtype=np.float64)
+        raw_c2w = _homogeneous_camera_poses(poses)
         robust_c2w = load_pose_graph_candidate_c2w(
             r3_output,
             expected_count=len(poses),

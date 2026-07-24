@@ -16,10 +16,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from r3_worker_wrapper import (
+    R3_EDGE_HISTORY_ACCEPT_ANCHOR,
+    R3_EDGE_HISTORY_RESET_ANCHOR,
     R3_POSE_GRAPH_EXPORT_ANCHOR,
     _build_r3_infer_cmd,
     _ensure_r3_pose_graph_export,
+    _homogeneous_camera_poses,
     _patch_r3_infer_source,
+    _patch_r3_online_source,
     _probe_video_frame_timestamps,
     collect_results,
 )
@@ -37,6 +41,36 @@ def option_value(command: list[str], option: str) -> str:
 
 
 class R3WorkerPresetTests(unittest.TestCase):
+    def test_native_three_by_four_camera_poses_become_homogeneous(self) -> None:
+        native = np.broadcast_to(np.eye(4)[:3], (2, 3, 4)).copy()
+        native[1, 0, 3] = 7.0
+
+        converted = _homogeneous_camera_poses(
+            [{"pose": matrix.tolist()} for matrix in native]
+        )
+
+        self.assertEqual(converted.shape, (2, 4, 4))
+        np.testing.assert_allclose(converted[:, 3, :], [[0, 0, 0, 1]] * 2)
+        self.assertEqual(float(converted[1, 0, 3]), 7.0)
+
+    def test_fallback_patch_preserves_all_measured_edges(self) -> None:
+        source = (
+            "class Worker:\n"
+            "    def clear(self):\n"
+            f"{R3_EDGE_HISTORY_RESET_ANCHOR}"
+            "    def accept(self, trial_pose_edge_log):\n"
+            f"{R3_EDGE_HISTORY_ACCEPT_ANCHOR}"
+        )
+
+        patched, diagnostics = _patch_r3_online_source(source)
+        patched_again, repeated = _patch_r3_online_source(patched)
+
+        self.assertTrue(diagnostics["changed"])
+        self.assertIn("for edge in old_pose_edge_log._edges:", patched)
+        self.assertIn("self._historical_pose_edge_keys", patched)
+        self.assertEqual(patched_again, patched)
+        self.assertEqual(repeated["status"], "already_available")
+
     def test_pose_graph_export_patch_is_valid_and_idempotent(self) -> None:
         source = (
             "import json, os\nimport numpy as np\n"
@@ -125,14 +159,26 @@ class R3WorkerPresetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             infer_path = Path(directory) / "infer.py"
             infer_path.write_text(source, encoding="utf-8")
+            online_path = Path(directory) / "R3/models/r3_wrapper/online_inference.py"
+            online_path.parent.mkdir(parents=True)
+            online_path.write_text(
+                "class Worker:\n"
+                "    def clear(self):\n"
+                f"{R3_EDGE_HISTORY_RESET_ANCHOR}"
+                "    def accept(self, trial_pose_edge_log):\n"
+                f"{R3_EDGE_HISTORY_ACCEPT_ANCHOR}",
+                encoding="utf-8",
+            )
 
             first = _ensure_r3_pose_graph_export(directory)
             second = _ensure_r3_pose_graph_export(directory)
             persisted = infer_path.read_text(encoding="utf-8")
+            persisted_online = online_path.read_text(encoding="utf-8")
 
         self.assertEqual(first["status"], "patched")
         self.assertEqual(second["status"], "already_available")
         self.assertIn('"pose_graph_edges.npz"', persisted)
+        self.assertIn("_historical_pose_edges.append", persisted_online)
 
     def test_collect_results_runs_guarded_shadow_optimizer(self) -> None:
         point_count = 8
@@ -242,6 +288,13 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "100")
         self.assertIn("--disable_segment_pgo", command)
         self.assertNotIn("--metric_scale_enabled", command)
+        self.assertEqual(option_value(command, "--fallback_drought_length"), "3")
+        self.assertEqual(
+            option_value(command, "--fallback_drought_threshold_pct"), "45.0"
+        )
+        self.assertEqual(option_value(command, "--fallback_num_bridge_frames"), "10")
+        self.assertEqual(option_value(command, "--fallback_ref_mode"), "bridge")
+        self.assertEqual(option_value(command, "--max_segment_frames"), "300")
         self.assertEqual(option_value(command, "--fallback_min_bridge_baseline_ratio"), "0.35")
         self.assertEqual(option_value(command, "--fallback_max_bridge_lookback"), "40")
 
@@ -252,8 +305,13 @@ class R3WorkerPresetTests(unittest.TestCase):
             "R3_KEYFRAME_MAX_INTERVAL": "15",
             "R3_KEYFRAME_MAX_KEYFRAMES": "160",
             "R3_ENABLE_SEGMENT_PGO": "true",
+            "R3_FALLBACK_DROUGHT_LENGTH": "8",
+            "R3_FALLBACK_DROUGHT_THRESHOLD_PCT": "35",
+            "R3_FALLBACK_NUM_BRIDGE_FRAMES": "12",
             "R3_FALLBACK_MIN_BRIDGE_BASELINE_RATIO": "0.5",
             "R3_FALLBACK_MAX_BRIDGE_LOOKBACK": "60",
+            "R3_FALLBACK_REF_MODE": "keyframe",
+            "R3_MAX_SEGMENT_FRAMES": "600",
         }
         with patch.dict(os.environ, custom_environment, clear=True):
             command, _, _ = _build_r3_infer_cmd(
@@ -268,8 +326,15 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--rel_pose_reconstruction_method"), "pgo")
         self.assertEqual(option_value(command, "--keyframe_max_interval"), "15")
         self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "160")
+        self.assertEqual(option_value(command, "--fallback_drought_length"), "8")
+        self.assertEqual(
+            option_value(command, "--fallback_drought_threshold_pct"), "35"
+        )
+        self.assertEqual(option_value(command, "--fallback_num_bridge_frames"), "12")
         self.assertEqual(option_value(command, "--fallback_min_bridge_baseline_ratio"), "0.5")
         self.assertEqual(option_value(command, "--fallback_max_bridge_lookback"), "60")
+        self.assertEqual(option_value(command, "--fallback_ref_mode"), "keyframe")
+        self.assertEqual(option_value(command, "--max_segment_frames"), "600")
         self.assertNotIn("--disable_segment_pgo", command)
 
     def test_metric_reanchor_requires_new_explicit_scale_policy(self) -> None:
