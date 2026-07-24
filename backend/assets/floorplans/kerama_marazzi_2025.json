@@ -15,17 +15,17 @@
     "office_pixel_area": 4060
   },
   "grid_cell_pixels": 4,
-  "person_radius_meters": 0.28,
+  "person_radius_meters": 0.18,
   "walking_speed_mps": 1.2,
   "default_start_anchor": {
-    "source": "fixed_plan_start_left_heading_red_safe_v3",
+    "source": "operator_ground_truth_left_heading_v4",
     "reference_pixels": [
-      2190.0,
-      686.0
+      2222.623,
+      684.183
     ],
     "direction_pixels": [
-      2170.0,
-      666.0
+      2000.0,
+      703.0
     ],
     "trajectory_points_used": false
   },

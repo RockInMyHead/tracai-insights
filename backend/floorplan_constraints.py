@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_absolute_red_priority_local_repair_v29"
+    "kerama_operator_left_route_local_repair_v30"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -52,13 +52,17 @@ LOCAL_ASTAR_MAX_MARGIN_METERS = 6.0
 MAX_LOCAL_MAP_CORRECTION_METERS = 4.0
 MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION = 0.06
 MAX_LOCAL_MAP_CORRECTION_HARD_METERS = 6.0
+# One metre plus one grid-quantisation allowance (4 px ~= 0.20 m).
+MASK_LOCAL_REPAIR_LIMIT_METERS = 1.05
+MASK_LOCAL_REPAIR_HARD_LIMIT_METERS = 1.5
 TURN_TOPOLOGY_MIN_DEGREES = 18.0
 MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES = 28.0
 MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO = 0.0
 MAX_AUTHORITATIVE_SHARP_REVERSE_RATIO = 0.18
 INDEPENDENT_LOOP_CLOSED_MIN_LENGTH_RATIO = 0.65
 STANDARD_YAW_OFFSETS_DEGREES = (
-    -20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0
+    -60.0, -45.0, -30.0, -20.0, -15.0, -10.0, -5.0, 0.0,
+    5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0,
 )
 REVERSED_HEADING_YAW_OFFSETS_DEGREES = tuple(
     180.0 + offset for offset in STANDARD_YAW_OFFSETS_DEGREES
@@ -951,7 +955,10 @@ class FloorplanConstraintEngine:
         total = _polyline_length(relative)
         if total <= 1e-8:
             return 0.0
-        early = _resample_polyline(relative, np.asarray([0.0, 0.025]))
+        # Use enough travelled arc to ignore marker occlusion and the first
+        # couple of unstable R3 poses, while remaining inside the first aisle.
+        # At 2.5% the Kerama start-marker gap biased heading by about 13°.
+        early = _resample_polyline(relative, np.asarray([0.0, 0.08]))
         delta = early[1] - early[0]
         if float(np.linalg.norm(delta)) > 1e-8:
             return math.atan2(float(delta[1]), float(delta[0]))
@@ -1076,9 +1083,14 @@ class FloorplanConstraintEngine:
         # This is deliberately a local repair window.  A larger search can
         # find a legal but unrelated aisle and thereby replace an R3 walk with
         # a plausible-looking route through the plant.
+        local_initial_margin_meters = (
+            MASK_LOCAL_REPAIR_LIMIT_METERS
+            if self._support_mask is not None
+            else LOCAL_ASTAR_INITIAL_MARGIN_METERS
+        )
         initial_margin = max(
-            24,
-            int(round(LOCAL_ASTAR_INITIAL_MARGIN_METERS / max(self.cell_meters, 1e-9))),
+            2 if self._support_mask is not None else 24,
+            int(round(local_initial_margin_meters / max(self.cell_meters, 1e-9))),
         )
         margin = initial_margin if _search_margin_cells is None else _search_margin_cells
         min_x = max(0, min(start[0], end[0], int(raw_cells[:, 0].min())) - margin)
@@ -1170,9 +1182,14 @@ class FloorplanConstraintEngine:
                 heappush(queue, (candidate + heuristic, candidate, key))
         # One bounded expansion handles a wide local obstruction without
         # crossing into a remote corridor.
+        local_max_margin_meters = (
+            MASK_LOCAL_REPAIR_LIMIT_METERS
+            if self._support_mask is not None
+            else LOCAL_ASTAR_MAX_MARGIN_METERS
+        )
         max_margin = max(
             initial_margin,
-            int(round(LOCAL_ASTAR_MAX_MARGIN_METERS / max(self.cell_meters, 1e-9))),
+            int(round(local_max_margin_meters / max(self.cell_meters, 1e-9))),
         )
         if margin < max_margin:
             return self._astar(
@@ -2309,18 +2326,30 @@ class FloorplanConstraintEngine:
             p95_correction = (
                 float(np.percentile(displacement_m, 95)) if len(displacement_m) else 0.0
             )
+            maximum_correction = (
+                float(np.max(displacement_m)) if len(displacement_m) else 0.0
+            )
             # A floor plan may select scale/yaw and make local obstacle
             # repairs; it may not invent a different route.  Keep the
             # correction budget deliberately local: once the fix needs a
             # multi-metre branch change, the observation and mask disagree and
             # the result must not be published as if it were measured by R3.
-            correction_budget = max(
-                MAX_LOCAL_MAP_CORRECTION_METERS,
-                min(
-                    MAX_LOCAL_MAP_CORRECTION_HARD_METERS,
-                    float(hypothesis["length_meters"])
-                    * MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION,
-                ),
+            correction_budget = (
+                MASK_LOCAL_REPAIR_LIMIT_METERS
+                if self._support_mask is not None
+                else max(
+                    MAX_LOCAL_MAP_CORRECTION_METERS,
+                    min(
+                        MAX_LOCAL_MAP_CORRECTION_HARD_METERS,
+                        float(hypothesis["length_meters"])
+                        * MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION,
+                    ),
+                )
+            )
+            maximum_correction_budget = (
+                MASK_LOCAL_REPAIR_HARD_LIMIT_METERS
+                if self._support_mask is not None
+                else MAX_LOCAL_MAP_CORRECTION_HARD_METERS
             )
             sharp_reverse_ratio = _polyline_sharp_reverse_ratio(
                 repaired,
@@ -2350,6 +2379,7 @@ class FloorplanConstraintEngine:
             )
             shape_preserved = (
                 p95_correction <= correction_budget
+                and maximum_correction <= maximum_correction_budget
                 and minimum_length_ratio <= length_ratio <= 1.50
                 and sharp_reverse_ratio <= maximum_sharp_reverse_ratio
                 and corrected_metrics["collision_ratio"] <= residual_collision_budget
@@ -2393,6 +2423,8 @@ class FloorplanConstraintEngine:
                 "topology_recovery": topology_recovery,
                 "segmented_recovery": segmented_recovery,
                 "correction_budget_meters": correction_budget,
+                "maximum_correction_meters": maximum_correction,
+                "maximum_correction_budget_meters": maximum_correction_budget,
                 "sharp_reverse_ratio": sharp_reverse_ratio,
                 "maximum_sharp_reverse_ratio": maximum_sharp_reverse_ratio,
                 "turn_topology": turn_topology,
@@ -2516,6 +2548,9 @@ class FloorplanConstraintEngine:
                     "correction_budget_meters": round(
                         float(closest["correction_budget_meters"]), 3
                     ),
+                    "maximum_correction_meters": round(
+                        float(closest["maximum_correction_meters"]), 3
+                    ),
                     "sharp_reverse_ratio": round(
                         float(closest.get("sharp_reverse_ratio", 0.0)), 4
                     ),
@@ -2535,6 +2570,9 @@ class FloorplanConstraintEngine:
                     "shape_gate_details": {
                         "p95_within_budget": closest_p95
                         <= float(closest["correction_budget_meters"]),
+                        "maximum_within_hard_budget": float(
+                            closest["maximum_correction_meters"]
+                        ) <= float(closest["maximum_correction_budget_meters"]),
                         "length_within_budget": float(closest["minimum_length_ratio"])
                         <= float(closest["length_ratio"]) <= 1.50,
                         "sharp_reverse_within_budget": float(
@@ -2961,7 +2999,17 @@ class FloorplanConstraintEngine:
             "start_snap_meters": round(start_snap_meters, 3),
             "correction_median_meters": round(float(np.median(displacement_m)), 3),
             "correction_p95_meters": round(p95_correction, 3),
+            "maximum_correction_meters": round(
+                float(np.max(displacement_m)) if len(displacement_m) else 0.0, 3
+            ),
             "correction_budget_meters": round(allowed_correction, 3),
+            "turn_topology": {
+                key: (
+                    round(float(value), 6)
+                    if isinstance(value, (float, np.floating)) else value
+                )
+                for key, value in (best.get("turn_topology") or {}).items()
+            },
             "sharp_reverse_ratio": round(float(best.get("sharp_reverse_ratio", 0.0)), 4),
             "publication_repair_applied": publication_repair_applied,
             "publication_rerouted_segments": int(publication_rerouted_segments),

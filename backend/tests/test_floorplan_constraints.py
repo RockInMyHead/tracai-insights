@@ -526,8 +526,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         original = [point[:] for point in source["plan_trajectory"]]
         updated = apply_floorplan_constraints(source, {
             "floorplan_id": "kerama_marazzi_2025",
-            "reference_point": {"x": 2190 / 5298 * 100, "y": 686 / 3743 * 100},
-            "direction_point": {"x": 2170 / 5298 * 100, "y": 666 / 3743 * 100},
+            "reference_point": {"x": 2222.623 / 5298 * 100, "y": 684.183 / 3743 * 100},
+            "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
         })
         self.assertTrue(updated["processing_stats"]["map_matching_applied"])
         self.assertGreater(len(updated["map_trajectory"]), 1)
@@ -539,7 +539,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
         self.assertEqual(
             updated["floorplan_constraint"]["constraint_revision"],
-            "kerama_absolute_red_priority_local_repair_v29",
+            "kerama_operator_left_route_local_repair_v30",
         )
         self.assertEqual(
             len(updated["map_trajectory_timestamps_seconds"]),
@@ -551,22 +551,22 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         ) * updated["map_metadata"]["meters_per_pixel"]
         self.assertLessEqual(max_step_meters, 0.751)
 
-    def test_positive_green_anchor_and_heading_are_walkable(self) -> None:
+    def test_operator_anchor_snaps_locally_and_heading_points_left(self) -> None:
         engine = get_floorplan_engine()
-        self.assertFalse(engine._point_occupied([2190.0, 686.0]))
-        self.assertFalse(engine._point_occupied([2170.0, 666.0]))
+        anchor = np.asarray([2222.623, 684.183])
+        direction = np.asarray([2000.0, 703.0])
+        cell = engine._nearest_free(engine._pixel_to_cell(anchor))
+        self.assertIsNotNone(cell)
+        snapped = engine._cell_to_pixel(cell)
+        self.assertLessEqual(
+            float(np.linalg.norm(snapped - anchor)) * engine.config.meters_per_pixel,
+            1.0,
+        )
+        self.assertLess(direction[0], anchor[0])
+        self.assertLess(abs(direction[1] - anchor[1]), 20.0)
         self.assertTrue(engine._point_occupied([100, 100]))
 
-    def test_fixed_anchor_heading_segment_is_walkable_and_connected(self) -> None:
-        engine = get_floorplan_engine()
-        points = np.asarray([
-            [2190.0, 686.0],
-            [2170.0, 666.0],
-        ], dtype=float)
-        self.assertEqual(engine._collision_runs(points), [])
-        self.assertEqual(engine._path_component_count(points), 1)
-
-    def test_stale_operator_reference_route_is_rejected_by_red_priority(self) -> None:
+    def test_operator_reference_route_repairs_locally_end_to_end(self) -> None:
         engine = get_floorplan_engine()
         reference = load_reference_route()
         points = reference["points"]
@@ -586,12 +586,12 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
             allow_safe_shape_fallback=True,
         )
-        self.assertFalse(result["accepted"])
-        self.assertEqual(result["trajectory"], [])
-        self.assertIn(
-            "different_walkable_components",
-            result["diagnostics"]["rejection_reasons"],
+        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
+        self.assertLessEqual(
+            result["diagnostics"]["correction_p95_meters"], 1.0
         )
+        self.assertEqual(result["diagnostics"]["turn_topology"]["sign_mismatch_ratio"], 0.0)
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [
@@ -620,8 +620,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         with patch.dict(os.environ, {"TRACKAI_ENABLE_FUSION_MAP_CANDIDATE": "1"}):
             updated = apply_floorplan_constraints(source, {
                 "floorplan_id": "kerama_marazzi_2025",
-                "reference_point": {"x": 2190 / 5298 * 100, "y": 686 / 3743 * 100},
-                "direction_point": {"x": 2170 / 5298 * 100, "y": 666 / 3743 * 100},
+                "reference_point": {"x": 2222.623 / 5298 * 100, "y": 684.183 / 3743 * 100},
+                "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
             })
 
         self.assertTrue(updated["processing_stats"]["map_matching_applied"])
