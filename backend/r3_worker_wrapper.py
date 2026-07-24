@@ -215,6 +215,27 @@ R3_EDGE_QUATERNION_NORMALIZATION_INSERTION = '''                    # TRACKAI_R3
                     rel_pose_values = rel_pose_values.copy()
                     rel_pose_values[3:7] /= quaternion_norm
 '''
+R3_PREDICTION_OFFLOAD_MARKER = "# TRACKAI_R3_OFFLOAD_COMPLETED_PREDICTIONS_V1"
+R3_PREDICTION_OFFLOAD_IMPORT_ANCHOR = "import torch\n"
+R3_PREDICTION_OFFLOAD_HELPER = '''
+
+# TRACKAI_R3_OFFLOAD_COMPLETED_PREDICTIONS_V1
+def _offload_completed_prediction(value):
+    """Move completed output tensors to CPU without touching the live online state."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _offload_completed_prediction(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_offload_completed_prediction(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_offload_completed_prediction(item) for item in value)
+    return value
+'''
+R3_PREDICTION_OFFLOAD_APPEND_ANCHOR = "            predictions_list.append(predictions)\n"
+R3_PREDICTION_OFFLOAD_APPEND_REPLACEMENT = (
+    "            predictions_list.append(_offload_completed_prediction(predictions))\n"
+)
 
 
 def emit(event_type, data=None):
@@ -365,6 +386,39 @@ def _patch_r3_edge_quaternion_normalization(source: str) -> tuple[str, dict]:
     return patched, {"status": "patched", "changed": True}
 
 
+def _patch_r3_prediction_offload(source: str) -> tuple[str, dict]:
+    """Bound VRAM by offloading finalized per-frame outputs while state stays on GPU."""
+    if R3_PREDICTION_OFFLOAD_MARKER in source:
+        return source, {"status": "already_available", "changed": False}
+    if (
+        R3_PREDICTION_OFFLOAD_IMPORT_ANCHOR not in source
+        or R3_PREDICTION_OFFLOAD_APPEND_ANCHOR not in source
+    ):
+        return source, {
+            "status": "unsupported_revisit_source",
+            "changed": False,
+            "reason": "prediction offload anchors not found",
+        }
+    patched = source.replace(
+        R3_PREDICTION_OFFLOAD_IMPORT_ANCHOR,
+        R3_PREDICTION_OFFLOAD_IMPORT_ANCHOR + R3_PREDICTION_OFFLOAD_HELPER,
+        1,
+    ).replace(
+        R3_PREDICTION_OFFLOAD_APPEND_ANCHOR,
+        R3_PREDICTION_OFFLOAD_APPEND_REPLACEMENT,
+        1,
+    )
+    try:
+        compile(patched, "revisit.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
 def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
     """Patch the external R3 exporter atomically, or report why it was skipped."""
     enabled = (os.getenv("R3_EXPORT_POSE_GRAPH_EDGES") or "true").strip().lower()
@@ -394,6 +448,17 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
             "reason": f"{type(exc).__name__}: {exc}",
         }
     patched_online, online_diagnostics = _patch_r3_online_source(online_source)
+    revisit_path = Path(r3_dir) / "R3/models/online/revisit.py"
+    try:
+        revisit_source = revisit_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {
+            "status": "revisit_source_read_failed",
+            "changed": False,
+            "path": str(revisit_path),
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    patched_revisit, offload_diagnostics = _patch_r3_prediction_offload(revisit_source)
     changed = any(
         item["changed"]
         for item in (
@@ -401,6 +466,7 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
             history_export_diagnostics,
             quaternion_diagnostics,
             online_diagnostics,
+            offload_diagnostics,
         )
     )
     diagnostics = {
@@ -412,6 +478,7 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
         "history_export": history_export_diagnostics,
         "quaternion_normalization": quaternion_diagnostics,
         "edge_history": online_diagnostics,
+        "prediction_offload": offload_diagnostics,
     }
     if not changed:
         return diagnostics
@@ -422,14 +489,20 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
         temporary_online_path = online_path.with_name(
             f".{online_path.name}.trackai.{os.getpid()}.tmp"
         )
+        temporary_revisit_path = revisit_path.with_name(
+            f".{revisit_path.name}.trackai.{os.getpid()}.tmp"
+        )
         temporary_path.write_text(patched, encoding="utf-8")
         temporary_online_path.write_text(patched_online, encoding="utf-8")
+        temporary_revisit_path.write_text(patched_revisit, encoding="utf-8")
         os.replace(temporary_path, infer_path)
         os.replace(temporary_online_path, online_path)
+        os.replace(temporary_revisit_path, revisit_path)
     except Exception as exc:
         try:
             temporary_path.unlink(missing_ok=True)
             temporary_online_path.unlink(missing_ok=True)
+            temporary_revisit_path.unlink(missing_ok=True)
         except Exception:
             pass
         return {
@@ -787,8 +860,6 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
     if mode in {"long", "strided"} and ckpt_name == "r3.safetensors":
         ckpt_name = "r3_long.safetensors"
 
-    kv_cache_mode = "all" if mode in {"test", "strided"} else "dynamic"
-
     def env_enabled(name: str, default: bool) -> bool:
         raw = os.getenv(name)
         if raw is None:
@@ -807,6 +878,18 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
             value = float(default)
         return str(int(value)) if value.is_integer() else str(value)
 
+    bounded_long = mode in {"long", "strided"}
+    kv_cache_mode = "dynamic" if bounded_long else "all"
+    kv_backend = env_choice(
+        "R3_ONLINE_KV_BACKEND",
+        "paged" if bounded_long else "dense",
+        {"dense", "paged"},
+    )
+    # Fallback is transactional and briefly owns both the old and replay KV
+    # pools. Keep the total resident budget near 300 frames while leaving room
+    # for both pools on a 24 GB RTX 3090.
+    recent_frames = env_number("R3_ONLINE_RECENT_FRAMES", "200", 32.0)
+
     # Match the official R3 release presets by default.  Greedy reconstruction
     # plus disabled fallback-segment PGO is deliberate upstream behaviour;
     # forcing both PGO layers made physical corners much smoother and added a
@@ -823,12 +906,12 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         else env_number("R3_KEYFRAME_NOVELTY_THRESHOLD", "0.985", 0.0)
     )
     keyframe_interval = (
-        "30"
+        ("15" if bounded_long else "30")
         if release_preset
         else env_number("R3_KEYFRAME_MAX_INTERVAL", "30", 1.0)
     )
     keyframe_count = (
-        "100"
+        ("80" if bounded_long else "100")
         if release_preset
         else env_number("R3_KEYFRAME_MAX_KEYFRAMES", "100", 16.0)
     )
@@ -842,8 +925,10 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
         "--size", str(size),
         "--max_frames", str(max_frames),
         "--frame_stride", "1",
-        "--online_kv_backend", "dense",
+        "--online_kv_backend", kv_backend,
         "--online_kv_cache_mode", kv_cache_mode,
+        "--online_recent_frames", recent_frames,
+        "--attention_mode", "causal",
         "--keyframe_mode", "novelty",
         "--keyframe_novelty_threshold", keyframe_novelty,
         "--keyframe_max_interval", keyframe_interval,
@@ -1503,11 +1588,11 @@ def resolve_long_execution_policy(mode: str) -> tuple[bool, bool, str]:
     if not long_mode:
         return False, False, "short"
     requested = (
-        os.getenv("R3_LONG_EXECUTION_POLICY") or "segmented_pose_graph"
+        os.getenv("R3_LONG_EXECUTION_POLICY") or "continuous_paged"
     ).strip().lower()
-    if requested in {"continuous", "continuous_experimental"}:
-        return True, False, "continuous_experimental"
-    return False, True, "segmented_pose_graph"
+    if requested in {"segmented", "segmented_pose_graph"}:
+        return False, True, "segmented_pose_graph"
+    return True, False, "continuous_paged"
 
 
 def find_r3_output_dir(output_path: Path) -> Path:
@@ -1951,7 +2036,7 @@ def main():
     segment_min_duration = float(
         os.getenv(
             "R3_LONG_MIN_DURATION_SECONDS",
-            os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "600"),
+            os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "60"),
         )
     )
     # Turns made while walking often complete in about one second.  Five

@@ -18,14 +18,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from r3_worker_wrapper import (
     R3_EDGE_HISTORY_ACCEPT_ANCHOR,
     R3_EDGE_HISTORY_RESET_ANCHOR,
+    R3_PREDICTION_OFFLOAD_APPEND_ANCHOR,
     R3_POSE_GRAPH_EXPORT_ANCHOR,
     _build_r3_infer_cmd,
     _ensure_r3_pose_graph_export,
     _homogeneous_camera_poses,
     _patch_r3_infer_source,
     _patch_r3_online_source,
+    _patch_r3_prediction_offload,
     _probe_video_frame_timestamps,
     collect_results,
+    resolve_long_execution_policy,
 )
 from r3_pose_graph import (
     R3_ABSOLUTE_POSE_SPACE,
@@ -41,6 +44,22 @@ def option_value(command: list[str], option: str) -> str:
 
 
 class R3WorkerPresetTests(unittest.TestCase):
+    def test_completed_prediction_offload_patch_is_idempotent(self) -> None:
+        source = (
+            "import torch\n"
+            "def run(predictions_list, predictions):\n"
+            "    if True:\n"
+            f"{R3_PREDICTION_OFFLOAD_APPEND_ANCHOR}"
+        )
+
+        patched, diagnostics = _patch_r3_prediction_offload(source)
+        patched_again, repeated = _patch_r3_prediction_offload(patched)
+
+        self.assertTrue(diagnostics["changed"])
+        self.assertIn("_offload_completed_prediction(predictions)", patched)
+        self.assertEqual(patched_again, patched)
+        self.assertEqual(repeated["status"], "already_available")
+
     def test_native_three_by_four_camera_poses_become_homogeneous(self) -> None:
         native = np.broadcast_to(np.eye(4)[:3], (2, 3, 4)).copy()
         native[1, 0, 3] = 7.0
@@ -169,6 +188,15 @@ class R3WorkerPresetTests(unittest.TestCase):
                 f"{R3_EDGE_HISTORY_ACCEPT_ANCHOR}",
                 encoding="utf-8",
             )
+            revisit_path = Path(directory) / "R3/models/online/revisit.py"
+            revisit_path.parent.mkdir(parents=True, exist_ok=True)
+            revisit_path.write_text(
+                "import torch\n"
+                "def run(predictions_list, predictions):\n"
+                "    if True:\n"
+                f"{R3_PREDICTION_OFFLOAD_APPEND_ANCHOR}",
+                encoding="utf-8",
+            )
 
             first = _ensure_r3_pose_graph_export(directory)
             second = _ensure_r3_pose_graph_export(directory)
@@ -282,10 +310,13 @@ class R3WorkerPresetTests(unittest.TestCase):
 
         self.assertEqual(mode, "long")
         self.assertEqual(checkpoint, "r3_long.safetensors")
+        self.assertEqual(option_value(command, "--online_kv_backend"), "paged")
         self.assertEqual(option_value(command, "--online_kv_cache_mode"), "dynamic")
+        self.assertEqual(option_value(command, "--online_recent_frames"), "200")
+        self.assertEqual(option_value(command, "--attention_mode"), "causal")
         self.assertEqual(option_value(command, "--rel_pose_reconstruction_method"), "greedy")
-        self.assertEqual(option_value(command, "--keyframe_max_interval"), "30")
-        self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "100")
+        self.assertEqual(option_value(command, "--keyframe_max_interval"), "15")
+        self.assertEqual(option_value(command, "--keyframe_max_keyframes"), "80")
         self.assertIn("--disable_segment_pgo", command)
         self.assertNotIn("--metric_scale_enabled", command)
         self.assertEqual(option_value(command, "--fallback_drought_length"), "3")
@@ -297,6 +328,22 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--max_segment_frames"), "300")
         self.assertEqual(option_value(command, "--fallback_min_bridge_baseline_ratio"), "0.35")
         self.assertEqual(option_value(command, "--fallback_max_bridge_lookback"), "40")
+
+    def test_long_execution_is_continuous_unless_segmentation_is_explicit(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                resolve_long_execution_policy("long"),
+                (True, False, "continuous_paged"),
+            )
+        with patch.dict(
+            os.environ,
+            {"R3_LONG_EXECUTION_POLICY": "segmented_pose_graph"},
+            clear=True,
+        ):
+            self.assertEqual(
+                resolve_long_execution_policy("long"),
+                (False, True, "segmented_pose_graph"),
+            )
 
     def test_custom_experimental_preset_remains_opt_in(self) -> None:
         custom_environment = {
