@@ -492,11 +492,23 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
     rotation_axis, rotation_axis_diagnostics = _camera_rotation_axis_normal(rotations, camera_up)
     pca_normal, pca_diagnostics = _trajectory_plane_normal(points)
     normal_sign_source = "camera_physical_up"
+    normal_disagreement_degrees = None
+    if rotation_axis is not None and pca_normal is not None:
+        agreement = float(np.clip(abs(np.dot(rotation_axis, pca_normal)), 0.0, 1.0))
+        normal_disagreement_degrees = float(np.degrees(np.arccos(agreement)))
+    pca_preferred = bool(
+        pca_normal is not None
+        and pca_diagnostics["eligible"]
+        and (
+            not rotation_axis_diagnostics["reliable"]
+            or (
+                normal_disagreement_degrees is not None
+                and normal_disagreement_degrees >= 12.0
+            )
+        )
+    )
 
-    if rotation_axis is not None and rotation_axis_diagnostics["reliable"]:
-        normal = rotation_axis
-        method = "camera_rotation_axis"
-    elif pca_normal is not None and pca_diagnostics["eligible"]:
+    if pca_preferred:
         normal = pca_normal
         method = "trajectory_plane_pca"
         if camera_up is not None:
@@ -507,6 +519,9 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
             if normal[dominant] < 0.0:
                 normal = -normal
             normal_sign_source = "deterministic_dominant_axis"
+    elif rotation_axis is not None and rotation_axis_diagnostics["reliable"]:
+        normal = rotation_axis
+        method = "camera_rotation_axis"
     elif camera_up is not None and coherence >= 0.55:
         normal = camera_up
         method = "camera_physical_up"
@@ -579,6 +594,10 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
         "chirality_confidence": "high" if normal_sign_source == "camera_physical_up" else "low",
         "camera_rotation_axis": rotation_axis_diagnostics,
         "trajectory_plane": pca_diagnostics,
+        "normal_disagreement_degrees": (
+            round(normal_disagreement_degrees, 6)
+            if normal_disagreement_degrees is not None else None
+        ),
         "origin": [round(float(v), 6) for v in origin],
         "basis_e1": [round(float(v), 6) for v in e1],
         "basis_e2": [round(float(v), 6) for v in e2],
