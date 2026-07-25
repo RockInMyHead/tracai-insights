@@ -219,6 +219,12 @@ class R3WorkerPresetTests(unittest.TestCase):
                 confidence_t=np.full(point_count - 1, 2.0, dtype=np.float32),
                 confidence_r=np.full(point_count - 1, 2.0, dtype=np.float32),
                 edge_type=np.zeros(point_count - 1, dtype=np.uint8),
+                creation_reason=np.full(point_count - 1, "adjacent_frames"),
+                original_edge_type=np.full(point_count - 1, "normal"),
+                temporal_gap=np.ones(point_count - 1, dtype=np.int32),
+                fallback_epoch=np.full(point_count - 1, -1, dtype=np.int32),
+                segment_id=np.full(point_count - 1, -1, dtype=np.int32),
+                matching_support=np.full(point_count - 1, np.nan, dtype=np.float32),
             )
 
             with patch.dict(

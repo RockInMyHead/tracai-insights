@@ -80,11 +80,12 @@ except ImportError:  # pragma: no cover - package-style startup
 R3_DIR = Path("/home/artem/trackai/R3")
 CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
 
-R3_POSE_GRAPH_EXPORT_MARKER = "# TRACKAI_R3_POSE_GRAPH_EXPORT_V1"
+R3_POSE_GRAPH_EXPORT_LEGACY_MARKER = "# TRACKAI_R3_POSE_GRAPH_EXPORT_V1"
+R3_POSE_GRAPH_EXPORT_MARKER = "# TRACKAI_R3_POSE_GRAPH_EXPORT_V2"
 R3_POSE_GRAPH_EXPORT_ANCHOR = '''                with open(os.path.join(output_dir, "pose_edge_log.json"), "w") as f:
                     json.dump(edge_records, f)
 '''
-R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPORT_V1
+R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPORT_V2
                 pose_graph_capacity = len(edges)
                 pose_graph_edge_sequence = np.empty(pose_graph_capacity, dtype=np.int64)
                 pose_graph_frame_i = np.empty(pose_graph_capacity, dtype=np.int32)
@@ -96,6 +97,12 @@ R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPO
                 pose_graph_confidence_t = np.full(pose_graph_capacity, np.nan, dtype=np.float32)
                 pose_graph_confidence_r = np.full(pose_graph_capacity, np.nan, dtype=np.float32)
                 pose_graph_edge_type = np.full(pose_graph_capacity, 255, dtype=np.uint8)
+                pose_graph_creation_reason = np.full(pose_graph_capacity, "", dtype="<U64")
+                pose_graph_original_edge_type = np.full(pose_graph_capacity, "", dtype="<U32")
+                pose_graph_temporal_gap = np.zeros(pose_graph_capacity, dtype=np.int32)
+                pose_graph_fallback_epoch = np.full(pose_graph_capacity, -1, dtype=np.int32)
+                pose_graph_segment_id = np.full(pose_graph_capacity, -1, dtype=np.int32)
+                pose_graph_matching_support = np.full(pose_graph_capacity, np.nan, dtype=np.float32)
                 pose_graph_count = 0
                 for edge_sequence, edge in enumerate(edges):
                     frame_i = int(edge.frame_i)
@@ -122,22 +129,56 @@ R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPO
                         pose_graph_confidence_t[record_index] = float(confidence_t)
                     if confidence_r is not None:
                         pose_graph_confidence_r[record_index] = float(confidence_r)
-                    pose_graph_edge_type[record_index] = {
-                        "normal": 0,
-                        "bridge": 1,
-                        "anchor": 2,
-                    }.get(edge.edge_type, 255)
+                    original_edge_type = str(edge.edge_type)
+                    temporal_gap = abs(
+                        frame_id_to_output_idx[frame_j]
+                        - frame_id_to_output_idx[frame_i]
+                    )
+                    if original_edge_type == "normal":
+                        classified_type = 0 if temporal_gap <= 2 else 1 if temporal_gap <= 20 else 3
+                        creation_reason = (
+                            "adjacent_frames" if temporal_gap <= 2
+                            else "local_overlap" if temporal_gap <= 20
+                            else "unverified_long_range_match"
+                        )
+                    else:
+                        classified_type = {
+                            "bridge": 2,
+                            "verified_loop": 4,
+                            "rejected_loop": 5,
+                            "anchor": 6,
+                        }.get(original_edge_type, 255)
+                        creation_reason = str(
+                            getattr(edge, "creation_reason", original_edge_type)
+                        )
+                    pose_graph_edge_type[record_index] = classified_type
+                    pose_graph_creation_reason[record_index] = creation_reason[:64]
+                    pose_graph_original_edge_type[record_index] = original_edge_type[:32]
+                    pose_graph_temporal_gap[record_index] = temporal_gap
+                    pose_graph_fallback_epoch[record_index] = int(
+                        getattr(edge, "fallback_epoch", -1)
+                    )
+                    pose_graph_segment_id[record_index] = int(
+                        getattr(edge, "segment_id", -1)
+                    )
+                    matching_support = getattr(edge, "matching_support", None)
+                    if matching_support is not None:
+                        pose_graph_matching_support[record_index] = float(matching_support)
                     pose_graph_count += 1
                 if pose_graph_count:
                     np.savez_compressed(
                         os.path.join(output_dir, "pose_graph_edges.npz"),
-                        schema_version=np.asarray([1], dtype=np.int32),
+                        schema_version=np.asarray([2], dtype=np.int32),
                         pose_encoding=np.asarray("txyz_qxyzw_fovxy"),
                         transform_convention=np.asarray("target_hmat=relative_hmat@reference_hmat"),
                         frame_index_space=np.asarray("exported_camera_index"),
                         absolute_pose_space=np.asarray("world_to_camera"),
                         confidence_semantics=np.asarray("softplus_positive_weight_not_covariance"),
-                        edge_type_names=np.asarray(["normal", "bridge", "anchor", "unknown"]),
+                        edge_type_names=np.asarray([
+                            "odometry", "local_constraint", "fallback_bridge",
+                            "loop_candidate", "verified_loop", "rejected_loop",
+                            "anchor", "unknown",
+                        ]),
                         edge_sequence=pose_graph_edge_sequence[:pose_graph_count],
                         frame_i=pose_graph_frame_i[:pose_graph_count],
                         frame_j=pose_graph_frame_j[:pose_graph_count],
@@ -148,6 +189,12 @@ R3_POSE_GRAPH_EXPORT_INSERTION = '''                # TRACKAI_R3_POSE_GRAPH_EXPO
                         confidence_t=pose_graph_confidence_t[:pose_graph_count],
                         confidence_r=pose_graph_confidence_r[:pose_graph_count],
                         edge_type=pose_graph_edge_type[:pose_graph_count],
+                        creation_reason=pose_graph_creation_reason[:pose_graph_count],
+                        original_edge_type=pose_graph_original_edge_type[:pose_graph_count],
+                        temporal_gap=pose_graph_temporal_gap[:pose_graph_count],
+                        fallback_epoch=pose_graph_fallback_epoch[:pose_graph_count],
+                        segment_id=pose_graph_segment_id[:pose_graph_count],
+                        matching_support=pose_graph_matching_support[:pose_graph_count],
                     )
 '''
 
@@ -245,6 +292,22 @@ def _patch_r3_infer_source(source: str) -> tuple[str, dict]:
     """Inject a versioned full-edge sidecar export into supported R3 infer.py."""
     if R3_POSE_GRAPH_EXPORT_MARKER in source:
         return source, {"status": "already_available", "changed": False}
+    if R3_POSE_GRAPH_EXPORT_LEGACY_MARKER in source:
+        start = source.find(
+            "                " + R3_POSE_GRAPH_EXPORT_LEGACY_MARKER
+        )
+        legacy_end = (
+            "                        edge_type=pose_graph_edge_type[:pose_graph_count],\n"
+            "                    )\n"
+        )
+        end = source.find(legacy_end, start)
+        if start < 0 or end < 0:
+            return source, {
+                "status": "legacy_export_migration_failed",
+                "changed": False,
+                "reason": "legacy export block boundary not found",
+            }
+        source = source[:start] + source[end + len(legacy_end):]
     if R3_POSE_GRAPH_EXPORT_ANCHOR not in source:
         return source, {
             "status": "unsupported_infer_source",
@@ -1084,6 +1147,9 @@ def _read_segment_pose_graph(
         return None
     try:
         with np.load(path, allow_pickle=False) as payload:
+            schema_version = int(np.asarray(
+                payload["schema_version"] if "schema_version" in payload.files else [1]
+            ).reshape(-1)[0])
             frame_i = np.asarray(payload["frame_i"], dtype=np.int64).reshape(-1)
             frame_j = np.asarray(payload["frame_j"], dtype=np.int64).reshape(-1)
             rel_pose = np.asarray(payload["rel_pose_enc"], dtype=np.float32)
@@ -1091,6 +1157,31 @@ def _read_segment_pose_graph(
             confidence_t = np.asarray(payload["confidence_t"], dtype=np.float32).reshape(-1)
             confidence_r = np.asarray(payload["confidence_r"], dtype=np.float32).reshape(-1)
             edge_type = np.asarray(payload["edge_type"], dtype=np.uint8).reshape(-1)
+            creation_reason = np.asarray(
+                payload["creation_reason"]
+                if "creation_reason" in payload.files
+                else np.full(len(frame_i), "legacy_import")
+            ).astype("<U64")
+            original_edge_type = np.asarray(
+                payload["original_edge_type"]
+                if "original_edge_type" in payload.files
+                else np.full(len(frame_i), "legacy")
+            ).astype("<U32")
+            fallback_epoch = np.asarray(
+                payload["fallback_epoch"]
+                if "fallback_epoch" in payload.files
+                else np.full(len(frame_i), -1)
+            ).astype(np.int32)
+            segment_id = np.asarray(
+                payload["segment_id"]
+                if "segment_id" in payload.files
+                else np.full(len(frame_i), -1)
+            ).astype(np.int32)
+            matching_support = np.asarray(
+                payload["matching_support"]
+                if "matching_support" in payload.files
+                else np.full(len(frame_i), np.nan)
+            ).astype(np.float32)
     except Exception:
         return None
 
@@ -1112,6 +1203,19 @@ def _read_segment_pose_graph(
         return None
     frame_i = frame_i[valid]
     frame_j = frame_j[valid]
+    if schema_version == 1:
+        gap = np.abs(frame_j - frame_i)
+        legacy = edge_type[valid]
+        classified = np.full(len(legacy), 255, dtype=np.uint8)
+        normal = legacy == 0
+        classified[normal & (gap <= 2)] = 0
+        classified[normal & (gap > 2) & (gap <= 20)] = 1
+        classified[normal & (gap > 20)] = 3
+        classified[legacy == 1] = 2
+        classified[legacy == 2] = 6
+        edge_type = classified
+    else:
+        edge_type = edge_type[valid]
     scaled_rel_pose = rel_pose[valid].copy()
     # A world Sim(3) changes relative translation scale but its common world
     # rotation/translation cancels between the two camera frames.
@@ -1125,13 +1229,22 @@ def _read_segment_pose_graph(
         confidence = confidence[valid][usable_quaternion]
         confidence_t = confidence_t[valid][usable_quaternion]
         confidence_r = confidence_r[valid][usable_quaternion]
-        edge_type = edge_type[valid][usable_quaternion]
+        edge_type = edge_type[usable_quaternion]
+        creation_reason = creation_reason[valid][usable_quaternion]
+        original_edge_type = original_edge_type[valid][usable_quaternion]
+        fallback_epoch = fallback_epoch[valid][usable_quaternion]
+        segment_id = segment_id[valid][usable_quaternion]
+        matching_support = matching_support[valid][usable_quaternion]
         quaternion_norm = quaternion_norm[usable_quaternion]
     else:
         confidence = confidence[valid]
         confidence_t = confidence_t[valid]
         confidence_r = confidence_r[valid]
-        edge_type = edge_type[valid]
+        creation_reason = creation_reason[valid]
+        original_edge_type = original_edge_type[valid]
+        fallback_epoch = fallback_epoch[valid]
+        segment_id = segment_id[valid]
+        matching_support = matching_support[valid]
     scaled_rel_pose[:, 3:7] /= quaternion_norm[:, None]
     index_array = np.asarray(global_indices, dtype=np.int32)
     return {
@@ -1142,6 +1255,12 @@ def _read_segment_pose_graph(
         "confidence_t": confidence_t,
         "confidence_r": confidence_r,
         "edge_type": edge_type,
+        "creation_reason": creation_reason,
+        "original_edge_type": original_edge_type,
+        "temporal_gap": np.abs(index_array[frame_j] - index_array[frame_i]).astype(np.int32),
+        "fallback_epoch": fallback_epoch,
+        "segment_id": segment_id,
+        "matching_support": matching_support,
     }
 
 
@@ -1162,6 +1281,12 @@ def _save_merged_pose_graph(
         "confidence_t",
         "confidence_r",
         "edge_type",
+        "creation_reason",
+        "original_edge_type",
+        "temporal_gap",
+        "fallback_epoch",
+        "segment_id",
+        "matching_support",
     )
     merged = {
         name: np.concatenate([np.asarray(part[name]) for part in parts], axis=0)
@@ -1192,7 +1317,11 @@ def _save_merged_pose_graph(
         frame_index_space=np.asarray("exported_camera_index"),
         absolute_pose_space=np.asarray(R3_ABSOLUTE_POSE_SPACE),
         confidence_semantics=np.asarray(R3_CONFIDENCE_SEMANTICS),
-        edge_type_names=np.asarray(["normal", "bridge", "anchor", "unknown"]),
+        edge_type_names=np.asarray([
+            "odometry", "local_constraint", "fallback_bridge",
+            "loop_candidate", "verified_loop", "rejected_loop",
+            "anchor", "unknown",
+        ]),
         edge_sequence=np.arange(count, dtype=np.int64),
         model_frame_i=merged["frame_i"].astype(np.int64),
         model_frame_j=merged["frame_j"].astype(np.int64),

@@ -18,11 +18,23 @@ from typing import Any, Mapping
 import numpy as np
 
 
-R3_POSE_GRAPH_SCHEMA_VERSION = 1
+R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION = 1
+R3_POSE_GRAPH_SCHEMA_VERSION = 2
+R3_EDGE_TYPE_NAMES = (
+    "odometry",
+    "local_constraint",
+    "fallback_bridge",
+    "loop_candidate",
+    "verified_loop",
+    "rejected_loop",
+    "anchor",
+    "unknown",
+)
 R3_POSE_ENCODING = "txyz_qxyzw_fovxy"
 R3_RELATIVE_TRANSFORM_CONVENTION = "target_hmat=relative_hmat@reference_hmat"
 R3_ABSOLUTE_POSE_SPACE = "world_to_camera"
 R3_CONFIDENCE_SEMANTICS = "softplus_positive_weight_not_covariance"
+R3_POSE_GRAPH_SUMMARY_READER_VERSION = 2
 
 
 def _percentile_summary(values: Any) -> dict[str, float] | None:
@@ -124,6 +136,15 @@ def _summarize_pose_graph_npz(payload: Any, point_count: int) -> dict[str, Any]:
         "confidence_r",
         "edge_type",
     )
+    if schema_version == R3_POSE_GRAPH_SCHEMA_VERSION:
+        required += (
+            "creation_reason",
+            "original_edge_type",
+            "temporal_gap",
+            "fallback_epoch",
+            "segment_id",
+            "matching_support",
+        )
     missing_arrays = [name for name in required if name not in getattr(payload, "files", [])]
     if missing_arrays:
         return {
@@ -155,6 +176,16 @@ def _summarize_pose_graph_npz(payload: Any, point_count: int) -> dict[str, Any]:
         "edge_type": len(edge_type),
         "rel_pose_enc": int(rel_pose.shape[0]) if rel_pose.ndim >= 1 else 0,
     }
+    for name in (
+        "creation_reason",
+        "original_edge_type",
+        "temporal_gap",
+        "fallback_epoch",
+        "segment_id",
+        "matching_support",
+    ):
+        if name in getattr(payload, "files", []):
+            lengths[name] = len(np.asarray(payload[name]).reshape(-1))
     if any(length != edge_count for length in lengths.values()) or rel_pose.shape != (edge_count, 9):
         return {
             "available": edge_count > 0,
@@ -220,7 +251,10 @@ def _summarize_pose_graph_npz(payload: Any, point_count: int) -> dict[str, Any]:
     relative_pose_coverage = relative_pose_edges / valid_index_edges if valid_index_edges else 0.0
     split_confidence_coverage = split_confidence_edges / valid_index_edges if valid_index_edges else 0.0
     schema_matches = (
-        schema_version == R3_POSE_GRAPH_SCHEMA_VERSION
+        schema_version in {
+            R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION,
+            R3_POSE_GRAPH_SCHEMA_VERSION,
+        }
         and pose_encoding == R3_POSE_ENCODING
         and transform_convention == R3_RELATIVE_TRANSFORM_CONVENTION
         and frame_index_space == "exported_camera_index"
@@ -237,7 +271,19 @@ def _summarize_pose_graph_npz(payload: Any, point_count: int) -> dict[str, Any]:
         and quaternion_outliers == 0
         and (connected_coverage is None or connected_coverage >= 0.8)
     )
-    type_names = {0: "normal", 1: "bridge", 2: "anchor"}
+    type_names = (
+        {0: "normal", 1: "bridge", 2: "anchor"}
+        if schema_version == R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION
+        else {
+            0: "odometry",
+            1: "local_constraint",
+            2: "fallback_bridge",
+            3: "loop_candidate",
+            4: "verified_loop",
+            5: "rejected_loop",
+            6: "anchor",
+        }
+    )
     type_counts: dict[str, int] = {}
     for code, count in zip(*np.unique(edge_type, return_counts=True)):
         name = type_names.get(int(code), "unknown")
@@ -249,6 +295,11 @@ def _summarize_pose_graph_npz(payload: Any, point_count: int) -> dict[str, Any]:
         "storage": "compressed_npz",
         "schema_version": schema_version,
         "schema_matches": schema_matches,
+        "compatibility_mode": (
+            "legacy_v1_safe_classification"
+            if schema_version == R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION
+            else "native_v2"
+        ),
         "pose_encoding": pose_encoding,
         "transform_convention": transform_convention,
         "frame_index_space": frame_index_space,
@@ -272,6 +323,12 @@ def _summarize_pose_graph_npz(payload: Any, point_count: int) -> dict[str, Any]:
         "translation_norm": _percentile_summary(translation_norms),
         "quaternion_norm": _percentile_summary(quaternion_norms),
         "frame_gap": _percentile_summary(np.abs(valid_j - valid_i).astype(float)),
+        "provenance_available": schema_version == R3_POSE_GRAPH_SCHEMA_VERSION,
+        "matching_support": (
+            _percentile_summary(np.asarray(payload["matching_support"], dtype=float))
+            if schema_version == R3_POSE_GRAPH_SCHEMA_VERSION
+            else None
+        ),
     }
 
 
@@ -401,7 +458,10 @@ def summarize_pose_graph_edges(payload: Any, point_count: int = 0) -> dict[str, 
     split_confidence_coverage = split_confidence_edges / valid_index_edges if valid_index_edges else 0.0
     connected_frame_coverage = largest_component / point_count if point_count > 0 else None
     schema_matches = (
-        schema_version == R3_POSE_GRAPH_SCHEMA_VERSION
+        schema_version in {
+            R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION,
+            R3_POSE_GRAPH_SCHEMA_VERSION,
+        }
         and pose_encoding == R3_POSE_ENCODING
         and transform_convention == R3_RELATIVE_TRANSFORM_CONVENTION
         and frame_index_space == "exported_camera_index"
@@ -475,7 +535,12 @@ def load_pose_graph_summary(path: str | Path, point_count: int = 0) -> dict[str,
         try:
             if cache_path.exists() and cache_path.stat().st_mtime_ns >= source.stat().st_mtime_ns:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(cached, Mapping) and cached.get("point_count") == point_count:
+                if (
+                    isinstance(cached, Mapping)
+                    and cached.get("point_count") == point_count
+                    and cached.get("summary_reader_version")
+                    == R3_POSE_GRAPH_SUMMARY_READER_VERSION
+                ):
                     return {"path": str(source), **dict(cached)}
         except Exception:
             pass
@@ -489,7 +554,11 @@ def load_pose_graph_summary(path: str | Path, point_count: int = 0) -> dict[str,
                 "path": str(source),
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        summary = {"point_count": point_count, **summary}
+        summary = {
+            "point_count": point_count,
+            "summary_reader_version": R3_POSE_GRAPH_SUMMARY_READER_VERSION,
+            **summary,
+        }
         temporary_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
         try:
             temporary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
