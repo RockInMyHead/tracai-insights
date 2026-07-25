@@ -2080,7 +2080,7 @@ def main():
     segment_min_duration = float(
         os.getenv(
             "R3_LONG_MIN_DURATION_SECONDS",
-            os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "600"),
+            os.getenv("R3_SEGMENT_MIN_DURATION_SECONDS", "180"),
         )
     )
     # Turns made while walking often complete in about one second.  Five
@@ -2116,7 +2116,7 @@ def main():
     except (TypeError, ValueError, ZeroDivisionError):
         selected_fps = max(1.0, long_target_fps)
     segment_seconds = max(180.0, min(300.0, float(
-        os.getenv("R3_LONG_SEGMENT_SECONDS", "240")
+        os.getenv("R3_LONG_SEGMENT_SECONDS", "180")
     )))
     overlap_seconds = max(15.0, min(60.0, float(
         os.getenv("R3_LONG_SEGMENT_OVERLAP_SECONDS", "30")
