@@ -1131,6 +1131,36 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         if "fine" in nonlinear and nonlinear["fine"].get("reason") is None:
             self.assertEqual(nonlinear["fine"]["order"], 2)
 
+    def test_five_minute_reference_route_passes_metric_and_map_gates(self) -> None:
+        engine = get_floorplan_engine()
+        points = np.asarray(load_reference_route()["points"], dtype=np.float64)
+        relative = points - points[0]
+        observation = np.column_stack((
+            relative[:, 0],
+            -relative[:, 1],
+            np.zeros(len(relative)),
+        ))
+        start = engine.config.default_anchor_reference_pixels
+        direction = engine.config.default_anchor_direction_pixels
+        self.assertIsNotNone(start)
+        self.assertIsNotNone(direction)
+        result = engine.align(
+            observation.tolist(),
+            {
+                "x": start[0] / engine.config.width * 100.0,
+                "y": start[1] / engine.config.height * 100.0,
+            },
+            {
+                "x": direction[0] / engine.config.width * 100.0,
+                "y": direction[1] / engine.config.height * 100.0,
+            },
+            timestamps=np.linspace(0.0, 305.533, len(points)).tolist(),
+            coordinate_convention="x_forward_y_left_z_up",
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+        )
+        self.assertTrue(result["accepted"], result["diagnostics"])
+
 
 if __name__ == "__main__":
     unittest.main()

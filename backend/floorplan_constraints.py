@@ -40,7 +40,10 @@ ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 # needs an explicit metric prior before the floor plan is allowed to choose
 # its scale. Short clips use walking speed; long inspection clips may contain
 # substantial stops, so their average speed is allowed to be much lower.
-AUTHORITATIVE_SPEED_RATIO_BOUNDS = (0.30, 2.70)
+# The verified five-minute Kerama route averages about 0.307 m/s including
+# stops, or 0.256 of the nominal 1.2 m/s.  The previous 0.30 lower bound
+# rejected the ground truth before the walkable mask was evaluated.
+AUTHORITATIVE_SPEED_RATIO_BOUNDS = (0.20, 2.70)
 INDEPENDENT_SPEED_RATIO_BOUNDS = (0.72, 1.80)
 INDEPENDENT_LOOP_CLOSED_SPEED_RATIO_BOUNDS = (0.55, 1.80)
 INDEPENDENT_LONG_INSPECTION_SPEED_RATIO_BOUNDS = (0.04, 1.80)
