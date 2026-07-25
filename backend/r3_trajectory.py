@@ -480,31 +480,6 @@ def _trajectory_plane_normal(points: np.ndarray) -> tuple[np.ndarray | None, dic
     return normal, diagnostics
 
 
-def _project_in_floor_basis(
-    points: np.ndarray,
-    basis: tuple[np.ndarray, np.ndarray, np.ndarray],
-    origin: np.ndarray | None = None,
-) -> np.ndarray:
-    """Project points without re-estimating plane, sign or initial heading."""
-    if len(points) == 0:
-        return np.asarray(points, dtype=np.float64).copy()
-    e1, e2, normal = (
-        _normalize(np.asarray(vector, dtype=np.float64))
-        for vector in basis
-    )
-    anchor = (
-        np.asarray(origin, dtype=np.float64)
-        if origin is not None
-        else np.asarray(points[0], dtype=np.float64)
-    )
-    centered = np.asarray(points, dtype=np.float64) - anchor
-    return np.column_stack((
-        np.sum(centered * e1.reshape(1, 3), axis=1),
-        np.sum(centered * e2.reshape(1, 3), axis=1),
-        np.sum(centered * normal.reshape(1, 3), axis=1),
-    ))
-
-
 def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tuple[np.ndarray, dict[str, Any], tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Project positions into canonical plan space: X forward, Y left, Z up."""
     if len(points) == 0:
@@ -588,7 +563,11 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
     e1 = _normalize(np.cross(e2, normal))
     # Element-wise reductions avoid platform BLAS overflow warnings observed
     # for otherwise finite 3-vectors on some NumPy/OpenBLAS combinations.
-    plan = _project_in_floor_basis(points, (e1, e2, normal), origin)
+    plan = np.column_stack((
+        np.sum(centered * e1.reshape(1, 3), axis=1),
+        np.sum(centered * e2.reshape(1, 3), axis=1),
+        np.sum(centered * normal.reshape(1, 3), axis=1),
+    ))
 
     return plan, {
         "method": method,
@@ -605,126 +584,6 @@ def _project_to_floor(points: np.ndarray, rotations: Sequence[np.ndarray]) -> tu
         "basis_e2": [round(float(v), 6) for v in e2],
         "normal": [round(float(v), 6) for v in normal],
     }, (e1, e2, normal)
-
-
-def compare_floor_projection_sources(
-    sources: Mapping[str, np.ndarray],
-    reliable_source: str,
-) -> dict[str, Any]:
-    """Compare own-plane and shared-basis projections for several pose sets."""
-    try:
-        from trajectory_geometry import compare_trajectories, trajectory_metrics
-    except ImportError:  # pragma: no cover - package-style startup
-        from backend.trajectory_geometry import compare_trajectories, trajectory_metrics
-
-    prepared: dict[str, dict[str, Any]] = {}
-    for name, poses_value in sources.items():
-        poses = np.asarray(poses_value, dtype=np.float64)
-        if poses.ndim != 3 or poses.shape[1:] != (4, 4) or len(poses) < 2:
-            continue
-        points = poses[:, :3, 3]
-        rotations = [rotation for rotation in poses[:, :3, :3]]
-        own, diagnostics, basis = _project_to_floor(points, rotations)
-        prepared[name] = {
-            "points": points,
-            "own": own,
-            "diagnostics": diagnostics,
-            "basis": basis,
-        }
-    if reliable_source not in prepared:
-        return {
-            "available": False,
-            "reason": "reliable_source_unavailable",
-            "reliable_source": reliable_source,
-            "sources": {},
-        }
-
-    reliable = prepared[reliable_source]
-    common_basis = reliable["basis"]
-    reliable_common = _project_in_floor_basis(
-        reliable["points"], common_basis
-    )
-    result: dict[str, Any] = {}
-    for name, item in prepared.items():
-        common = _project_in_floor_basis(item["points"], common_basis)
-        own_vs_common = compare_trajectories(
-            item["own"][:, :2], common[:, :2]
-        )
-        own_vs_reliable = compare_trajectories(
-            reliable["own"][:, :2], item["own"][:, :2]
-        )
-        common_vs_reliable = compare_trajectories(
-            reliable_common[:, :2], common[:, :2]
-        )
-        basis = item["basis"]
-        normal_dot = float(np.clip(np.dot(basis[2], common_basis[2]), -1.0, 1.0))
-        normal_angle = math.degrees(math.acos(abs(normal_dot)))
-        heading_dot = float(np.clip(np.dot(basis[0], common_basis[0]), -1.0, 1.0))
-        heading_angle = math.degrees(math.acos(heading_dot))
-        handedness_flip = normal_dot < 0.0
-        basis_change = float(
-            own_vs_common.get("normalized_frechet_distance", 0.0)
-        )
-        own_error = float(
-            own_vs_reliable.get("normalized_frechet_distance", 0.0)
-        )
-        common_error = float(
-            common_vs_reliable.get("normalized_frechet_distance", 0.0)
-        )
-        common_metrics = trajectory_metrics(common[:, :2])
-        common_span = float(np.linalg.norm(np.ptp(common[:, :2], axis=0)))
-        common_radius = np.linalg.norm(common[:, :2] - common[0, :2], axis=1)
-        common_metrics["near_start_fraction_relative"] = round(
-            float(np.mean(common_radius <= max(common_span * 0.10, 1e-12))),
-            6,
-        )
-        causes: list[str] = []
-        if common_error > 0.08:
-            causes.append("trajectory_3d_mismatch")
-        if normal_angle > 10.0:
-            causes.append("floor_plane_mismatch")
-        if handedness_flip:
-            causes.append("handedness_mismatch")
-        if heading_angle > 20.0 and normal_angle <= 10.0:
-            causes.append("initial_heading_mismatch")
-        if basis_change > 0.04 and common_error + 0.02 < own_error:
-            causes.append("projection_basis_sensitive")
-        result[name] = {
-            "point_count": int(len(common)),
-            "own_projection_method": item["diagnostics"].get("method"),
-            "own_basis": {
-                "e1": item["diagnostics"].get("basis_e1"),
-                "e2": item["diagnostics"].get("basis_e2"),
-                "normal": item["diagnostics"].get("normal"),
-            },
-            "own_vs_common": own_vs_common,
-            "own_vs_reliable": own_vs_reliable,
-            "common_vs_reliable": common_vs_reliable,
-            "common_projection_metrics": common_metrics,
-            "normal_angle_to_common_degrees": round(normal_angle, 6),
-            "initial_heading_angle_to_common_degrees": round(heading_angle, 6),
-            "handedness_flip": handedness_flip,
-            "diagnosed_causes": causes,
-            "recommended_fix": (
-                "_project_to_floor"
-                if "projection_basis_sensitive" in causes
-                and "trajectory_3d_mismatch" not in causes
-                else "trajectory_3d"
-                if "trajectory_3d_mismatch" in causes
-                else None
-            ),
-        }
-    return {
-        "available": True,
-        "reliable_source": reliable_source,
-        "common_basis": {
-            "e1": reliable["diagnostics"].get("basis_e1"),
-            "e2": reliable["diagnostics"].get("basis_e2"),
-            "normal": reliable["diagnostics"].get("normal"),
-            "method": reliable["diagnostics"].get("method"),
-        },
-        "sources": result,
-    }
 
 
 def _stabilize_scale_regimes(

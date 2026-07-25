@@ -133,12 +133,6 @@ class R3PoseGraphTests(unittest.TestCase):
                 confidence_t=np.asarray([2.1, 2.1], dtype=np.float32),
                 confidence_r=np.asarray([1.9, 1.9], dtype=np.float32),
                 edge_type=np.asarray([0, 0], dtype=np.uint8),
-                creation_reason=np.asarray(["adjacent_frames", "adjacent_frames"]),
-                original_edge_type=np.asarray(["normal", "normal"]),
-                temporal_gap=np.asarray([1, 1], dtype=np.int32),
-                fallback_epoch=np.asarray([-1, -1], dtype=np.int32),
-                segment_id=np.asarray([-1, -1], dtype=np.int32),
-                matching_support=np.asarray([np.nan, np.nan], dtype=np.float32),
             )
 
             first = load_pose_graph_summary(graph_path, point_count=3)

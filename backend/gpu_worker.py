@@ -46,15 +46,9 @@ except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_pose_graph_optimizer import load_pose_graph_candidate_summary
 
 try:
-    from r3_trajectory_sources import (
-        load_r3_trajectory_pose_sets,
-        select_r3_trajectory_camera_poses,
-    )
+    from r3_trajectory_sources import select_r3_trajectory_camera_poses
 except ImportError:  # pragma: no cover - supports package-style startup
-    from backend.r3_trajectory_sources import (
-        load_r3_trajectory_pose_sets,
-        select_r3_trajectory_camera_poses,
-    )
+    from backend.r3_trajectory_sources import select_r3_trajectory_camera_poses
 
 try:
     from r3_scale_aware import load_scale_aware_candidate_summary
@@ -1001,36 +995,6 @@ def _load_r3_trajectory_bundle(
     bundle["trajectory_source"] = source_selection["selected"]
     bundle["trajectory_source_fallback_reason"] = source_selection["fallback_reason"]
     bundle["trajectory_source_selection"] = source_selection
-    source_bundles: dict[str, dict] = {}
-    for source_name, source_poses in load_r3_trajectory_pose_sets(
-        base, camera_poses
-    ).items():
-        source_cameras = [
-            {**camera, "pose": source_poses[index].tolist()}
-            for index, camera in enumerate(camera_poses)
-        ]
-        source_bundle = build_r3_trajectory(
-            source_cameras,
-            pose_confidence,
-            frame_selection,
-            run_params,
-        )
-        candidate_quality = (
-            source_selection.get("candidates", {}).get(source_name, {})
-        )
-        source_bundles[source_name] = {
-            "plan_trajectory": source_bundle.get("plan_trajectory", []),
-            "turn_points": source_bundle.get("turn_points", []),
-            "trajectory_quality": source_bundle.get("trajectory_quality", {}),
-            "geometry_quality": candidate_quality,
-            "eligible_before_map": bool(
-                candidate_quality.get("eligible", source_name == "raw")
-            ),
-            "verified_loop_closure": bool(
-                candidate_quality.get("verified_loop_closure", False)
-            ),
-        }
-    bundle["r3_source_trajectories"] = source_bundles
     return bundle, selected_camera_poses
 
 
@@ -2663,9 +2627,6 @@ async def r3_get_trajectory(
             ),
             "trajectory_source_selection": trajectory_bundle.get(
                 "trajectory_source_selection", {}
-            ),
-            "r3_source_trajectories": trajectory_bundle.get(
-                "r3_source_trajectories", {}
             ),
             "run_params": run_params,
             "fallback_summary": fallback_summary,

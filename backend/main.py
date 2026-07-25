@@ -579,7 +579,6 @@ async def _recover_orphaned_r3_completion(video_id: str) -> Optional[Dict[str, A
             "r3_pose_graph": selected.get("pose_graph"),
             "r3_pose_graph_candidate": selected.get("pose_graph_candidate"),
             "r3_scale_aware_candidate": selected.get("scale_aware_candidate"),
-            "r3_source_trajectories": selected.get("r3_source_trajectories") or {},
             "processing_stats": {
                 "estimated_distance": round(estimated_distance, 2),
                 "scale_factor": 1.0,
@@ -1966,7 +1965,6 @@ def _merge_r3_production_trajectory(base: dict, selected: dict) -> dict:
         "r3_pose_graph": selected.get("pose_graph"),
         "r3_pose_graph_candidate": selected.get("pose_graph_candidate"),
         "r3_scale_aware_candidate": selected.get("scale_aware_candidate"),
-        "r3_source_trajectories": selected.get("r3_source_trajectories") or {},
     })
     # Keep confidence samples index-aligned with the promoted plan. Prefer the
     # selected source's own confidence; otherwise resample/clear the base array.

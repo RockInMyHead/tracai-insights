@@ -11,11 +11,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from r3_trajectory import (
-    build_r3_trajectory,
-    compare_floor_projection_sources,
-    summarize_fallback_edges,
-)
+from r3_trajectory import build_r3_trajectory, summarize_fallback_edges
 
 
 def make_pose(frame: int, x: float, y: float, z: float, rotation: list[list[float]] | None = None) -> dict:
@@ -62,37 +58,6 @@ def rotation_for_pitched_heading(x: float, z: float, pitch_degrees: float) -> li
 
 
 class R3TrajectoryTests(unittest.TestCase):
-    def test_shared_floor_basis_exposes_handedness_without_3d_error(self) -> None:
-        point_count = 80
-        raw = np.broadcast_to(np.eye(4), (point_count, 4, 4)).copy()
-        x = np.linspace(0.0, 40.0, point_count)
-        raw[:, 0, 3] = x
-        raw[:, 2, 3] = 5.0 * np.sin(np.pi * x / 40.0)
-        flipped = raw.copy()
-        flipped[:, :3, :3] = np.diag([1.0, -1.0, -1.0])
-
-        comparison = compare_floor_projection_sources(
-            {"raw": raw, "flipped": flipped},
-            "raw",
-        )
-
-        flipped_result = comparison["sources"]["flipped"]
-        self.assertTrue(comparison["available"])
-        self.assertTrue(flipped_result["handedness_flip"])
-        self.assertIn(
-            "handedness_mismatch",
-            flipped_result["diagnosed_causes"],
-        )
-        self.assertNotIn(
-            "trajectory_3d_mismatch",
-            flipped_result["diagnosed_causes"],
-        )
-        self.assertAlmostEqual(
-            flipped_result["common_vs_reliable"]["normalized_frechet_distance"],
-            0.0,
-            places=6,
-        )
-
     def test_opencv_left_turn_has_canonical_left_handedness(self) -> None:
         # R3 exports OpenCV c2w: local +Y is camera-down.  With a +Z initial
         # heading, a physical left turn goes toward -X and must become +Y in

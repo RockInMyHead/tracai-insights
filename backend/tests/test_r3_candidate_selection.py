@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import json
 import sys
 import tempfile
 import unittest
@@ -57,65 +56,6 @@ def write_candidate(
 
 
 class R3CandidateSelectionTests(unittest.TestCase):
-    def test_leaderboard_rejects_spatially_collapsed_robust_candidate(self) -> None:
-        raw = line_poses(40, 1.0)
-        collapsed = raw.copy()
-        collapsed[:, 0, 3] = np.arange(len(collapsed), dtype=float) % 5
-        collapsed[:, 1, 3] = np.arange(len(collapsed), dtype=float) // 5 * 0.05
-
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            write_camera_artifacts(base, raw)
-            write_candidate(base, collapsed)
-            _, selection = select_r3_trajectory_camera_poses(
-                base,
-                [{"frame": index, "pose": pose.tolist()} for index, pose in enumerate(raw)],
-                "robust_candidate",
-            )
-
-        self.assertEqual(selection["selected"], "raw")
-        self.assertEqual(selection["reason"], "robust_spatial_span_collapsed")
-        self.assertEqual(
-            set(selection["candidates"]),
-            {"raw", "robust_candidate", "scale_aware_candidate"},
-        )
-        self.assertFalse(selection["candidates"]["robust_candidate"]["eligible"])
-
-    def test_map_repair_regression_overrides_internal_acceptance(self) -> None:
-        raw = line_poses(20, 1.0)
-        robust = line_poses(20, 1.0)
-        evaluations = {
-            "candidates": {
-                "raw": {
-                    "accepted": True,
-                    "map_alignment_score": 0.20,
-                    "correction_p95_meters": 0.4,
-                },
-                "robust_candidate": {
-                    "accepted": True,
-                    "map_alignment_score": 0.21,
-                    "correction_p95_meters": 2.0,
-                },
-            }
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            write_camera_artifacts(base, raw)
-            write_candidate(base, robust)
-            (base / "trajectory_source_evaluations.json").write_text(
-                json.dumps(evaluations),
-                encoding="utf-8",
-            )
-            _, selection = select_r3_trajectory_camera_poses(
-                base,
-                [{"frame": index, "pose": pose.tolist()} for index, pose in enumerate(raw)],
-                "robust_candidate",
-            )
-
-        self.assertEqual(selection["selected"], "raw")
-        self.assertEqual(selection["reason"], "map_repair_regressed")
-        self.assertEqual(selection["selection_uncertainty"]["level"], "low")
-
     def test_accepted_scale_candidate_is_selected_without_touching_raw(self) -> None:
         raw = line_poses(40, 1.0)
         local_scale = np.ones(40)
@@ -135,7 +75,6 @@ class R3CandidateSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             write_camera_artifacts(base, raw)
-            write_candidate(base, raw)
             save_scale_aware_candidate(base, build_scale_aware_candidate(raw, observations))
             selected, selection = select_r3_trajectory_camera_poses(
                 base,
@@ -146,10 +85,6 @@ class R3CandidateSelectionTests(unittest.TestCase):
 
         self.assertEqual(selection["selected"], "scale_aware_candidate")
         self.assertIsNone(selection["fallback_reason"])
-        self.assertEqual(
-            set(selection["floor_projection_comparison"]["sources"]),
-            {"raw", "robust_candidate", "scale_aware_candidate"},
-        )
         self.assertNotAlmostEqual(selected[-1]["pose"][0][3], raw[-1, 0, 3])
         np.testing.assert_allclose(persisted_raw, raw[-1])
 

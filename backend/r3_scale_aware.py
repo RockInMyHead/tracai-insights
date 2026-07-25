@@ -18,91 +18,10 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
-try:
-    from trajectory_geometry import trajectory_acceptance
-except ImportError:  # pragma: no cover - supports package-style startup
-    from backend.trajectory_geometry import trajectory_acceptance
-
 
 SCALE_CANDIDATE_FILE = "scale_aware_candidate.npz"
 SCALE_SUMMARY_FILE = "scale_aware_candidate.json"
 SCALE_SCHEMA_VERSION = 1
-
-
-def select_scale_aware_base(
-    raw_c2w: np.ndarray,
-    robust_c2w: np.ndarray | None,
-    robust_summary: dict[str, Any] | None,
-) -> tuple[np.ndarray, str, dict[str, Any]]:
-    """Use robust geometry only when it is accepted with a safety margin."""
-    raw = np.asarray(raw_c2w, dtype=np.float64)
-    summary = robust_summary if isinstance(robust_summary, dict) else {}
-    reasons: list[str] = []
-    geometry: dict[str, Any] | None = None
-    if robust_c2w is None:
-        reasons.append("robust_candidate_unavailable")
-    elif not summary.get("accepted", False):
-        reasons.append("robust_candidate_rejected")
-    else:
-        robust = np.asarray(robust_c2w, dtype=np.float64)
-        if robust.shape != raw.shape or not np.isfinite(robust).all():
-            reasons.append("robust_candidate_invalid")
-        else:
-            backbone = summary.get("backbone")
-            backbone = backbone if isinstance(backbone, dict) else {}
-            coverage = float(backbone.get("backbone_coverage", 0.0) or 0.0)
-            bridge_coverage = float(
-                backbone.get("bridge_boundary_coverage", 0.0) or 0.0
-            )
-            if coverage < 0.95:
-                reasons.append("robust_backbone_coverage_low")
-            if bridge_coverage < 1.0:
-                reasons.append("robust_bridge_coverage_low")
-
-            geometry = trajectory_acceptance(
-                raw[:, :3, 3],
-                robust[:, :3, 3],
-                {
-                    "verified_loop_closure": bool(
-                        summary.get("verified_loop_closure", False)
-                    )
-                },
-            )
-            if not geometry["accepted"]:
-                comparison = geometry.get("comparison") or {}
-                if float(comparison.get("spatial_span_ratio", 1.0)) < 0.55:
-                    reasons.append("robust_spatial_span_collapsed")
-                if float(comparison.get("endpoint_progress_ratio", 1.0)) < 0.55:
-                    reasons.append("robust_net_progress_collapsed")
-                reasons.append("robust_geometry_rejected")
-            else:
-                comparison = geometry["comparison"]
-                # A candidate just inside a hard boundary is too ambiguous to
-                # become the foundation of a second correction stage.
-                ambiguous = (
-                    float(comparison["normalized_frechet_distance"]) > 0.07
-                    or float(comparison["normalized_chamfer_distance"]) > 0.035
-                    or float(comparison["turn_sequence_agreement"]) < 0.75
-                    or float(comparison["local_direction_agreement"]) < 0.80
-                    or not 0.65 <= float(comparison["spatial_span_ratio"]) <= 1.55
-                    or (
-                        not bool(summary.get("verified_loop_closure", False))
-                        and not 0.65
-                        <= float(comparison["endpoint_progress_ratio"])
-                        <= 1.55
-                    )
-                )
-                if ambiguous:
-                    reasons.append("robust_geometry_ambiguous")
-
-    selected = "raw" if reasons else "robust_candidate"
-    base = raw if reasons else np.asarray(robust_c2w, dtype=np.float64)
-    return base, selected, {
-        "selected": selected,
-        "rejection_reasons": reasons,
-        "robust_internal_accepted": bool(summary.get("accepted", False)),
-        "geometry": geometry,
-    }
 
 
 def _project_rotation(matrix: np.ndarray) -> np.ndarray:
@@ -436,16 +355,6 @@ def build_scale_aware_candidate(
         rejection_reasons.append("insufficient_height_consistency_improvement")
     if not np.isfinite(candidate).all():
         rejection_reasons.append("non_finite_candidate")
-    geometry_gate = trajectory_acceptance(
-        c2w[:, :3, 3],
-        candidate[:, :3, 3],
-    )
-    if not geometry_gate["accepted"]:
-        rejection_reasons.extend(
-            f"geometry_{reason}"
-            for reason in geometry_gate["rejection_reasons"]
-            if f"geometry_{reason}" not in rejection_reasons
-        )
 
     diagnostics = {
         "schema_version": SCALE_SCHEMA_VERSION,
@@ -464,7 +373,6 @@ def build_scale_aware_candidate(
         "scale_max": float(scale.max()),
         "scale_range": correction_range,
         "path_length_ratio": path_ratio,
-        "geometry_gate": geometry_gate,
         "runtime_seconds": float(time.perf_counter() - started),
     }
     return {"c2w": candidate.astype(np.float32), "scale": scale.astype(np.float32), "diagnostics": diagnostics}
