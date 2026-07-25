@@ -1,3 +1,0 @@
-# Installed in the isolated `r3` conda environment on the GPU worker.
-# Required by continuous long-video inference with paged KV cache.
-flashinfer-python==0.6.15.post1
