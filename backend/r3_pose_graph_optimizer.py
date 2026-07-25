@@ -33,9 +33,15 @@ from scipy.sparse import csgraph
 from scipy.sparse.linalg import lsmr
 
 try:
+    from trajectory_geometry import compare_trajectories, trajectory_metrics
+except ImportError:  # pragma: no cover
+    from backend.trajectory_geometry import compare_trajectories, trajectory_metrics
+
+try:
     from r3_pose_graph import (
         R3_ABSOLUTE_POSE_SPACE,
         R3_CONFIDENCE_SEMANTICS,
+        R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION,
         R3_POSE_ENCODING,
         R3_POSE_GRAPH_SCHEMA_VERSION,
         R3_RELATIVE_TRANSFORM_CONVENTION,
@@ -44,6 +50,7 @@ except ImportError:  # pragma: no cover - supports package-style startup
     from backend.r3_pose_graph import (
         R3_ABSOLUTE_POSE_SPACE,
         R3_CONFIDENCE_SEMANTICS,
+        R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION,
         R3_POSE_ENCODING,
         R3_POSE_GRAPH_SCHEMA_VERSION,
         R3_RELATIVE_TRANSFORM_CONVENTION,
@@ -72,6 +79,43 @@ class PoseGraphOptimizerConfig:
     maximum_rotation_p90_increase_degrees: float = 2.0
     maximum_translation_p90_increase: float = 0.15
     maximum_inlier_fraction_drop: float = 0.05
+    verified_loop_closure: bool = False
+    minimum_endpoint_displacement_ratio: float = 0.55
+    minimum_spatial_span_ratio: float = 0.55
+    maximum_tortuosity_factor: float = 2.0
+    maximum_tortuosity_increase: float = 2.0
+    maximum_near_start_fraction_increase: float = 0.25
+    maximum_segment_length_log_rmse: float = 0.80
+    minimum_straight_run_preservation: float = 0.75
+    minimum_turn_sequence_agreement: float = 0.70
+    maximum_sharp_reverse_ratio_increase: float = 0.10
+    maximum_backbone_gap: int = 2
+    maximum_bridge_gap: int = 24
+    minimum_backbone_coverage: float = 0.95
+    minimum_bridge_boundary_coverage: float = 1.0
+    fallback_boundaries: tuple[int, ...] = ()
+    local_constraint_weight_factor: float = 0.7
+    verified_loop_weight_factor: float = 0.4
+
+
+def _safe_edge_types(
+    schema_version: int,
+    frame_i: np.ndarray,
+    frame_j: np.ndarray,
+    edge_type: np.ndarray,
+) -> np.ndarray:
+    types = np.asarray(edge_type, dtype=np.uint8).reshape(-1)
+    if schema_version != R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION:
+        return types
+    gap = np.abs(np.asarray(frame_j) - np.asarray(frame_i))
+    converted = np.full(len(types), 255, dtype=np.uint8)
+    normal = types == 0
+    converted[normal & (gap <= 2)] = 0
+    converted[normal & (gap > 2) & (gap <= 20)] = 1
+    converted[normal & (gap > 20)] = 3
+    converted[types == 1] = 2
+    converted[types == 2] = 6
+    return converted
 
 
 def _project_rotations(matrices: np.ndarray) -> np.ndarray:
@@ -173,6 +217,7 @@ def _canonicalize_and_deduplicate_edges(
         & (conf_t > 0)
         & np.isfinite(conf_r)
         & (conf_r > 0)
+        & np.isin(types, np.asarray([0, 1, 2, 4, 6], dtype=np.uint8))
     )
     i, j, rel = i[valid], j[valid], rel[valid]
     aggregate, conf_t, conf_r, types = (
@@ -217,6 +262,7 @@ def _canonicalize_and_deduplicate_edges(
         "edge_type": types[keep],
         "input_edge_count": np.asarray([count], dtype=np.int64),
         "valid_edge_count": np.asarray([int(valid.sum())], dtype=np.int64),
+        "excluded_edge_count": np.asarray([int((~valid).sum())], dtype=np.int64),
     }
 
 
@@ -225,19 +271,79 @@ def _temporal_backbone_mask(
     frame_j: np.ndarray,
     confidence: np.ndarray,
     point_count: int,
-) -> np.ndarray:
-    gap = frame_j - frame_i
-    order = np.lexsort((-confidence, gap, frame_j))
-    ordered_targets = frame_j[order]
-    first = np.ones(len(order), dtype=bool)
-    if len(order) > 1:
-        first[1:] = ordered_targets[1:] != ordered_targets[:-1]
-    mask = np.zeros(len(frame_i), dtype=bool)
-    mask[order[first]] = True
-    # A malformed/disconnected graph may not have an incoming edge for every
-    # node.  The coverage gate below will keep such a candidate non-authoritative.
-    _ = point_count
-    return mask
+    edge_type: np.ndarray,
+    config: PoseGraphOptimizerConfig,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    i = np.asarray(frame_i, dtype=np.int64)
+    j = np.asarray(frame_j, dtype=np.int64)
+    gap = j - i
+    types = np.asarray(edge_type, dtype=np.uint8)
+    boundaries = sorted({
+        int(value) for value in config.fallback_boundaries
+        if 0 < int(value) < point_count
+    })
+    maximum_gap = max(1, int(config.maximum_backbone_gap))
+    maximum_bridge_gap = max(maximum_gap, int(config.maximum_bridge_gap))
+    reachable = np.zeros(point_count, dtype=bool)
+    if point_count:
+        reachable[0] = True
+    mask = np.zeros(len(i), dtype=bool)
+    missing: list[int] = []
+    covered_boundaries: set[int] = set()
+
+    def crossings(left: int, right: int) -> list[int]:
+        # A fallback boundary records the final frame of the preceding
+        # segment, so the protected transition is boundary -> boundary + 1.
+        return [boundary for boundary in boundaries if left <= boundary < right]
+
+    for target in range(1, point_count):
+        candidates: list[tuple[int, int, float, int]] = []
+        for edge_index in np.flatnonzero(j == target):
+            left = int(i[edge_index])
+            edge_gap = int(gap[edge_index])
+            kind = int(types[edge_index])
+            if (
+                edge_gap < 1
+                or edge_gap > (maximum_bridge_gap if kind == 2 else maximum_gap)
+                or left < 0 or left >= point_count or not reachable[left]
+            ):
+                continue
+            crossed = crossings(left, target)
+            if crossed and kind != 2:
+                continue
+            if not crossed and kind not in {0, 1, 2, 6}:
+                continue
+            # A bridge is a fallback only: an ordinary local observation with
+            # the same temporal reach always wins.
+            candidates.append((
+                1 if kind == 2 else 0,
+                edge_gap,
+                -float(confidence[edge_index]),
+                int(edge_index),
+            ))
+        if not candidates:
+            missing.append(target)
+            continue
+        _, _, _, selected = min(candidates)
+        mask[selected] = True
+        reachable[target] = True
+        covered_boundaries.update(crossings(int(i[selected]), target))
+    selected_gaps = gap[mask]
+    return mask, {
+        "backbone_coverage": float(np.mean(reachable)) if point_count else 0.0,
+        "reachable_frames": int(reachable.sum()),
+        "maximum_backbone_gap": int(selected_gaps.max()) if len(selected_gaps) else 0,
+        "configured_maximum_gap": maximum_gap,
+        "configured_maximum_bridge_gap": maximum_bridge_gap,
+        "missing_temporal_links": missing,
+        "missing_temporal_link_count": len(missing),
+        "fallback_boundaries": boundaries,
+        "bridge_boundaries_covered": sorted(covered_boundaries),
+        "bridge_boundary_coverage": (
+            len(covered_boundaries) / len(boundaries) if boundaries else 1.0
+        ),
+        "long_range_backbone_edges": int((selected_gaps > maximum_bridge_gap).sum()),
+    }
 
 
 def _build_block_matrix(
@@ -569,13 +675,105 @@ def _residual_metrics(
     }
 
 
-def _path_metrics(c2w: np.ndarray) -> dict[str, float]:
+def _path_metrics(
+    c2w: np.ndarray,
+    *,
+    near_start_radius: float | None = None,
+) -> dict[str, float]:
     centers = c2w[:, :3, 3]
     steps = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+    shared = trajectory_metrics(centers)
+    bbox_diagonal = float(np.linalg.norm(np.ptp(centers, axis=0)))
+    if near_start_radius is None:
+        near_start_radius = max(
+            bbox_diagonal * 0.10,
+            (float(np.median(steps)) if len(steps) else 0.0) * 5.0,
+        )
+    distance_from_start = np.linalg.norm(centers - centers[0], axis=1)
     return {
         "path_length": float(steps.sum()),
+        "endpoint_displacement": float(shared.get("endpoint_displacement", 0.0)),
+        "net_progress_ratio": float(shared.get("net_progress_ratio", 0.0)),
+        "bbox_diagonal": bbox_diagonal,
+        "span_length_ratio": float(shared.get("span_ratio", 0.0)),
+        "tortuosity": float(shared.get("tortuosity", 0.0)),
+        "near_start_radius": float(near_start_radius),
+        "near_start_fraction": float(np.mean(distance_from_start <= near_start_radius)),
+        "sharp_reverse_ratio": float(shared.get("sharp_reverse_ratio", 0.0)),
         "step_median": float(np.median(steps)) if steps.size else 0.0,
         "step_p99": float(np.percentile(steps, 99)) if steps.size else 0.0,
+    }
+
+
+def _geometry_rejection_reasons(
+    initial_c2w: np.ndarray,
+    candidate_c2w: np.ndarray,
+    initial_path: dict[str, float],
+    candidate_path: dict[str, float],
+    config: PoseGraphOptimizerConfig,
+) -> tuple[list[str], dict[str, Any]]:
+    comparison = compare_trajectories(
+        initial_c2w[:, :3, 3],
+        candidate_c2w[:, :3, 3],
+    )
+    reasons: list[str] = []
+    endpoint_ratio = (
+        candidate_path["endpoint_displacement"]
+        / max(initial_path["endpoint_displacement"], 1e-12)
+    )
+    if (
+        not config.verified_loop_closure
+        and initial_path["net_progress_ratio"] >= 0.10
+        and endpoint_ratio < config.minimum_endpoint_displacement_ratio
+    ):
+        reasons.append("endpoint_displacement_collapsed")
+    if (
+        candidate_path["span_length_ratio"]
+        < initial_path["span_length_ratio"] * config.minimum_spatial_span_ratio
+    ):
+        reasons.append("spatial_span_collapsed")
+    tortuosity_limit = max(
+        initial_path["tortuosity"] * config.maximum_tortuosity_factor,
+        initial_path["tortuosity"] + config.maximum_tortuosity_increase,
+    )
+    if candidate_path["tortuosity"] > tortuosity_limit:
+        reasons.append("tortuosity_regression")
+    near_start_limit = min(
+        0.95,
+        initial_path["near_start_fraction"]
+        + config.maximum_near_start_fraction_increase,
+    )
+    if (
+        not config.verified_loop_closure
+        and candidate_path["near_start_fraction"] > near_start_limit
+    ):
+        reasons.append("near_start_concentration_regression")
+    if not comparison.get("available"):
+        reasons.append("trajectory_geometry_comparison_unavailable")
+    else:
+        if comparison["segment_length_log_rmse"] > config.maximum_segment_length_log_rmse:
+            reasons.append("local_step_distortion")
+        if comparison["straight_run_preservation"] < config.minimum_straight_run_preservation:
+            reasons.append("straight_run_destroyed")
+        if (
+            comparison["turn_sequence_agreement"] < config.minimum_turn_sequence_agreement
+            and (
+                endpoint_ratio < 0.75
+                or candidate_path["span_length_ratio"]
+                < initial_path["span_length_ratio"] * 0.75
+                or candidate_path["tortuosity"] > initial_path["tortuosity"] * 1.5
+            )
+        ):
+            reasons.append("turn_sequence_destroyed")
+    sharp_limit = initial_path["sharp_reverse_ratio"] + config.maximum_sharp_reverse_ratio_increase
+    if candidate_path["sharp_reverse_ratio"] > sharp_limit:
+        reasons.append("sharp_reverse_ratio_regression")
+    return reasons, {
+        "verified_loop_closure": config.verified_loop_closure,
+        "endpoint_displacement_ratio": float(endpoint_ratio),
+        "tortuosity_limit": float(tortuosity_limit),
+        "near_start_fraction_limit": float(near_start_limit),
+        "comparison": comparison,
     }
 
 
@@ -642,13 +840,17 @@ def optimize_pose_graph_arrays(
     # confidence to trigger fallback.  Their network confidence remains useful,
     # but is not calibrated as an information matrix and must not be promoted
     # above ordinary observations merely because it crosses a segment boundary.
-    type_factor[edges["edge_type"] == 1] = config.bridge_weight_factor
-    type_factor[edges["edge_type"] == 2] = config.anchor_weight_factor
+    type_factor[edges["edge_type"] == 1] = config.local_constraint_weight_factor
+    type_factor[edges["edge_type"] == 2] = config.bridge_weight_factor
+    type_factor[edges["edge_type"] == 4] = config.verified_loop_weight_factor
+    type_factor[edges["edge_type"] == 6] = config.anchor_weight_factor
     type_factor[edges["edge_type"] == 255] = config.unknown_edge_weight_factor
     confidence_weight_t *= type_factor
     confidence_weight_r *= type_factor
     joint_weight = np.sqrt(confidence_weight_t * confidence_weight_r)
-    backbone = _temporal_backbone_mask(i, j, joint_weight, point_count)
+    backbone, backbone_diagnostics = _temporal_backbone_mask(
+        i, j, joint_weight, point_count, edges["edge_type"], config
+    )
     denominator, step_scale = _translation_denominator(i, j, edges["translation"])
 
     optimized_rotations, rotation_iterations = _solve_rotations(
@@ -694,7 +896,10 @@ def optimize_pose_graph_arrays(
         joint_weight,
     )
     initial_path = _path_metrics(c2w)
-    candidate_path = _path_metrics(candidate_c2w)
+    candidate_path = _path_metrics(
+        candidate_c2w,
+        near_start_radius=initial_path["near_start_radius"],
+    )
     component = _component_metrics(point_count, i, j)
     path_ratio = candidate_path["path_length"] / max(initial_path["path_length"], 1e-12)
     step_p99_ratio = candidate_path["step_p99"] / max(initial_path["step_p99"], 1e-12)
@@ -707,6 +912,13 @@ def optimize_pose_graph_arrays(
     rejection_reasons: list[str] = []
     if component["largest_component_coverage"] < config.minimum_component_coverage:
         rejection_reasons.append("insufficient_graph_coverage")
+    if backbone_diagnostics["backbone_coverage"] < config.minimum_backbone_coverage:
+        rejection_reasons.append("insufficient_backbone_coverage")
+    if (
+        backbone_diagnostics["bridge_boundary_coverage"]
+        < config.minimum_bridge_boundary_coverage
+    ):
+        rejection_reasons.append("insufficient_bridge_boundary_coverage")
     if improvement < config.minimum_objective_improvement:
         rejection_reasons.append("insufficient_objective_improvement")
     if not config.minimum_path_length_ratio <= path_ratio <= config.maximum_path_length_ratio:
@@ -736,6 +948,10 @@ def optimize_pose_graph_arrays(
         rejection_reasons.append("non_finite_candidate")
     if np.any(np.linalg.det(candidate_c2w[:, :3, :3]) < 0.999):
         rejection_reasons.append("improper_candidate_rotation")
+    geometry_rejections, geometry_comparison = _geometry_rejection_reasons(
+        c2w, candidate_c2w, initial_path, candidate_path, config
+    )
+    rejection_reasons.extend(geometry_rejections)
 
     diagnostics = {
         "schema_version": 1,
@@ -746,8 +962,10 @@ def optimize_pose_graph_arrays(
         "point_count": point_count,
         "input_edge_count": int(edges["input_edge_count"][0]),
         "valid_edge_count": int(edges["valid_edge_count"][0]),
+        "excluded_edge_count": int(edges["excluded_edge_count"][0]),
         "deduplicated_edge_count": len(i),
         "backbone_edge_count": int(backbone.sum()),
+        "backbone": backbone_diagnostics,
         "step_scale": step_scale,
         "graph": component,
         "before": before,
@@ -757,6 +975,7 @@ def optimize_pose_graph_arrays(
         "candidate_path": candidate_path,
         "path_length_ratio": float(path_ratio),
         "step_p99_ratio": float(step_p99_ratio),
+        "geometry_comparison": geometry_comparison,
         "displacement_median": float(np.median(displacement)),
         "displacement_p95": float(np.percentile(displacement, 95)),
         "displacement_max": float(np.max(displacement)),
@@ -793,7 +1012,6 @@ def optimize_pose_graph_file(
             "confidence_semantics": scalar("confidence_semantics"),
         }
         expected = {
-            "schema_version": R3_POSE_GRAPH_SCHEMA_VERSION,
             "pose_encoding": R3_POSE_ENCODING,
             "transform_convention": R3_RELATIVE_TRANSFORM_CONVENTION,
             "frame_index_space": "exported_camera_index",
@@ -805,8 +1023,25 @@ def optimize_pose_graph_file(
             for key, expected_value in expected.items()
             if metadata[key] != expected_value
         }
+        if metadata["schema_version"] not in {
+            R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION,
+            R3_POSE_GRAPH_SCHEMA_VERSION,
+        }:
+            mismatches["schema_version"] = {
+                "actual": metadata["schema_version"],
+                "expected": [
+                    R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION,
+                    R3_POSE_GRAPH_SCHEMA_VERSION,
+                ],
+            }
         if mismatches:
             raise ValueError(f"unsupported pose graph metadata: {mismatches}")
+        safe_types = _safe_edge_types(
+            int(metadata["schema_version"]),
+            payload["frame_i"],
+            payload["frame_j"],
+            payload["edge_type"],
+        )
         result = optimize_pose_graph_arrays(
             c2w_poses,
             frame_i=payload["frame_i"],
@@ -815,10 +1050,15 @@ def optimize_pose_graph_file(
             confidence=payload["confidence"],
             confidence_t=payload["confidence_t"],
             confidence_r=payload["confidence_r"],
-            edge_type=payload["edge_type"],
+            edge_type=safe_types,
             config=config,
         )
     result["diagnostics"]["source_metadata"] = metadata
+    result["diagnostics"]["edge_classification_mode"] = (
+        "legacy_v1_safe_classification"
+        if metadata["schema_version"] == R3_POSE_GRAPH_LEGACY_SCHEMA_VERSION
+        else "native_v2"
+    )
     result["diagnostics"]["source_graph"] = str(source)
     result["diagnostics"]["source_graph_mtime_ns"] = source.stat().st_mtime_ns
     return result
@@ -919,6 +1159,10 @@ def run_pose_graph_shadow(
     graph_path = destination / "pose_graph_edges.npz"
     if not graph_path.exists():
         return {"available": False, "accepted": False, "error": "pose_graph_missing"}
+    if config is None:
+        # Processing-chunk boundaries are not graph discontinuities.  Schema-v2
+        # edge classes already identify the verified fallback bridges.
+        config = PoseGraphOptimizerConfig()
     try:
         result = optimize_pose_graph_file(c2w_poses, graph_path, config=config)
         return {"available": True, **save_pose_graph_candidate(destination, result)}
