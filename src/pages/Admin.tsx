@@ -34,6 +34,7 @@ import {
     EyeOff,
     Trash2,
     Download,
+    Copy,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
@@ -235,6 +236,20 @@ const Admin = () => {
     /** Раздельные цепочки точек (одна задача = один сегмент; объединение по сотруднику = несколько). */
     const [manualSegments, setManualSegments] = useState<Array<Array<{ x: number; y: number }>>>([]);
     const manualPointsFlat = useMemo(() => manualSegments.flat(), [manualSegments]);
+    const manualCoordinateRows = useMemo(
+        () =>
+            manualSegments.flatMap((segment, segmentIndex) =>
+                segment.map((point, pointIndex) => ({
+                    segment: segmentIndex + 1,
+                    index: pointIndex + 1,
+                    x: point.x,
+                    y: point.y,
+                    xPercent: (point.x / PLAN_VB_W) * 100,
+                    yPercent: (point.y / PLAN_VB_H) * 100,
+                }))
+            ),
+        [manualSegments]
+    );
     const adminTrajectoryPathD = useMemo(() => planPathDFromSegments(manualSegments), [manualSegments]);
     const adminFirstPlanPt = useMemo(() => firstPlanPoint(manualSegments), [manualSegments]);
     const adminLastPlanPt = useMemo(() => lastPlanPoint(manualSegments), [manualSegments]);
@@ -494,6 +509,24 @@ const Admin = () => {
 
     const handleClearPoints = () => {
         setManualSegments([]);
+    };
+
+    const handleCopyManualCoordinates = async () => {
+        if (manualCoordinateRows.length === 0) return;
+        const payload = manualCoordinateRows.map(({ segment, index, x, y, xPercent, yPercent }) => ({
+            segment,
+            point: index,
+            x,
+            y,
+            x_percent: Number(xPercent.toFixed(3)),
+            y_percent: Number(yPercent.toFixed(3)),
+        }));
+        try {
+            await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+            setTrajectoryNotice(`Скопировано координат: ${payload.length}`);
+        } catch {
+            setTrajectoryNotice("Не удалось скопировать координаты");
+        }
     };
 
     /** Только GET ручной траектории; не затрагивает загрузку/конвертацию видео на сервере. */
@@ -1333,6 +1366,64 @@ const Admin = () => {
                                                                         ? `Сетка ${PLAN_VB_W}×${PLAN_VB_H}. Масштаб: +/− или колесо. Сдвиг: средняя/правая кнопка или Shift+ЛКМ.`
                                                                         : "Масштаб: +/− или колесо. Сдвиг плана: средняя/правая кнопка мыши или Shift+перетаскивание левой."}
                                                                 </p>
+                                                            </div>
+                                                            <div className="overflow-hidden rounded-xl border border-slate-800 bg-slate-950/80">
+                                                                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-3 py-2.5">
+                                                                    <div>
+                                                                        <p className="text-sm font-semibold text-slate-200">
+                                                                            Координаты нарисованного пути
+                                                                        </p>
+                                                                        <p className="text-[11px] text-slate-500">
+                                                                            Сетка {PLAN_VB_W}×{PLAN_VB_H}; проценты считаются от размеров плана
+                                                                        </p>
+                                                                    </div>
+                                                                    <Button
+                                                                        type="button"
+                                                                        variant="outline"
+                                                                        size="sm"
+                                                                        disabled={manualCoordinateRows.length === 0}
+                                                                        onClick={handleCopyManualCoordinates}
+                                                                        className="h-8 gap-2 border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800"
+                                                                    >
+                                                                        <Copy className="h-3.5 w-3.5" />
+                                                                        Копировать
+                                                                    </Button>
+                                                                </div>
+                                                                {manualCoordinateRows.length > 0 ? (
+                                                                    <div className="max-h-52 overflow-auto">
+                                                                        <table className="w-full min-w-[34rem] text-xs">
+                                                                            <thead className="sticky top-0 z-[1] bg-slate-900/95 text-slate-400 backdrop-blur">
+                                                                                <tr className="border-b border-slate-800">
+                                                                                    <th className="px-3 py-2 text-left font-medium">Участок</th>
+                                                                                    <th className="px-3 py-2 text-left font-medium">Точка</th>
+                                                                                    <th className="px-3 py-2 text-right font-medium">X</th>
+                                                                                    <th className="px-3 py-2 text-right font-medium">Y</th>
+                                                                                    <th className="px-3 py-2 text-right font-medium">X, %</th>
+                                                                                    <th className="px-3 py-2 text-right font-medium">Y, %</th>
+                                                                                </tr>
+                                                                            </thead>
+                                                                            <tbody>
+                                                                                {manualCoordinateRows.map((row) => (
+                                                                                    <tr
+                                                                                        key={`${row.segment}-${row.index}`}
+                                                                                        className="border-b border-slate-800/70 text-slate-300 last:border-0 hover:bg-slate-800/40"
+                                                                                    >
+                                                                                        <td className="px-3 py-2 tabular-nums">{row.segment}</td>
+                                                                                        <td className="px-3 py-2 tabular-nums">{row.index}</td>
+                                                                                        <td className="px-3 py-2 text-right font-mono tabular-nums">{row.x.toFixed(2)}</td>
+                                                                                        <td className="px-3 py-2 text-right font-mono tabular-nums">{row.y.toFixed(2)}</td>
+                                                                                        <td className="px-3 py-2 text-right font-mono tabular-nums">{row.xPercent.toFixed(2)}</td>
+                                                                                        <td className="px-3 py-2 text-right font-mono tabular-nums">{row.yPercent.toFixed(2)}</td>
+                                                                                    </tr>
+                                                                                ))}
+                                                                            </tbody>
+                                                                        </table>
+                                                                    </div>
+                                                                ) : (
+                                                                    <p className="px-3 py-5 text-center text-xs text-slate-500">
+                                                                        Поставьте точки на чертеже — их координаты появятся здесь.
+                                                                    </p>
+                                                                )}
                                                             </div>
                                                         </div>
                                                     </div>
