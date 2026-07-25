@@ -97,6 +97,38 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertAlmostEqual(points[0, 1], 60.0, delta=1.0)
         self.assertTrue(np.any(np.abs(points[:, 1] - 60.0) > 15.0))
 
+    def test_local_obstacle_repair_stays_below_one_point_zero_five_meters(self) -> None:
+        mask = np.zeros((120, 180), dtype=bool)
+        mask[57:64, 88:94] = True
+        engine = FloorplanConstraintEngine.from_mask(
+            mask,
+            meters_per_pixel=0.1,
+            person_radius_meters=0.0,
+            grid_cell_pixels=1,
+        )
+        trajectory = [
+            [float(x), 0.0, 0.0]
+            for x in range(0, 81, 5)
+        ]
+        result = engine.align(
+            trajectory,
+            {"x": 10, "y": 50},
+            {"x": 30, "y": 50},
+            scale_candidates=[2.0],
+            yaw_offsets_degrees=[0.0],
+        )
+
+        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertGreater(result["diagnostics"]["rerouted_segments"], 0)
+        self.assertLessEqual(
+            result["diagnostics"]["correction_p95_meters"],
+            1.05,
+        )
+        self.assertEqual(
+            result["diagnostics"]["corrected_collision_ratio"],
+            0.0,
+        )
+
     def test_distant_parallel_branch_is_not_a_valid_r3_repair(self) -> None:
         support = np.zeros((100, 180), dtype=bool)
         support[28:33, 10:170] = True
@@ -770,6 +802,167 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(independent_result["fusion_supported"])
         self.assertFalse(independent_result["accepted"])
 
+    def test_ambiguous_r3_sources_return_raw_without_map_route(self) -> None:
+        class StubConfig:
+            meters_per_pixel = 0.1
+            width = 100
+            height = 100
+            person_radius_meters = 0.0
+
+        class StubEngine:
+            config = StubConfig()
+
+            def align(self, trajectory, *args, **kwargs):
+                return {
+                    "accepted": True,
+                    "trajectory": [[10.0, 50.0], [20.0, 50.0]],
+                    "diagnostics": {
+                        "accepted": True,
+                        "reason": None,
+                        "constrained_score": 1.0,
+                        "correction_p95_meters": 0.2,
+                        "corrected_collision_ratio": 0.0,
+                        "length_ratio": 1.0,
+                        "turn_topology": {"sign_mismatch_ratio": 0.0},
+                        "estimated_length_meters": 1.0,
+                        "plan_width": 100,
+                        "plan_height": 100,
+                        "meters_per_pixel": 0.1,
+                        "person_radius_meters": 0.0,
+                        "confidence": 0.8,
+                    },
+                }
+
+        raw = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]
+        robust = [[0.0, 0.0, 0.0], [11.0, 0.0, 0.0]]
+        scale = [[0.0, 0.0, 0.0], [12.0, 0.0, 0.0]]
+        source = {
+            "method": "r3_reconstruction_scale_aware",
+            "plan_trajectory": scale,
+            "trajectory": scale,
+            "turn_points": [],
+            "processing_stats": {},
+            "r3_source_trajectories": {
+                "raw": {
+                    "plan_trajectory": raw,
+                    "eligible_before_map": True,
+                    "geometry_quality": {"eligible": True},
+                },
+                "robust_candidate": {
+                    "plan_trajectory": robust,
+                    "eligible_before_map": True,
+                    "geometry_quality": {"eligible": True},
+                },
+                "scale_aware_candidate": {
+                    "plan_trajectory": scale,
+                    "eligible_before_map": True,
+                    "geometry_quality": {"eligible": True},
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine",
+            return_value=StubEngine(),
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+
+        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
+        self.assertNotIn("map_trajectory", updated)
+        self.assertEqual(updated["plan_trajectory"], raw)
+        self.assertEqual(
+            updated["floorplan_constraint"]["reason"],
+            "ambiguous_r3_source_selection",
+        )
+        selection = updated["floorplan_constraint"][
+            "observation_source_selection"
+        ]
+        self.assertEqual(selection["reason"], "ambiguous_r3_source_selection")
+        self.assertIsNone(selection["selected"])
+
+    def test_better_corridor_fit_cannot_override_worse_source_geometry(self) -> None:
+        class StubConfig:
+            meters_per_pixel = 0.1
+            width = 100
+            height = 100
+            person_radius_meters = 0.0
+
+        class StubEngine:
+            config = StubConfig()
+
+            def align(self, trajectory, *args, **kwargs):
+                endpoint = float(np.asarray(trajectory, dtype=float)[-1, 0])
+                score = 1.0 if endpoint == 10.0 else 0.8
+                return {
+                    "accepted": True,
+                    "trajectory": [[10.0, 50.0], [20.0, 50.0]],
+                    "diagnostics": {
+                        "accepted": True,
+                        "reason": None,
+                        "constrained_score": score,
+                        "correction_p95_meters": 0.2,
+                        "corrected_collision_ratio": 0.0,
+                        "length_ratio": 1.0,
+                        "turn_topology": {"sign_mismatch_ratio": 0.0},
+                        "estimated_length_meters": 1.0,
+                        "plan_width": 100,
+                        "plan_height": 100,
+                        "meters_per_pixel": 0.1,
+                        "person_radius_meters": 0.0,
+                        "confidence": 0.8,
+                    },
+                }
+
+        raw = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]
+        robust = [[0.0, 0.0, 0.0], [11.0, 0.0, 0.0]]
+        source = {
+            "method": "r3_reconstruction",
+            "plan_trajectory": raw,
+            "trajectory": raw,
+            "turn_points": [],
+            "processing_stats": {},
+            "r3_source_trajectories": {
+                "raw": {
+                    "plan_trajectory": raw,
+                    "eligible_before_map": True,
+                    "geometry_quality": {"eligible": True},
+                },
+                "robust_candidate": {
+                    "plan_trajectory": robust,
+                    "eligible_before_map": True,
+                    "geometry_quality": {
+                        "eligible": True,
+                        "geometry_vs_previous": {
+                            "comparison": {
+                                "normalized_frechet_distance": 0.10,
+                                "normalized_chamfer_distance": 0.10,
+                                "local_direction_agreement": 0.8,
+                                "segment_length_log_rmse": 0.4,
+                            }
+                        },
+                    },
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine",
+            return_value=StubEngine(),
+        ):
+            updated = apply_floorplan_constraints(source, {
+                "floorplan_id": "test",
+                "reference_point": {"x": 10, "y": 50},
+                "direction_point": {"x": 30, "y": 50},
+            })
+
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
+        selection = updated["floorplan_constraint"][
+            "observation_source_selection"
+        ]
+        self.assertEqual(selection["selected_r3_source"], "raw")
+
     def test_fragmented_r3_refuses_low_quality_independent(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
             np.zeros((120, 180), dtype=bool), meters_per_pixel=0.1
@@ -1076,6 +1269,77 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(
             result["diagnostics"]["reason"],
             "insufficient_independent_net_progress",
+        )
+
+    def test_destroyed_authoritative_progress_is_rejected_before_map_search(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((240, 240), dtype=bool), meters_per_pixel=0.1
+        )
+        observation = np.asarray([
+            [0.0, 0.0],
+            [20.0, 0.0],
+            [1.0, 0.0],
+            [20.0, 0.0],
+            [2.0, 0.0],
+            [20.0, 0.0],
+            [3.0, 0.0],
+        ])
+        result = engine.align(
+            observation.tolist(),
+            {"x": 10.0, "y": 50.0},
+            {"x": 30.0, "y": 50.0},
+            observation_policy="authoritative",
+            authoritative_reference_progress={
+                "net_progress_ratio": 1.0,
+                "span_length_ratio": 1.0,
+                "tortuosity": 1.0,
+                "near_start_fraction_relative": 0.1,
+            },
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(
+            result["diagnostics"]["reason"],
+            "authoritative_net_progress_regressed",
+        )
+        self.assertFalse(result["diagnostics"]["map_matching_attempted"])
+        self.assertIn(
+            "authoritative_tortuosity_extreme",
+            result["diagnostics"]["rejection_reasons"],
+        )
+
+    def test_verified_loop_is_not_rejected_for_low_endpoint_progress(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((300, 300), dtype=bool), meters_per_pixel=0.1
+        )
+        angles = np.linspace(0.0, 2.0 * np.pi, 41)
+        observation = np.column_stack((
+            20.0 * np.cos(angles),
+            20.0 * np.sin(angles),
+        ))
+        result = engine.align(
+            observation.tolist(),
+            {"x": 50.0, "y": 50.0},
+            {"x": 65.0, "y": 50.0},
+            observation_policy="authoritative",
+            loop_closure_verified=True,
+            authoritative_reference_progress={
+                "net_progress_ratio": 1.0,
+                "span_length_ratio": 1.0,
+                "tortuosity": 1.0,
+                "near_start_fraction_relative": 0.1,
+            },
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=(0.0,),
+        )
+
+        self.assertNotEqual(
+            result["diagnostics"].get("reason"),
+            "authoritative_net_progress_regressed",
+        )
+        self.assertNotEqual(
+            result["diagnostics"].get("reason"),
+            "authoritative_tortuosity_extreme",
         )
 
     def test_malformed_points_are_dropped_not_zeroed(self) -> None:

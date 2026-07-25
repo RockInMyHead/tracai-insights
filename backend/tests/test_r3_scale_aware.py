@@ -17,6 +17,7 @@ from r3_scale_aware import (
     estimate_floor_height_observations,
     load_scale_aware_candidate_c2w,
     save_scale_aware_candidate,
+    select_scale_aware_base,
 )
 
 
@@ -54,6 +55,68 @@ def floor_observations(local_scale: np.ndarray, stride: int = 3) -> list[dict]:
 
 
 class R3ScaleAwareTests(unittest.TestCase):
+    def test_scale_base_uses_robust_only_with_good_backbone_and_geometry(self) -> None:
+        raw = np.broadcast_to(np.eye(4), (60, 4, 4)).copy()
+        raw[:, 0, 3] = np.arange(len(raw), dtype=float)
+        robust = raw.copy()
+        robust[:, 0, 3] *= 1.05
+        good_summary = {
+            "accepted": True,
+            "backbone": {
+                "backbone_coverage": 1.0,
+                "bridge_boundary_coverage": 1.0,
+            },
+        }
+
+        base, source, diagnostics = select_scale_aware_base(
+            raw, robust, good_summary
+        )
+
+        self.assertEqual(source, "robust_candidate")
+        self.assertEqual(diagnostics["rejection_reasons"], [])
+        np.testing.assert_allclose(base, robust)
+
+        bad_backbone = {
+            **good_summary,
+            "backbone": {
+                "backbone_coverage": 0.7,
+                "bridge_boundary_coverage": 1.0,
+            },
+        }
+        base, source, diagnostics = select_scale_aware_base(
+            raw, robust, bad_backbone
+        )
+        self.assertEqual(source, "raw")
+        self.assertIn(
+            "robust_backbone_coverage_low",
+            diagnostics["rejection_reasons"],
+        )
+        np.testing.assert_allclose(base, raw)
+
+    def test_scale_base_rejects_spatially_collapsed_robust_geometry(self) -> None:
+        raw = np.broadcast_to(np.eye(4), (60, 4, 4)).copy()
+        raw[:, 0, 3] = np.arange(len(raw), dtype=float)
+        collapsed = raw.copy()
+        collapsed[:, 0, 3] = np.arange(len(raw), dtype=float) % 5
+        collapsed[:, 1, 3] = np.arange(len(raw), dtype=float) // 5 * 0.05
+        summary = {
+            "accepted": True,
+            "backbone": {
+                "backbone_coverage": 1.0,
+                "bridge_boundary_coverage": 1.0,
+            },
+        }
+
+        _, source, diagnostics = select_scale_aware_base(
+            raw, collapsed, summary
+        )
+
+        self.assertEqual(source, "raw")
+        self.assertIn(
+            "robust_spatial_span_collapsed",
+            diagnostics["rejection_reasons"],
+        )
+
     def test_turn_axis_recovers_floor_normal_for_downward_camera(self) -> None:
         poses = np.broadcast_to(np.eye(4), (80, 4, 4)).copy()
         for index in range(len(poses)):
@@ -78,6 +141,7 @@ class R3ScaleAwareTests(unittest.TestCase):
         self.assertAlmostEqual(float(np.median(before[75:110]) / np.median(before[10:45])), 2.0, delta=0.01)
         self.assertAlmostEqual(float(np.median(steps[75:110]) / np.median(steps[10:45])), 1.0, delta=0.08)
         self.assertGreater(result["diagnostics"]["height_consistency_improvement"], 0.8)
+        self.assertTrue(result["diagnostics"]["geometry_gate"]["accepted"])
         np.testing.assert_allclose(candidate[0, :3, 3], poses[0, :3, 3])
 
     def test_sparse_floor_support_is_rejected_without_mutating_input(self) -> None:

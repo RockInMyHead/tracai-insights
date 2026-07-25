@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "source": "operator_confirmed_route",
+  "ranges": {
+    "path_length": [700.0, 760.0],
+    "endpoint_displacement": [550.0, 590.0],
+    "net_progress_ratio": [0.74, 0.82],
+    "span_ratio": [0.74, 0.83],
+    "bbox_width": [550.0, 575.0],
+    "bbox_height": [85.0, 105.0],
+    "tortuosity": [1.20, 1.36],
+    "sharp_reverse_ratio": [0.0, 0.02],
+    "turn_count": [4, 7]
+  },
+  "required": {
+    "start_point": [625, 121],
+    "initial_direction_point": [578, 120],
+    "end_point": [63, 215],
+    "minimum_point_count": 25
+  }
+}

@@ -210,6 +210,10 @@ def _polyline_progress_metrics(
     )
     endpoint_ratio = endpoint_pixels / max(length_pixels, 1e-12)
     span_ratio = bbox_pixels / max(length_pixels, 1e-12)
+    radius = (
+        np.linalg.norm(array[:, :2] - array[0, :2], axis=1)
+        if len(array) else np.asarray([], dtype=np.float64)
+    )
     return {
         "path_length_meters": length_pixels * meters_per_pixel,
         "endpoint_displacement_meters": endpoint_pixels * meters_per_pixel,
@@ -217,6 +221,10 @@ def _polyline_progress_metrics(
         "net_progress_ratio": endpoint_ratio,
         "span_length_ratio": span_ratio,
         "tortuosity": length_pixels / max(endpoint_pixels, 1e-12),
+        "near_start_fraction_relative": (
+            float(np.mean(radius <= max(bbox_pixels * 0.10, 1e-12)))
+            if len(radius) else 1.0
+        ),
     }
 
 
@@ -1937,6 +1945,7 @@ class FloorplanConstraintEngine:
         allow_low_net_progress: bool = False,
         observation_policy: str = "authoritative",
         loop_closure_verified: bool = False,
+        authoritative_reference_progress: Optional[dict[str, Any]] = None,
         allow_independent_corridor_recovery: bool = False,
     ) -> dict[str, Any]:
         observation_policy = str(observation_policy or "authoritative").lower()
@@ -2014,8 +2023,102 @@ class FloorplanConstraintEngine:
         observation_progress = _polyline_progress_metrics(relative)
         base_diagnostics["observation_progress"] = {
             key: round(float(observation_progress[key]), 6)
-            for key in ("net_progress_ratio", "span_length_ratio", "tortuosity")
+            for key in (
+                "net_progress_ratio",
+                "span_length_ratio",
+                "tortuosity",
+                "near_start_fraction_relative",
+            )
         }
+        if observation_policy == "authoritative":
+            reference = (
+                authoritative_reference_progress
+                if isinstance(authoritative_reference_progress, dict)
+                else {}
+            )
+            raw_progress = {
+                "net_progress_ratio": _finite_float(
+                    reference.get("net_progress_ratio"), math.nan
+                ),
+                "span_length_ratio": _finite_float(
+                    reference.get(
+                        "span_length_ratio",
+                        reference.get("span_ratio"),
+                    ),
+                    math.nan,
+                ),
+                "tortuosity": _finite_float(
+                    reference.get("tortuosity"), math.nan
+                ),
+                "near_start_fraction_relative": _finite_float(
+                    reference.get("near_start_fraction_relative"), math.nan
+                ),
+            }
+            base_diagnostics["authoritative_reference_progress"] = {
+                key: round(float(value), 6) if math.isfinite(value) else None
+                for key, value in raw_progress.items()
+            }
+            authoritative_rejections: list[str] = []
+            current_net = float(observation_progress["net_progress_ratio"])
+            current_span = float(observation_progress["span_length_ratio"])
+            current_tortuosity = float(observation_progress["tortuosity"])
+            current_near = float(
+                observation_progress["near_start_fraction_relative"]
+            )
+            if not loop_closure_verified:
+                raw_net = raw_progress["net_progress_ratio"]
+                if (
+                    math.isfinite(raw_net)
+                    and raw_net > 1e-6
+                    and current_net < raw_net * 0.55
+                ):
+                    authoritative_rejections.append(
+                        "authoritative_net_progress_regressed"
+                    )
+                raw_span = raw_progress["span_length_ratio"]
+                if (
+                    math.isfinite(raw_span)
+                    and raw_span > 1e-6
+                    and current_span < raw_span * 0.55
+                ):
+                    authoritative_rejections.append(
+                        "authoritative_spatial_span_regressed"
+                    )
+                if current_span < 0.08:
+                    authoritative_rejections.append(
+                        "authoritative_spatial_span_extremely_small"
+                    )
+                raw_tortuosity = raw_progress["tortuosity"]
+                tortuosity_limit = (
+                    max(raw_tortuosity * 2.0, raw_tortuosity + 3.0, 12.0)
+                    if math.isfinite(raw_tortuosity)
+                    else 12.0
+                )
+                if current_tortuosity > tortuosity_limit:
+                    authoritative_rejections.append(
+                        "authoritative_tortuosity_extreme"
+                    )
+            raw_near = raw_progress["near_start_fraction_relative"]
+            near_limit = (
+                max(0.65, raw_near * 3.0, raw_near + 0.25)
+                if math.isfinite(raw_near)
+                else 0.80
+            )
+            if current_near > near_limit:
+                authoritative_rejections.append(
+                    "authoritative_near_start_concentration_high"
+                )
+            if authoritative_rejections:
+                return {
+                    "accepted": False,
+                    "trajectory": [],
+                    "diagnostics": {
+                        **base_diagnostics,
+                        "reason": authoritative_rejections[0],
+                        "rejection_reasons": authoritative_rejections,
+                        "map_matching_attempted": False,
+                    },
+                }
         if (
             observation_policy == "independent"
             and not allow_low_net_progress
@@ -3179,6 +3282,52 @@ def apply_floorplan_constraints(
         or result.get("source_timestamps_seconds")
     )
     fragmented_r3 = method.startswith("r3") and _r3_is_severely_fragmented(result)
+    source_selection_diagnostics = result.get("trajectory_source_selection")
+    source_selection_diagnostics = (
+        source_selection_diagnostics
+        if isinstance(source_selection_diagnostics, dict)
+        else {}
+    )
+    floor_projection_comparison = source_selection_diagnostics.get(
+        "floor_projection_comparison"
+    )
+    floor_projection_comparison = (
+        floor_projection_comparison
+        if isinstance(floor_projection_comparison, dict)
+        else {}
+    )
+    projection_sources = floor_projection_comparison.get("sources")
+    projection_sources = (
+        projection_sources if isinstance(projection_sources, dict) else {}
+    )
+    raw_projection = projection_sources.get("raw")
+    raw_projection = raw_projection if isinstance(raw_projection, dict) else {}
+    authoritative_reference_progress = raw_projection.get(
+        "common_projection_metrics"
+    )
+    authoritative_reference_progress = (
+        authoritative_reference_progress
+        if isinstance(authoritative_reference_progress, dict)
+        else None
+    )
+    selected_trajectory_source = str(
+        source_selection_diagnostics.get("selected") or "raw"
+    )
+    source_candidates = source_selection_diagnostics.get("candidates")
+    source_candidates = (
+        source_candidates if isinstance(source_candidates, dict) else {}
+    )
+    selected_source_diagnostics = source_candidates.get(
+        selected_trajectory_source
+    )
+    selected_source_diagnostics = (
+        selected_source_diagnostics
+        if isinstance(selected_source_diagnostics, dict)
+        else {}
+    )
+    primary_loop_closure_verified = bool(
+        selected_source_diagnostics.get("verified_loop_closure", False)
+    )
     candidate_payload = result.get("lingbot_fusion_candidate")
     candidate_payload = candidate_payload if isinstance(candidate_payload, dict) else {}
 
@@ -3192,6 +3341,8 @@ def apply_floorplan_constraints(
         # Fragmentation lowers trust, but never removes a geometrically valid R3
         # route from competition.
         "source_prior": 0.45 if fragmented_r3 else 0.05,
+        "authoritative_reference_progress": authoritative_reference_progress,
+        "loop_closure_verified": primary_loop_closure_verified,
     }]
 
     if method.startswith("r3") and primary_convention == "x_forward_y_left_z_up":
@@ -3213,6 +3364,107 @@ def apply_floorplan_constraints(
             "source_prior": (0.46 if fragmented_r3 else 0.06),
             "polarity_candidate": "unflipped_r3_plan_y",
         })
+
+    skipped_r3_sources: list[dict[str, Any]] = []
+    r3_source_trajectories = result.get("r3_source_trajectories")
+    r3_source_trajectories = (
+        r3_source_trajectories
+        if isinstance(r3_source_trajectories, dict)
+        else {}
+    )
+    if method.startswith("r3") and r3_source_trajectories:
+        observations = []
+        for source_name in ("raw", "robust_candidate", "scale_aware_candidate"):
+            source_payload = r3_source_trajectories.get(source_name)
+            if not isinstance(source_payload, dict):
+                continue
+            points = source_payload.get("plan_trajectory") or []
+            geometry_quality = source_payload.get("geometry_quality")
+            geometry_quality = (
+                geometry_quality if isinstance(geometry_quality, dict) else {}
+            )
+            eligible = bool(
+                source_payload.get(
+                    "eligible_before_map", source_name == "raw"
+                )
+            )
+            if not eligible or len(points) < 2:
+                skipped_r3_sources.append({
+                    "source": "r3",
+                    "r3_source": source_name,
+                    "variant": source_name,
+                    "accepted": False,
+                    "skipped": True,
+                    "reason": "source_geometry_rejected",
+                    "rejection_reasons": geometry_quality.get(
+                        "rejection_reasons", []
+                    ),
+                })
+                continue
+            comparison = (
+                geometry_quality.get("geometry_vs_previous") or {}
+            ).get("comparison") or {}
+            geometry_penalty = 0.0
+            if source_name != "raw" and isinstance(comparison, dict):
+                geometry_penalty = min(2.0, (
+                    3.0 * _finite_float(
+                        comparison.get("normalized_frechet_distance"), 0.0
+                    )
+                    + 3.0 * _finite_float(
+                        comparison.get("normalized_chamfer_distance"), 0.0
+                    )
+                    + max(
+                        0.0,
+                        1.0 - _finite_float(
+                            comparison.get("local_direction_agreement"), 1.0
+                        ),
+                    )
+                    + 0.25 * _finite_float(
+                        comparison.get("segment_length_log_rmse"), 0.0
+                    )
+                ))
+            trajectory_quality = source_payload.get("trajectory_quality")
+            trajectory_quality = (
+                trajectory_quality
+                if isinstance(trajectory_quality, dict)
+                else {}
+            )
+            projection = trajectory_quality.get("projection")
+            projection = projection if isinstance(projection, dict) else {}
+            convention = str(
+                projection.get(
+                    "plan_coordinate_convention",
+                    "x_forward_y_left_z_up",
+                )
+            )
+            common = {
+                "source": "r3",
+                "r3_source": source_name,
+                "points": points,
+                "turns": source_payload.get("turn_points") or [],
+                "timestamps": source_timestamps,
+                "selection_tier": 0,
+                "source_prior": 0.05 + geometry_penalty,
+                "source_geometry_penalty": geometry_penalty,
+                "source_geometry_quality": geometry_quality,
+                "authoritative_reference_progress": authoritative_reference_progress,
+                "loop_closure_verified": bool(
+                    source_payload.get("verified_loop_closure", False)
+                ),
+            }
+            observations.append({
+                **common,
+                "variant": source_name,
+                "coordinate_convention": convention,
+            })
+            if convention == "x_forward_y_left_z_up":
+                observations.append({
+                    **common,
+                    "variant": f"{source_name}_image_y_down",
+                    "coordinate_convention": "x_right_y_down",
+                    "source_prior": 0.06 + geometry_penalty,
+                    "polarity_candidate": "unflipped_r3_plan_y",
+                })
 
     # R3 is the authoritative motion observation.  LingBot can be useful for
     # diagnostics, but must not silently replace the direction/topology of a
@@ -3359,6 +3611,8 @@ def apply_floorplan_constraints(
         "fusion_map_candidate_enabled": fusion_map_candidate_enabled,
         "candidate_results": [],
     }
+    source_selection["selection_policy"] = "comparative_r3_map_validator_v1"
+    source_selection["candidate_results"].extend(skipped_r3_sources)
     selected_observation: Optional[dict[str, Any]] = None
     alignment: dict[str, Any] = {
         "accepted": False,
@@ -3424,6 +3678,13 @@ def apply_floorplan_constraints(
                     loop_closure_verified=bool(
                         observation.get("loop_closure_verified", False)
                     ),
+                    authoritative_reference_progress=observation.get(
+                        "authoritative_reference_progress"
+                    ) or (
+                        authoritative_reference_progress
+                        if observation["source"] != "lingbot_independent"
+                        else None
+                    ),
                     allow_independent_corridor_recovery=bool(
                         observation["source"] == "lingbot_independent"
                         and observation.get("fusion_supported", False)
@@ -3462,7 +3723,10 @@ def apply_floorplan_constraints(
                 )
                 source_prior = float(observation["source_prior"])
                 selection_score = (
-                    constrained_score + source_prior
+                    constrained_score
+                    + source_prior
+                    + 0.15 * correction_p95
+                    + 0.50 * abs(math.log(length_ratio))
                     if candidate_alignment.get("accepted")
                     else float("inf")
                 )
@@ -3477,6 +3741,7 @@ def apply_floorplan_constraints(
                 tier_evaluated.append(evaluated_item)
                 source_selection["candidate_results"].append({
                     "source": observation["source"],
+                    "r3_source": observation.get("r3_source"),
                     "variant": observation["variant"],
                     "selection_tier": tier,
                     "accepted": bool(candidate_alignment.get("accepted")),
@@ -3516,6 +3781,24 @@ def apply_floorplan_constraints(
                         observation.get("loop_closure_verified", False)
                     ),
                     "corrected_progress": diag.get("corrected_progress"),
+                    "source_geometry_penalty": round(
+                        float(observation.get("source_geometry_penalty", 0.0)),
+                        6,
+                    ),
+                    "map_collision_score": diag.get(
+                        "corrected_collision_ratio"
+                    ),
+                    "repair_magnitude_p95_meters": (
+                        round(correction_p95, 3)
+                        if math.isfinite(correction_p95)
+                        else None
+                    ),
+                    "topology_preserved": (
+                        diag.get("turn_topology") or {}
+                    ).get("sign_mismatch_ratio", 0.0) == 0.0,
+                    "metric_plausible": bool(
+                        candidate_alignment.get("accepted")
+                    ),
                 })
             accepted = [
                 item for item in tier_evaluated
@@ -3548,22 +3831,59 @@ def apply_floorplan_constraints(
                 str(item["source"]),
                 str(item["variant"]),
             ))
-            selected_observation = accepted[0]
-            alignment = selected_observation["alignment"]
-            selected_source = str(selected_observation["source"])
-            source_selection.update({
-                "selected": selected_source,
-                "selected_variant": selected_observation["variant"],
-                "selected_tier": selected_tier,
-                "reason": (
-                    "authoritative_candidate_accepted"
-                    if selected_tier == 0
-                    else "independent_fallback_after_authoritative_rejection"
-                ),
-                "selection_score": round(
-                    float(selected_observation["selection_score"]), 6
-                ),
-            })
+            best = accepted[0]
+            distinct_runner_up = next((
+                item for item in accepted[1:]
+                if item.get("r3_source") != best.get("r3_source")
+            ), None)
+            cross_source_margin = (
+                float(distinct_runner_up["selection_score"])
+                - float(best["selection_score"])
+                if distinct_runner_up is not None
+                and best.get("r3_source") is not None
+                else math.inf
+            )
+            if cross_source_margin < 0.10:
+                alignment = {
+                    "accepted": False,
+                    "trajectory": [],
+                    "diagnostics": {
+                        "accepted": False,
+                        "reason": "ambiguous_r3_source_selection",
+                        "map_alignment_accepted": False,
+                        "selection_margin": round(cross_source_margin, 6),
+                    },
+                }
+                source_selection.update({
+                    "selected": None,
+                    "reason": "ambiguous_r3_source_selection",
+                    "selection_margin": round(cross_source_margin, 6),
+                    "best_source": best.get("r3_source"),
+                    "runner_up_source": distinct_runner_up.get("r3_source"),
+                })
+            else:
+                selected_observation = best
+                alignment = selected_observation["alignment"]
+                selected_source = str(selected_observation["source"])
+                source_selection.update({
+                    "selected": selected_source,
+                    "selected_r3_source": selected_observation.get("r3_source"),
+                    "selected_variant": selected_observation["variant"],
+                    "selected_tier": selected_tier,
+                    "reason": (
+                        "authoritative_candidate_accepted"
+                        if selected_tier == 0
+                        else "independent_fallback_after_authoritative_rejection"
+                    ),
+                    "selection_score": round(
+                        float(selected_observation["selection_score"]), 6
+                    ),
+                    "selection_margin": (
+                        round(cross_source_margin, 6)
+                        if math.isfinite(cross_source_margin)
+                        else None
+                    ),
+                })
         elif evaluated:
             # Preserve the most informative rejection diagnostics, but do not
             # claim that its observer was selected for the map.
@@ -3605,6 +3925,7 @@ def apply_floorplan_constraints(
 
     updated = dict(result)
     diagnostics = dict(alignment.get("diagnostics") or {})
+    diagnostics["map_alignment_accepted"] = bool(alignment.get("accepted"))
     selected_source = (
         str(selected_observation["source"])
         if selected_observation is not None and alignment.get("accepted")
@@ -3625,7 +3946,10 @@ def apply_floorplan_constraints(
         source_turns = (
             []
             if selected_source == "lingbot_independent"
-            else result.get("turn_points")
+            else (
+                selected_observation.get("turns")
+                or result.get("turn_points")
+            )
         )
         map_turns = _map_turn_points(
             source_turns,
@@ -3666,6 +3990,7 @@ def apply_floorplan_constraints(
             "person_radius_meters": diagnostics.get("person_radius_meters"),
             "source": "fixed_floorplan_constraint_engine",
             "trajectory_observation_source": selected_source,
+            "r3_trajectory_source": selected_observation.get("r3_source"),
             "observation_variant": selected_observation["variant"],
         }
     else:
@@ -3675,6 +4000,20 @@ def apply_floorplan_constraints(
         updated.pop("map_turn_points", None)
         updated.pop("map_metadata", None)
         updated["final_turn_points"] = result.get("turn_points") or []
+        if (
+            source_selection.get("reason") == "ambiguous_r3_source_selection"
+            and isinstance(r3_source_trajectories.get("raw"), dict)
+        ):
+            raw_fallback = r3_source_trajectories["raw"].get(
+                "plan_trajectory"
+            ) or []
+            if len(raw_fallback) >= 2:
+                updated["trajectory"] = raw_fallback
+                updated["plan_trajectory"] = raw_fallback
+                updated["turn_points"] = (
+                    r3_source_trajectories["raw"].get("turn_points") or []
+                )
+                updated["final_turn_points"] = updated["turn_points"]
 
     updated["processing_stats"] = stats
     return updated

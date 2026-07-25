@@ -14,6 +14,11 @@ from scipy.spatial.transform import Rotation
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from r3_pose_graph_optimizer import (
+    PoseGraphOptimizerConfig,
+    _geometry_rejection_reasons,
+    _path_metrics,
+    _temporal_backbone_mask,
+    _verify_distant_edges,
     load_pose_graph_candidate_c2w,
     load_pose_graph_candidate_summary,
     optimize_pose_graph_arrays,
@@ -114,6 +119,227 @@ def graph_metadata() -> dict[str, np.ndarray]:
 
 
 class R3PoseGraphOptimizerTests(unittest.TestCase):
+    def test_residual_improvement_cannot_hide_destroyed_l_turn_sequence(self) -> None:
+        raw = l_route()
+        folded = raw.copy()
+        folded[:, :3, :3] = np.stack([
+            rotation_z(0.0 if index < 10 else np.pi)
+            for index in range(len(folded))
+        ])
+        folded[:, 0, 3] = np.concatenate((
+            np.arange(10, dtype=float),
+            np.arange(8, -2, -1, dtype=float),
+        ))
+        folded[:, 1, 3] = 0.0
+        edges = [
+            edge_from_c2w(folded, index, index + 1, confidence=5.0)
+            for index in range(len(folded) - 1)
+        ]
+
+        result = optimize_pose_graph_arrays(raw, **graph_arrays(edges))
+        diagnostics = result["diagnostics"]
+
+        self.assertGreater(diagnostics["objective_improvement"], 0.5)
+        self.assertFalse(diagnostics["accepted"])
+        self.assertIn(
+            "turn_sequence_destroyed",
+            diagnostics["rejection_reasons"],
+        )
+        self.assertLess(
+            diagnostics["candidate_path"]["endpoint_displacement"],
+            diagnostics["initial_path"]["endpoint_displacement"] * 0.2,
+        )
+
+    def test_mutually_supported_false_distant_edges_are_still_rejected(self) -> None:
+        poses = np.broadcast_to(np.eye(4), (16, 4, 4)).copy()
+        poses[:, 0, 3] = np.arange(len(poses), dtype=float)
+        frame_i = np.asarray([0, 1, 2], dtype=np.int32)
+        frame_j = np.asarray([10, 11, 12], dtype=np.int32)
+        wrong = np.zeros((3, 9), dtype=np.float64)
+        wrong[:, 0] = 10.0
+        # The W2C convention predicts negative X for this forward C2W motion.
+        wrong[:, 6] = 1.0
+        edge_type = np.full(3, 3, dtype=np.uint8)
+
+        verified_types, diagnostics = _verify_distant_edges(
+            poses,
+            frame_i=frame_i,
+            frame_j=frame_j,
+            rel_pose_enc=wrong,
+            confidence_t=np.full(3, 20.0),
+            confidence_r=np.full(3, 20.0),
+            edge_type=edge_type,
+            matching_support=np.full(3, np.nan),
+            config=PoseGraphOptimizerConfig(
+                distant_edge_minimum_temporal_gap=2,
+            ),
+        )
+
+        self.assertEqual(verified_types.tolist(), [5, 5, 5])
+        self.assertEqual(diagnostics["rejected_count"], 3)
+        for decision in diagnostics["decisions"]:
+            self.assertGreaterEqual(decision["neighbor_match_count"], 2)
+            self.assertNotIn("isolated_match", decision["reasons"])
+            self.assertIn(
+                "translation_direction_inconsistent",
+                decision["reasons"],
+            )
+
+    def test_backbone_prefers_gap_one_then_gap_two(self) -> None:
+        frame_i = np.asarray([0, 0, 1, 1, 2, 3], dtype=np.int32)
+        frame_j = np.asarray([1, 2, 2, 3, 3, 4], dtype=np.int32)
+        confidence = np.asarray([1, 10, 1, 10, 1, 1], dtype=float)
+        edge_type = np.zeros(len(frame_i), dtype=np.uint8)
+
+        mask, diagnostics = _temporal_backbone_mask(
+            frame_i,
+            frame_j,
+            confidence,
+            point_count=5,
+            edge_type=edge_type,
+            config=PoseGraphOptimizerConfig(),
+        )
+
+        selected = list(zip(frame_i[mask].tolist(), frame_j[mask].tolist()))
+        self.assertEqual(selected, [(0, 1), (1, 2), (2, 3), (3, 4)])
+        self.assertEqual(diagnostics["backbone_coverage"], 1.0)
+        self.assertEqual(diagnostics["maximum_backbone_gap"], 1)
+        self.assertEqual(diagnostics["missing_temporal_links"], [])
+
+    def test_backbone_requires_bridge_at_fallback_boundary(self) -> None:
+        frame_i = np.asarray([0, 1, 2, 2, 3, 4], dtype=np.int32)
+        frame_j = np.asarray([1, 2, 3, 3, 4, 5], dtype=np.int32)
+        confidence = np.ones(len(frame_i), dtype=float)
+        edge_type = np.asarray([0, 0, 0, 2, 0, 0], dtype=np.uint8)
+        config = PoseGraphOptimizerConfig(fallback_boundaries=(3,))
+
+        mask, diagnostics = _temporal_backbone_mask(
+            frame_i, frame_j, confidence, 6, edge_type, config
+        )
+
+        selected_types = edge_type[mask].tolist()
+        self.assertEqual(diagnostics["backbone_coverage"], 1.0)
+        self.assertEqual(diagnostics["bridge_boundary_coverage"], 1.0)
+        self.assertEqual(selected_types.count(2), 1)
+        # The parallel normal edge 2->3 must not cross the boundary.
+        self.assertFalse(mask[2])
+        self.assertTrue(mask[3])
+
+    def test_missing_bridge_breaks_backbone_even_if_full_graph_is_connected(self) -> None:
+        frame_i = np.asarray([0, 1, 2, 3, 4, 0], dtype=np.int32)
+        frame_j = np.asarray([1, 2, 3, 4, 5, 5], dtype=np.int32)
+        confidence = np.ones(len(frame_i), dtype=float)
+        edge_type = np.zeros(len(frame_i), dtype=np.uint8)
+        config = PoseGraphOptimizerConfig(fallback_boundaries=(3,))
+
+        mask, diagnostics = _temporal_backbone_mask(
+            frame_i, frame_j, confidence, 6, edge_type, config
+        )
+
+        self.assertLess(diagnostics["backbone_coverage"], 0.95)
+        self.assertEqual(diagnostics["bridge_boundary_coverage"], 0.0)
+        self.assertIn(3, diagnostics["missing_temporal_links"])
+        self.assertEqual(diagnostics["long_range_backbone_edges"], 0)
+        self.assertEqual(diagnostics["input_long_range_edges"], 1)
+        self.assertEqual(int(mask.sum()), 2)
+
+    def test_long_range_edge_is_never_promoted_into_backbone(self) -> None:
+        frame_i = np.asarray([0, 0], dtype=np.int32)
+        frame_j = np.asarray([1, 4], dtype=np.int32)
+        confidence = np.asarray([1.0, 100.0])
+        edge_type = np.zeros(2, dtype=np.uint8)
+
+        mask, diagnostics = _temporal_backbone_mask(
+            frame_i,
+            frame_j,
+            confidence,
+            5,
+            edge_type,
+            PoseGraphOptimizerConfig(maximum_backbone_gap=2),
+        )
+
+        self.assertTrue(mask[0])
+        self.assertFalse(mask[1])
+        self.assertIn(4, diagnostics["missing_temporal_links"])
+        self.assertEqual(diagnostics["long_range_backbone_edges"], 0)
+
+    def test_geometry_gate_rejects_same_length_spatial_collapse(self) -> None:
+        point_count = 101
+        raw = np.broadcast_to(np.eye(4), (point_count, 4, 4)).copy()
+        raw[:, 0, 3] = np.linspace(0.0, 100.0, point_count)
+        collapsed = raw.copy()
+        # Preserve approximately the same travelled length while folding every
+        # ten steps back through a narrow strip around the start.
+        x = np.arange(point_count, dtype=float) % 10
+        direction = (np.arange(point_count) // 10) % 2
+        collapsed[:, 0, 3] = np.where(direction == 0, x, 9.0 - x)
+        collapsed[:, 1, 3] = np.arange(point_count, dtype=float) // 10 * 0.1
+        raw_metrics = _path_metrics(raw)
+        candidate_metrics = _path_metrics(
+            collapsed, near_start_radius=raw_metrics["near_start_radius"]
+        )
+
+        reasons, diagnostics = _geometry_rejection_reasons(
+            raw,
+            collapsed,
+            raw_metrics,
+            candidate_metrics,
+            PoseGraphOptimizerConfig(),
+        )
+
+        self.assertIn("spatial_span_collapsed", reasons)
+        self.assertIn("endpoint_displacement_collapsed", reasons)
+        self.assertGreater(candidate_metrics["near_start_fraction"], 0.9)
+        self.assertIn("comparison", diagnostics)
+
+    def test_verified_loop_mode_only_relaxes_endpoint_semantics(self) -> None:
+        raw = np.broadcast_to(np.eye(4), (5, 4, 4)).copy()
+        raw[:, :2, 3] = np.asarray([
+            [0.0, 0.0], [5.0, 0.0], [5.0, 5.0], [0.0, 5.0], [1.0, 0.0]
+        ])
+        candidate = raw.copy()
+        candidate[-1, :2, 3] = [0.0, 0.0]
+        raw_metrics = _path_metrics(raw)
+        candidate_metrics = _path_metrics(
+            candidate, near_start_radius=raw_metrics["near_start_radius"]
+        )
+        config = PoseGraphOptimizerConfig(
+            verified_loop_closure=True,
+            minimum_spatial_span_ratio=0.0,
+            maximum_tortuosity_factor=1e9,
+            maximum_tortuosity_increase=1e9,
+            maximum_segment_length_log_rmse=10.0,
+            minimum_straight_run_preservation=0.0,
+            maximum_sharp_reverse_ratio_increase=1.0,
+        )
+
+        reasons, diagnostics = _geometry_rejection_reasons(
+            raw, candidate, raw_metrics, candidate_metrics, config
+        )
+
+        self.assertNotIn("endpoint_displacement_collapsed", reasons)
+        self.assertNotIn("near_start_concentration_regression", reasons)
+        self.assertTrue(diagnostics["verified_loop_closure"])
+
+    def test_closed_raw_route_is_not_rejected_for_low_endpoint_alone(self) -> None:
+        raw = square_route()
+        candidate = raw.copy()
+        candidate[:, :3, 3] *= 1.03
+        raw_metrics = _path_metrics(raw)
+        candidate_metrics = _path_metrics(
+            candidate, near_start_radius=raw_metrics["near_start_radius"]
+        )
+
+        reasons, _ = _geometry_rejection_reasons(
+            raw,
+            candidate,
+            raw_metrics,
+            candidate_metrics,
+            PoseGraphOptimizerConfig(),
+        )
+
+        self.assertNotIn("endpoint_displacement_collapsed", reasons)
+
     def test_recovers_left_turn_from_right_turn_with_outliers(self) -> None:
         truth = l_route()
         edges = []
@@ -254,6 +480,30 @@ class R3PoseGraphOptimizerTests(unittest.TestCase):
         )
         self.assertEqual(result["diagnostics"]["graph"]["component_count"], 3)
 
+    def test_connected_full_graph_with_broken_backbone_is_rejected(self) -> None:
+        truth = np.broadcast_to(np.eye(4), (5, 4, 4)).copy()
+        truth[:, 0, 3] = np.arange(5, dtype=float)
+        edges = [
+            edge_from_c2w(truth, 0, 1),
+            edge_from_c2w(truth, 1, 2),
+            edge_from_c2w(truth, 3, 4),
+            edge_from_c2w(truth, 0, 4),
+        ]
+        initial = truth.copy()
+        initial[:, 0, 3] *= 1.1
+
+        result = optimize_pose_graph_arrays(initial, **graph_arrays(edges))
+        diagnostics = result["diagnostics"]
+
+        self.assertEqual(diagnostics["graph"]["component_count"], 1)
+        self.assertFalse(diagnostics["accepted"])
+        self.assertIn(
+            "insufficient_backbone_coverage",
+            diagnostics["rejection_reasons"],
+        )
+        self.assertLess(diagnostics["backbone"]["backbone_coverage"], 0.95)
+        self.assertEqual(diagnostics["backbone"]["long_range_backbone_edges"], 0)
+
     def test_candidate_artifact_round_trip_does_not_touch_raw_cameras(self) -> None:
         truth = l_route()
         edges = [
@@ -328,6 +578,106 @@ class R3PoseGraphOptimizerTests(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertFalse(result["accepted"])
         self.assertIn("unsupported pose graph metadata", result["error"])
+
+    def test_legacy_v1_long_normal_edge_is_excluded_safely(self) -> None:
+        truth = square_route()
+        edges = [
+            edge_from_c2w(truth, index, index + 1)
+            for index in range(len(truth) - 1)
+        ]
+        edges.append(edge_from_c2w(truth, 0, len(truth) - 1, confidence=20.0))
+        arrays = graph_arrays(edges)
+        metadata = graph_metadata()
+        metadata["schema_version"] = np.asarray([1], dtype=np.int32)
+        initial = truth.copy()
+        initial[:, :3, 3] *= 1.1
+
+        with tempfile.TemporaryDirectory() as directory:
+            np.savez_compressed(
+                Path(directory) / "pose_graph_edges.npz",
+                **metadata,
+                **arrays,
+            )
+            result = run_pose_graph_shadow(directory, initial)
+
+        diagnostics = result
+        self.assertEqual(
+            diagnostics["edge_classification_mode"],
+            "legacy_v1_safe_classification",
+        )
+        self.assertEqual(diagnostics["excluded_edge_count"], 1)
+        self.assertTrue(diagnostics["accepted"])
+
+    def test_unverified_loop_candidate_never_enters_optimizer(self) -> None:
+        truth = l_route()
+        edges = [
+            edge_from_c2w(truth, index, index + 1)
+            for index in range(len(truth) - 1)
+        ]
+        distant = list(edge_from_c2w(truth, 0, len(truth) - 1, confidence=50.0))
+        distant[-1] = 3
+        edges.append(tuple(distant))
+        initial = truth.copy()
+        initial[:, :3, 3] *= 1.1
+
+        result = optimize_pose_graph_arrays(initial, **graph_arrays(edges))
+
+        self.assertEqual(result["diagnostics"]["excluded_edge_count"], 1)
+        self.assertTrue(result["diagnostics"]["accepted"])
+
+    def test_supported_distant_overlap_is_not_mislabeled_as_loop(self) -> None:
+        truth = l_route()
+        edges = [
+            edge_from_c2w(truth, index, index + 1)
+            for index in range(len(truth) - 1)
+        ]
+        distant = list(edge_from_c2w(truth, 2, len(truth) - 2, confidence=4.0))
+        # A source-side verified label must not bypass local verification.
+        distant[-1] = 4
+        edges.append(tuple(distant))
+        arrays = graph_arrays(edges)
+        support = np.full(len(edges), np.nan, dtype=np.float32)
+        support[-1] = 3.0
+
+        result = optimize_pose_graph_arrays(
+            truth.copy(),
+            **arrays,
+            matching_support=support,
+            config=PoseGraphOptimizerConfig(distant_edge_minimum_temporal_gap=2),
+        )
+
+        verification = result["diagnostics"]["distant_edge_verification"]
+        self.assertEqual(verification["verified_overlap_count"], 1)
+        self.assertEqual(verification["verified_loop_count"], 0)
+        self.assertEqual(verification["rejected_count"], 0)
+        self.assertEqual(
+            verification["decisions"][0]["classification"],
+            "verified_overlap",
+        )
+
+    def test_isolated_distant_match_is_rejected_despite_high_confidence(self) -> None:
+        truth = l_route()
+        edges = [
+            edge_from_c2w(truth, index, index + 1)
+            for index in range(len(truth) - 1)
+        ]
+        distant = list(edge_from_c2w(truth, 1, len(truth) - 1, confidence=20.0))
+        distant[-1] = 3
+        edges.append(tuple(distant))
+
+        result = optimize_pose_graph_arrays(
+            truth.copy(),
+            **graph_arrays(edges),
+            config=PoseGraphOptimizerConfig(distant_edge_minimum_temporal_gap=2),
+        )
+
+        verification = result["diagnostics"]["distant_edge_verification"]
+        self.assertEqual(verification["rejected_count"], 1)
+        self.assertIn(
+            "isolated_match",
+            verification["decisions"][0]["reasons"],
+        )
+        self.assertEqual(result["diagnostics"]["excluded_edge_count"], 1)
 
     def test_duplicate_pair_uses_strongest_measurement_once(self) -> None:
         truth = l_route()

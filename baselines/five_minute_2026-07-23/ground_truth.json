@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "name": "five_minute_operator_route_2026-07-23",
+  "source_image": "reference_route.png",
+  "coordinate_system": {
+    "origin": "image_top_left",
+    "x_axis": "right",
+    "y_axis": "down",
+    "width": 684,
+    "height": 408,
+    "unit": "source_image_pixel"
+  },
+  "start_point": {
+    "x": 625,
+    "y": 121
+  },
+  "initial_direction_point": {
+    "x": 578,
+    "y": 120
+  },
+  "end_point": {
+    "x": 63,
+    "y": 215
+  },
+  "trajectory": [
+    [625, 121],
+    [578, 120],
+    [520, 120],
+    [462, 120],
+    [412, 121],
+    [411, 139],
+    [410, 158],
+    [376, 163],
+    [336, 161],
+    [297, 161],
+    [256, 163],
+    [238, 184],
+    [226, 193],
+    [219, 184],
+    [205, 169],
+    [204, 158],
+    [201, 137],
+    [194, 123],
+    [163, 127],
+    [119, 127],
+    [85, 128],
+    [79, 143],
+    [79, 164],
+    [76, 181],
+    [68, 190],
+    [67, 203],
+    [63, 215]
+  ],
+  "provenance": {
+    "description": "Operator-confirmed real route for the five-minute video, ordered from the right marker toward the left",
+    "confirmed_in_conversation": "2026-07-25",
+    "trace_method": "manual centerline trace of the blue route",
+    "expected_trace_uncertainty_pixels": 4
+  }
+}

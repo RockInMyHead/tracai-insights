@@ -107,6 +107,8 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertIn('"rel_pose_enc"', patched)
         self.assertIn('"confidence_t"', patched)
         self.assertIn('"confidence_r"', patched)
+        self.assertIn('"creation_reason"', patched)
+        self.assertIn('"matching_support"', patched)
         self.assertEqual(patched_again, patched)
         self.assertEqual(repeated["status"], "already_available")
 
@@ -166,6 +168,11 @@ class R3WorkerPresetTests(unittest.TestCase):
         self.assertEqual(exported["rel_pose_enc"][0, :3].tolist(), [1.0, 0.0, 0.0])
         self.assertAlmostEqual(float(exported["confidence_t"][0]), 2.1, places=5)
         self.assertAlmostEqual(float(exported["confidence_r"][0]), 1.9, places=5)
+        self.assertEqual(int(exported["schema_version"][0]), 2)
+        self.assertEqual(int(exported["edge_type"][0]), 0)
+        self.assertEqual(str(exported["creation_reason"][0]), "adjacent_frames")
+        self.assertEqual(str(exported["original_edge_type"][0]), "normal")
+        self.assertEqual(int(exported["temporal_gap"][0]), 1)
 
     def test_pose_graph_export_patches_external_infer_atomically(self) -> None:
         source = (
@@ -247,6 +254,12 @@ class R3WorkerPresetTests(unittest.TestCase):
                 confidence_t=np.full(point_count - 1, 2.0, dtype=np.float32),
                 confidence_r=np.full(point_count - 1, 2.0, dtype=np.float32),
                 edge_type=np.zeros(point_count - 1, dtype=np.uint8),
+                creation_reason=np.full(point_count - 1, "adjacent_frames"),
+                original_edge_type=np.full(point_count - 1, "normal"),
+                temporal_gap=np.ones(point_count - 1, dtype=np.int32),
+                fallback_epoch=np.full(point_count - 1, -1, dtype=np.int32),
+                segment_id=np.full(point_count - 1, -1, dtype=np.int32),
+                matching_support=np.full(point_count - 1, np.nan, dtype=np.float32),
             )
 
             with patch.dict(
