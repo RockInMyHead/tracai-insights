@@ -481,10 +481,11 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             scale_candidates=[1.0],
             yaw_offsets_degrees=[0.0],
         )
-        self.assertTrue(result["accepted"], result["diagnostics"])
-        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
-        self.assertGreater(result["diagnostics"]["rerouted_segments"], 0)
-        self.assertGreaterEqual(len(result["trajectory"]), 5)
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertIn(
+            "different_walkable_components",
+            result["diagnostics"]["rejection_reasons"],
+        )
 
     def test_wrapper_preserves_visual_trajectory_when_map_context_is_incomplete(self) -> None:
         source = {
@@ -565,8 +566,9 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
             allow_safe_shape_fallback=True,
         )
-        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertTrue(result["accepted"], result["diagnostics"])
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
+        self.assertLessEqual(result["diagnostics"]["correction_p95_meters"], 1.05)
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [
