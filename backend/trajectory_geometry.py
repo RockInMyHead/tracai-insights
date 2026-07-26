@@ -94,6 +94,96 @@ def trajectory_metrics(points: Any) -> dict[str, Any]:
     }
 
 
+def _early_heading(points: np.ndarray, fraction: float = 0.08) -> np.ndarray | None:
+    if len(points) < 2:
+        return None
+    sampled = _resample(points, 64)
+    index = min(len(sampled) - 1, max(1, int(round((len(sampled) - 1) * fraction))))
+    heading = sampled[index] - sampled[0]
+    norm = float(np.linalg.norm(heading))
+    return heading / norm if norm > 1e-12 else None
+
+
+def align_trajectory_to_anchor(
+    reference: Any,
+    candidate: Any,
+    context: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Align around a fixed start; direction chooses rotation and polarity.
+
+    Translation is never estimated from centroids.  Reflection is only applied
+    when explicitly requested by the coordinate convention.
+    """
+    options = context or {}
+    ref = _points(reference)
+    cand = _points(candidate)
+    dimensions = min(ref.shape[1], cand.shape[1]) if len(ref) and len(cand) else 0
+    if len(ref) < 2 or len(cand) < 2 or dimensions < 2:
+        return cand.copy(), {"available": False, "reason": "insufficient_points"}
+    ref = ref[:, :dimensions]
+    cand = cand[:, :dimensions]
+    ref_start = np.asarray(options.get("reference_start", ref[0]), dtype=np.float64)
+    cand_start = np.asarray(options.get("candidate_start", cand[0]), dtype=np.float64)
+    ref_heading = np.asarray(
+        options.get("reference_direction", _early_heading(ref)),
+        dtype=np.float64,
+    )
+    cand_heading = np.asarray(
+        options.get("candidate_direction", _early_heading(cand)),
+        dtype=np.float64,
+    )
+    if ref_heading.size < 2 or cand_heading.size < 2:
+        return cand.copy(), {"available": False, "reason": "direction_unavailable"}
+    ref_heading = ref_heading[:2]
+    cand_heading = cand_heading[:2]
+    ref_norm = float(np.linalg.norm(ref_heading))
+    cand_norm = float(np.linalg.norm(cand_heading))
+    if ref_norm <= 1e-12 or cand_norm <= 1e-12:
+        return cand.copy(), {"available": False, "reason": "direction_degenerate"}
+
+    reflect = bool(options.get("reflect_y", False))
+    centered = cand[:, :2] - cand_start[:2]
+    candidate_direction = cand_heading / cand_norm
+    reflection = np.asarray([[1.0, 0.0], [0.0, -1.0]]) if reflect else np.eye(2)
+    centered = centered @ reflection.T
+    candidate_direction = candidate_direction @ reflection.T
+    reference_direction = ref_heading / ref_norm
+    source_angle = math.atan2(float(candidate_direction[1]), float(candidate_direction[0]))
+    target_angle = math.atan2(float(reference_direction[1]), float(reference_direction[0]))
+    angle = target_angle - source_angle
+    rotation = np.asarray([
+        [math.cos(angle), -math.sin(angle)],
+        [math.sin(angle), math.cos(angle)],
+    ])
+    rotated = centered @ rotation.T
+
+    ref_resampled = _resample(ref[:, :2] - ref_start[:2], 256)
+    cand_resampled = _resample(rotated, 256)
+    scale = float(
+        np.sum(cand_resampled * ref_resampled)
+        / max(np.sum(cand_resampled * cand_resampled), 1e-12)
+    )
+    if not math.isfinite(scale) or scale <= 0:
+        return cand.copy(), {"available": False, "reason": "scale_degenerate"}
+    aligned_2d = rotated * scale + ref_start[:2]
+    aligned = cand.copy()
+    aligned[:, :2] = aligned_2d
+    start_error = float(np.linalg.norm(aligned[0, :2] - ref_start[:2]))
+    return aligned, {
+        "available": True,
+        "mode": "fixed_start_and_direction",
+        "scale": scale,
+        "rotation_degrees": math.degrees(angle),
+        "reflection_applied": reflect,
+        "translation_fitted_from_centroid": False,
+        "reference_start": ref_start[:2].tolist(),
+        "candidate_start": cand_start[:2].tolist(),
+        "aligned_start": aligned[0, :2].tolist(),
+        "start_error": start_error,
+        "direction_error_degrees": 0.0,
+    }
+
+
 def _similarity(reference: np.ndarray, candidate: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
     ref = reference - reference.mean(axis=0)
     cand = candidate - candidate.mean(axis=0)
@@ -144,8 +234,12 @@ def _frechet(first: np.ndarray, second: np.ndarray) -> float:
     return float(cache[-1, -1])
 
 
-def compare_trajectories(reference: Any, candidate: Any) -> dict[str, Any]:
-    """Compare shapes after one best-fit similarity without reflection."""
+def compare_trajectories(
+    reference: Any,
+    candidate: Any,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compare shapes using a fixed start when an anchor context is supplied."""
     raw_reference = _points(reference)
     raw_candidate = _points(candidate)
     if len(raw_reference) < 2 or len(raw_candidate) < 2:
@@ -154,7 +248,10 @@ def compare_trajectories(reference: Any, candidate: Any) -> dict[str, Any]:
     count = min(256, max(64, min(len(raw_reference), len(raw_candidate))))
     ref = _resample(raw_reference[:, :dimensions], count)
     cand = _resample(raw_candidate[:, :dimensions], count)
-    aligned, transform = _similarity(ref, cand)
+    aligned, transform = (
+        align_trajectory_to_anchor(ref, cand, context)
+        if context is not None else _similarity(ref, cand)
+    )
     if not transform["available"]:
         return {"available": False, "reason": "degenerate_similarity"}
     span = max(float(np.linalg.norm(np.ptp(ref, axis=0))), 1e-12)
@@ -183,8 +280,11 @@ def compare_trajectories(reference: Any, candidate: Any) -> dict[str, Any]:
         ))
         if significant.any() else 1.0
     )
-    ref_metrics = trajectory_metrics(raw_reference)
-    candidate_metrics = trajectory_metrics(raw_candidate)
+    # Ratios are shape ratios after the same allowed similarity.  Comparing
+    # pre-alignment units incorrectly rejected otherwise identical paths whose
+    # coordinate scales differed (for example metres versus plan pixels).
+    ref_metrics = trajectory_metrics(ref)
+    candidate_metrics = trajectory_metrics(aligned)
     straight = np.abs(ref_turns) <= math.radians(8.0)
     straight_preservation = (
         float(np.mean(np.abs(cand_turns[straight]) <= math.radians(15.0)))
@@ -221,7 +321,9 @@ def trajectory_acceptance(
 ) -> dict[str, Any]:
     """Apply relative geometry gates; closed routes relax endpoint only."""
     context = dict(context or {})
-    comparison = compare_trajectories(reference, candidate)
+    # Supplying a context selects the fixed-start comparison.  Do not let an
+    # improved candidate hide a displaced start through centroid translation.
+    comparison = compare_trajectories(reference, candidate, context)
     if not comparison.get("available"):
         return {
             "accepted": False,

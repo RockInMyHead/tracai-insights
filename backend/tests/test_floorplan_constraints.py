@@ -140,7 +140,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 result["diagnostics"]["shape_gate_details"]["p95_within_budget"]
             )
 
-    def test_start_inside_restricted_area_is_projected_to_walkable_mask(self) -> None:
+    def test_start_inside_restricted_area_is_rejected_without_hidden_projection(self) -> None:
         mask = np.zeros((100, 100), dtype=bool)
         mask[40:60, 40:60] = True
         engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
@@ -151,12 +151,9 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             scale_candidates=[1.0],
             yaw_offsets_degrees=[0.0],
         )
-        self.assertTrue(result["accepted"], result["diagnostics"])
-        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
-        self.assertIn(
-            "start_projected_to_walkable_area",
-            result["diagnostics"]["quality_warnings"],
-        )
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertTrue(result["diagnostics"]["start_anchor_locked"])
+        self.assertGreater(result["diagnostics"]["start_snap_meters"], 0.05)
 
     def test_route_leaving_plan_is_constrained_inside_instead_of_rejected(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
@@ -267,9 +264,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
         )
         self.assertFalse(result["accepted"], result["diagnostics"])
-        self.assertEqual(
-            result["diagnostics"]["reason"], "start_too_far_from_walkable_area"
-        )
+        self.assertEqual(result["diagnostics"]["reason"], "constraint_solution_not_found")
+        self.assertTrue(result["diagnostics"]["start_anchor_locked"])
 
     def test_stationary_time_is_removed_from_scale_prior(self) -> None:
         points = np.asarray([
@@ -529,27 +525,10 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             "reference_point": {"x": 2222.623 / 5298 * 100, "y": 684.183 / 3743 * 100},
             "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
         })
-        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
-        self.assertGreater(len(updated["map_trajectory"]), 1)
+        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
+        self.assertNotIn("map_trajectory", updated)
         self.assertEqual(updated["plan_trajectory"], original)
-        self.assertEqual(updated["map_turn_points"][0]["angle_degrees"], 90.0)
-        self.assertEqual(updated["map_turn_points"][0]["turn_type"], "left")
-        self.assertTrue(updated["map_turn_points"][0]["map_constrained"])
-        self.assertGreater(updated["processing_stats"]["estimated_distance"], 0.0)
-        self.assertEqual(updated["map_metadata"]["map_id"], "kerama_marazzi_2025")
-        self.assertEqual(
-            updated["floorplan_constraint"]["constraint_revision"],
-            "kerama_operator_left_route_local_repair_v30",
-        )
-        self.assertEqual(
-            len(updated["map_trajectory_timestamps_seconds"]),
-            len(updated["map_trajectory"]),
-        )
-        mapped = np.asarray(updated["map_trajectory"], dtype=float)
-        max_step_meters = float(
-            np.max(np.linalg.norm(np.diff(mapped[:, :2], axis=0), axis=1))
-        ) * updated["map_metadata"]["meters_per_pixel"]
-        self.assertLessEqual(max_step_meters, 0.751)
+        self.assertTrue(updated["floorplan_constraint"]["start_anchor_locked"])
 
     def test_operator_anchor_snaps_locally_and_heading_points_left(self) -> None:
         engine = get_floorplan_engine()
@@ -586,12 +565,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
             allow_safe_shape_fallback=True,
         )
-        self.assertTrue(result["accepted"], result["diagnostics"])
-        self.assertEqual(result["diagnostics"]["corrected_collision_ratio"], 0.0)
-        self.assertLessEqual(
-            result["diagnostics"]["correction_p95_meters"], 1.0
-        )
-        self.assertEqual(result["diagnostics"]["turn_topology"]["sign_mismatch_ratio"], 0.0)
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertTrue(result["diagnostics"]["start_anchor_locked"])
 
     def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
         source_path = [
@@ -624,22 +599,13 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
             })
 
-        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
-        self.assertEqual(
-            updated["processing_stats"]["map_observation_source"],
-            "r3_lingbot_fusion",
-        )
-        self.assertEqual(
-            updated["floorplan_constraint"]["observation_source_selection"]["reason"],
-            "authoritative_candidate_accepted",
-        )
+        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
         selection = updated["floorplan_constraint"]["observation_source_selection"]
         independent = next(
             item for item in selection["candidate_results"]
             if item["source"] == "lingbot_independent"
         )
-        self.assertTrue(independent["skipped"])
-        self.assertEqual(independent["reason"], "authoritative_candidate_accepted")
+        self.assertFalse(independent["accepted"])
 
     def test_fragmented_r3_selects_independent_lingbot_even_after_fusion_veto(self) -> None:
         engine = FloorplanConstraintEngine.from_mask(
@@ -1131,7 +1097,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         if "fine" in nonlinear and nonlinear["fine"].get("reason") is None:
             self.assertEqual(nonlinear["fine"]["order"], 2)
 
-    def test_five_minute_reference_route_passes_metric_and_map_gates(self) -> None:
+    def test_five_minute_reference_route_is_not_shifted_to_fit_bad_mask(self) -> None:
         engine = get_floorplan_engine()
         points = np.asarray(load_reference_route()["points"], dtype=np.float64)
         relative = points - points[0]
@@ -1144,6 +1110,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         direction = engine.config.default_anchor_direction_pixels
         self.assertIsNotNone(start)
         self.assertIsNotNone(direction)
+        expected_start = points[0]
+        np.testing.assert_allclose(start, expected_start, atol=1e-6)
         result = engine.align(
             observation.tolist(),
             {
@@ -1159,7 +1127,14 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             scale_candidates=[1.0],
             yaw_offsets_degrees=[0.0],
         )
-        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertTrue(result["diagnostics"]["start_anchor_locked"])
+        self.assertGreater(result["diagnostics"]["start_snap_meters"], 1.9)
+        np.testing.assert_allclose(
+            result["diagnostics"]["requested_start_pixels"],
+            expected_start,
+            atol=1e-6,
+        )
 
 
 if __name__ == "__main__":

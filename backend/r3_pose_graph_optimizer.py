@@ -715,6 +715,7 @@ def _geometry_rejection_reasons(
     comparison = compare_trajectories(
         initial_c2w[:, :3, 3],
         candidate_c2w[:, :3, 3],
+        {},
     )
     reasons: list[str] = []
     endpoint_ratio = (

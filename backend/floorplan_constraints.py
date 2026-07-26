@@ -81,6 +81,8 @@ INDEPENDENT_LOOP_CLOSED_MAX_SHARP_REVERSE_RATIO = 0.18
 INDEPENDENT_MIN_SELECTION_MARGIN = 0.10
 INDEPENDENT_MAX_AMBIGUOUS_SCALE_RATIO = 1.18
 MAX_START_SNAP_METERS = 1.50
+MAX_PUBLISHED_START_ERROR_METERS = 0.05
+MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES = 5.0
 MAX_PUBLISHED_SEGMENT_METERS = 0.75
 
 
@@ -1994,22 +1996,20 @@ class FloorplanConstraintEngine:
         start_cell = self._nearest_free(self._pixel_to_cell(requested_start))
         if start_cell is None:
             return {"accepted": False, "trajectory": [], "diagnostics": {**base_diagnostics, "reason": "no_walkable_start"}}
-        start = self._cell_to_pixel(start_cell)
+        nearest_walkable_start = self._cell_to_pixel(start_cell)
         start_snap_meters = (
-            float(np.linalg.norm(start - requested_start))
+            float(np.linalg.norm(nearest_walkable_start - requested_start))
             * self.config.meters_per_pixel
         )
-        if start_snap_meters > MAX_START_SNAP_METERS:
-            return {
-                "accepted": False,
-                "trajectory": [],
-                "diagnostics": {
-                    **base_diagnostics,
-                    "reason": "start_too_far_from_walkable_area",
-                    "start_snap_meters": round(start_snap_meters, 3),
-                    "max_start_snap_meters": MAX_START_SNAP_METERS,
-                },
-            }
+        # The operator's start is ground truth.  Never move the entire route
+        # to make that point fit an imperfect support mask.
+        start = requested_start.copy()
+        base_diagnostics.update({
+            "requested_start_pixels": requested_start.tolist(),
+            "nearest_walkable_start_pixels": nearest_walkable_start.tolist(),
+            "start_snap_meters": round(start_snap_meters, 3),
+            "start_anchor_locked": True,
+        })
 
         relative = raw - raw[0]
         if coordinate_convention == "x_forward_y_left_z_up":
@@ -2042,8 +2042,11 @@ class FloorplanConstraintEngine:
         duration = self._motion_duration_seconds(timestamps, relative)
         candidates = list(scale_candidates) if scale_candidates is not None else self._scale_candidates(relative, duration)
         hypotheses: list[dict[str, Any]] = []
+        # The supplied direction fixes rotation.  Yaw search used to rotate
+        # the whole route away from the operator's anchor.
+        effective_yaw_offsets = (0.0,)
         for scale in candidates:
-            for yaw in yaw_offsets_degrees:
+            for yaw in effective_yaw_offsets:
                 points = self._build_hypothesis(relative, start, desired_heading, float(scale), float(yaw))
                 score, metrics = self._score_hypothesis(
                     points,
@@ -2332,6 +2335,11 @@ class FloorplanConstraintEngine:
             maximum_correction = (
                 float(np.max(displacement_m)) if len(displacement_m) else 0.0
             )
+            start_error_meters = (
+                float(np.linalg.norm(repaired[0] - requested_start))
+                * self.config.meters_per_pixel
+                if len(repaired) else float("inf")
+            )
             # A floor plan may select scale/yaw and make local obstacle
             # repairs; it may not invent a different route.  Keep the
             # correction budget deliberately local: once the fix needs a
@@ -2381,6 +2389,8 @@ class FloorplanConstraintEngine:
                 else 0.70
             )
             shape_preserved = (
+                start_error_meters <= MAX_PUBLISHED_START_ERROR_METERS
+                and
                 p95_correction <= correction_budget
                 and maximum_correction <= maximum_correction_budget
                 and minimum_length_ratio <= length_ratio <= 1.50
@@ -2428,6 +2438,7 @@ class FloorplanConstraintEngine:
                 "correction_budget_meters": correction_budget,
                 "maximum_correction_meters": maximum_correction,
                 "maximum_correction_budget_meters": maximum_correction_budget,
+                "start_error_meters": start_error_meters,
                 "sharp_reverse_ratio": sharp_reverse_ratio,
                 "maximum_sharp_reverse_ratio": maximum_sharp_reverse_ratio,
                 "turn_topology": turn_topology,
@@ -2943,6 +2954,49 @@ class FloorplanConstraintEngine:
         published_length_meters = (
             _polyline_length(repaired) * self.config.meters_per_pixel
         )
+        published_start_error_meters = (
+            float(np.linalg.norm(repaired[0] - requested_start))
+            * self.config.meters_per_pixel
+            if len(repaired) else float("inf")
+        )
+        if published_start_error_meters > MAX_PUBLISHED_START_ERROR_METERS:
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": "start_anchor_moved",
+                    "rejection_reasons": ["published_start_not_locked"],
+                    "start_error_meters": round(published_start_error_meters, 6),
+                    "maximum_start_error_meters": MAX_PUBLISHED_START_ERROR_METERS,
+                },
+            }
+        published_initial_heading = self._initial_heading(repaired - repaired[0])
+        direction_error_radians = math.atan2(
+            math.sin(published_initial_heading - desired_heading),
+            math.cos(published_initial_heading - desired_heading),
+        )
+        published_direction_error_degrees = abs(
+            math.degrees(direction_error_radians)
+        )
+        if (
+            published_direction_error_degrees
+            > MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES
+        ):
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": "initial_direction_moved",
+                    "rejection_reasons": ["published_initial_direction_not_locked"],
+                    "initial_direction_error_degrees": round(
+                        published_direction_error_degrees, 6
+                    ),
+                    "maximum_initial_direction_error_degrees":
+                        MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES,
+                },
+            }
         diagnostics = {
             **base_diagnostics,
             "accepted": True,
@@ -3000,6 +3054,15 @@ class FloorplanConstraintEngine:
             "outside_ratio": round(float(corrected_metrics["outside_ratio"]), 6),
             "rerouted_segments": rerouted_segments,
             "start_snap_meters": round(start_snap_meters, 3),
+            "start_error_meters": round(published_start_error_meters, 6),
+            "maximum_start_error_meters": MAX_PUBLISHED_START_ERROR_METERS,
+            "start_anchor_locked": True,
+            "initial_direction_locked": True,
+            "initial_direction_error_degrees": round(
+                published_direction_error_degrees, 6
+            ),
+            "maximum_initial_direction_error_degrees":
+                MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES,
             "correction_median_meters": round(float(np.median(displacement_m)), 3),
             "correction_p95_meters": round(p95_correction, 3),
             "maximum_correction_meters": round(

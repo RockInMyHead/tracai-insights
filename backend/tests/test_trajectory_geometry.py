@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from backend.trajectory_geometry import (
+    align_trajectory_to_anchor,
     compare_trajectories,
     trajectory_acceptance,
     trajectory_metrics,
@@ -10,6 +11,29 @@ from backend.trajectory_geometry import (
 
 
 class TrajectoryGeometryTests(unittest.TestCase):
+    def test_anchor_alignment_preserves_start_under_translation_rotation_and_scale(self) -> None:
+        reference = np.asarray([[20, 30], [30, 30], [30, 40]], dtype=float)
+        rotation = np.asarray([[0, -1], [1, 0]], dtype=float)
+        candidate = (reference - reference[0]) @ rotation.T * 2.5
+        candidate += np.asarray([800.0, -200.0])
+        aligned, details = align_trajectory_to_anchor(reference, candidate)
+        self.assertTrue(details["available"], details)
+        np.testing.assert_allclose(aligned, reference, atol=1e-8)
+        np.testing.assert_allclose(aligned[0], reference[0], atol=1e-10)
+        self.assertFalse(details["translation_fitted_from_centroid"])
+
+    def test_reflection_is_only_used_when_explicit(self) -> None:
+        reference = np.asarray([[0, 0], [10, 0], [10, 5]], dtype=float)
+        reflected = reference * np.asarray([1.0, -1.0])
+        without_reflection, plain = align_trajectory_to_anchor(reference, reflected)
+        with_reflection, explicit = align_trajectory_to_anchor(
+            reference, reflected, {"reflect_y": True}
+        )
+        self.assertFalse(plain["reflection_applied"])
+        self.assertTrue(explicit["reflection_applied"])
+        self.assertGreater(np.linalg.norm(without_reflection[-1] - reference[-1]), 1.0)
+        np.testing.assert_allclose(with_reflection, reference, atol=1e-8)
+
     def test_similarity_does_not_reflect_turns(self) -> None:
         reference = np.asarray([[0, 0], [5, 0], [5, 5]], dtype=float)
         reflected = np.asarray([[0, 0], [5, 0], [5, -5]], dtype=float)
