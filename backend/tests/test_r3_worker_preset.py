@@ -19,12 +19,14 @@ from r3_worker_wrapper import (
     R3_EDGE_HISTORY_ACCEPT_ANCHOR,
     R3_EDGE_HISTORY_RESET_ANCHOR,
     R3_FALLBACK_CUMULATIVE_SCALE_ANCHOR,
+    R3_FALLBACK_ORIENTATION_LOCK_ANCHOR,
     R3_POSE_GRAPH_EXPORT_ANCHOR,
     _build_r3_infer_cmd,
     _ensure_r3_pose_graph_export,
     _fallback_edges_from_pose_graph_part,
     _homogeneous_camera_poses,
     _patch_r3_fallback_cumulative_scale,
+    _patch_r3_fallback_orientation_lock,
     _patch_r3_infer_source,
     _patch_r3_online_source,
     _probe_video_frame_timestamps,
@@ -44,6 +46,54 @@ def option_value(command: list[str], option: str) -> str:
 
 
 class R3WorkerPresetTests(unittest.TestCase):
+    def test_fallback_replay_preserves_established_bridge_orientation(self) -> None:
+        source = (
+            "class Worker:\n"
+            "    def fallback(self, trial_state, fid, old_pose, old_ref_pose, "
+            "old_rel_pose, new_rel_pose, old_score, new_score, scale):\n"
+            "        if True:\n"
+            f"{R3_FALLBACK_ORIENTATION_LOCK_ANCHOR}"
+            "        return trial_state.frame_pose_enc[fid]\n"
+        )
+
+        patched, diagnostics = _patch_r3_fallback_orientation_lock(source)
+        patched_again, repeated = _patch_r3_fallback_orientation_lock(patched)
+
+        self.assertTrue(diagnostics["changed"])
+        self.assertIn(
+            "fused_bridge_pose[..., 3:7] = old_pose[..., 3:7]",
+            patched,
+        )
+        self.assertEqual(patched_again, patched)
+        self.assertEqual(repeated["status"], "already_available")
+
+        namespace = {
+            "fuse_fallback_bridge_pose": lambda **_: np.asarray(
+                [[1.0, 2.0, 3.0, 0.1, 0.2, 0.3, 0.9, 0.8, 0.8]],
+                dtype=np.float64,
+            ),
+        }
+        exec(patched, namespace)
+        worker = namespace["Worker"]()
+        trial_state = SimpleNamespace(frame_pose_enc={})
+        old_pose = np.asarray(
+            [[9.0, 9.0, 9.0, 0.0, 0.0, 0.70710678, 0.70710678, 0.7, 0.7]],
+            dtype=np.float64,
+        )
+        fused = worker.fallback(
+            trial_state,
+            12,
+            old_pose,
+            None,
+            None,
+            None,
+            1.0,
+            2.0,
+            1.3,
+        )
+        np.testing.assert_allclose(fused[0, :3], [1.0, 2.0, 3.0])
+        np.testing.assert_allclose(fused[0, 3:7], old_pose[0, 3:7])
+
     def test_repeated_fallback_keeps_cumulative_global_scale(self) -> None:
         source = (
             "import math\n"

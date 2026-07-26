@@ -294,6 +294,35 @@ R3_FALLBACK_CUMULATIVE_SCALE_REPLACEMENT = '''        else:
             )
         trial_state.scale_factor = scale
 '''
+R3_FALLBACK_ORIENTATION_LOCK_MARKER = (
+    "# TRACKAI_R3_FALLBACK_ORIENTATION_LOCK_V1"
+)
+R3_FALLBACK_ORIENTATION_LOCK_ANCHOR = '''            trial_state.frame_pose_enc[fid] = fuse_fallback_bridge_pose(
+                old_ref_pose=old_ref_pose,
+                old_rel_pose=old_rel_pose,
+                new_rel_pose=new_rel_pose,
+                old_score=old_score,
+                new_score=new_score,
+                scale=scale,
+            )
+'''
+R3_FALLBACK_ORIENTATION_LOCK_REPLACEMENT = '''            fused_bridge_pose = fuse_fallback_bridge_pose(
+                old_ref_pose=old_ref_pose,
+                old_rel_pose=old_rel_pose,
+                new_rel_pose=new_rel_pose,
+                old_score=old_score,
+                new_score=new_score,
+                scale=scale,
+            )
+            # TRACKAI_R3_FALLBACK_ORIENTATION_LOCK_V1
+            # Replay is allowed to improve bridge translation, but bridge frames
+            # already belong to the accepted global orientation history.  Blending
+            # their old/new quaternions makes every recovery rotate the local floor
+            # basis a little.  Preserve the old absolute orientation so the fresh
+            # segment continues from one stable direction frame.
+            fused_bridge_pose[..., 3:7] = old_pose[..., 3:7]
+            trial_state.frame_pose_enc[fid] = fused_bridge_pose
+'''
 
 
 def emit(event_type, data=None):
@@ -434,6 +463,32 @@ def _patch_r3_fallback_cumulative_scale(source: str) -> tuple[str, dict]:
     return patched, {"status": "patched", "changed": True}
 
 
+def _patch_r3_fallback_orientation_lock(source: str) -> tuple[str, dict]:
+    """Keep replayed bridge frames in the established global orientation."""
+    if R3_FALLBACK_ORIENTATION_LOCK_MARKER in source:
+        return source, {"status": "already_available", "changed": False}
+    if R3_FALLBACK_ORIENTATION_LOCK_ANCHOR not in source:
+        return source, {
+            "status": "unsupported_online_source",
+            "changed": False,
+            "reason": "fallback bridge fusion anchor not found",
+        }
+    patched = source.replace(
+        R3_FALLBACK_ORIENTATION_LOCK_ANCHOR,
+        R3_FALLBACK_ORIENTATION_LOCK_REPLACEMENT,
+        1,
+    )
+    try:
+        compile(patched, "online_inference.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
 def _patch_r3_edge_history_export(source: str) -> tuple[str, dict]:
     """Make infer.py export the preserved full history instead of bridge-only history."""
     if R3_EDGE_HISTORY_EXPORT_REPLACEMENT in source:
@@ -518,6 +573,9 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
     patched_online, fallback_scale_diagnostics = (
         _patch_r3_fallback_cumulative_scale(patched_online)
     )
+    patched_online, fallback_orientation_diagnostics = (
+        _patch_r3_fallback_orientation_lock(patched_online)
+    )
     changed = any(
         item["changed"]
         for item in (
@@ -526,6 +584,7 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
             quaternion_diagnostics,
             online_diagnostics,
             fallback_scale_diagnostics,
+            fallback_orientation_diagnostics,
         )
     )
     diagnostics = {
@@ -538,6 +597,7 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
         "quaternion_normalization": quaternion_diagnostics,
         "edge_history": online_diagnostics,
         "fallback_cumulative_scale": fallback_scale_diagnostics,
+        "fallback_orientation_lock": fallback_orientation_diagnostics,
     }
     if not changed:
         return diagnostics
