@@ -18,10 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from r3_worker_wrapper import (
     R3_EDGE_HISTORY_ACCEPT_ANCHOR,
     R3_EDGE_HISTORY_RESET_ANCHOR,
+    R3_FALLBACK_CUMULATIVE_SCALE_ANCHOR,
     R3_POSE_GRAPH_EXPORT_ANCHOR,
     _build_r3_infer_cmd,
     _ensure_r3_pose_graph_export,
+    _fallback_edges_from_pose_graph_part,
     _homogeneous_camera_poses,
+    _patch_r3_fallback_cumulative_scale,
     _patch_r3_infer_source,
     _patch_r3_online_source,
     _probe_video_frame_timestamps,
@@ -41,6 +44,58 @@ def option_value(command: list[str], option: str) -> str:
 
 
 class R3WorkerPresetTests(unittest.TestCase):
+    def test_repeated_fallback_keeps_cumulative_global_scale(self) -> None:
+        source = (
+            "import math\n"
+            "class Worker:\n"
+            "    def fallback(self, state, trial_state, pose_scale, depth_scale):\n"
+            "        if False:\n"
+            "            scale = 1.0\n"
+            f"{R3_FALLBACK_CUMULATIVE_SCALE_ANCHOR}"
+            "        return scale\n"
+        )
+
+        patched, diagnostics = _patch_r3_fallback_cumulative_scale(source)
+        patched_again, repeated = _patch_r3_fallback_cumulative_scale(patched)
+
+        self.assertTrue(diagnostics["changed"])
+        self.assertIn(
+            "depth_scale_global = previous_scale * depth_scale_value",
+            patched,
+        )
+        self.assertEqual(patched_again, patched)
+        self.assertEqual(repeated["status"], "already_available")
+
+        namespace: dict = {}
+        exec(patched, namespace)
+        worker = namespace["Worker"]()
+        worker._resolve_fallback_scale = lambda pose_scale, depth_scale: depth_scale
+        state = SimpleNamespace(scale_factor=2.5)
+        trial_state = SimpleNamespace(scale_factor=1.0)
+        resolved = worker.fallback(
+            state,
+            trial_state,
+            pose_scale=3.0,
+            depth_scale=1.2,
+        )
+        self.assertAlmostEqual(resolved, 3.0)
+        self.assertAlmostEqual(trial_state.scale_factor, 3.0)
+
+    def test_merged_pose_graph_preserves_internal_fallback_boundaries(self) -> None:
+        records = _fallback_edges_from_pose_graph_part({
+            "frame_i": np.asarray([100, 101, 250], dtype=np.int32),
+            "frame_j": np.asarray([101, 106, 255], dtype=np.int32),
+            "edge_type": np.asarray([0, 2, 2], dtype=np.uint8),
+            "confidence": np.asarray([2.0, 1.8, 1.7], dtype=np.float32),
+            "fallback_epoch": np.asarray([-1, 3, 4], dtype=np.int32),
+        })
+
+        self.assertEqual(
+            [(record["frame_i"], record["frame_j"]) for record in records],
+            [(101, 106), (250, 255)],
+        )
+        self.assertTrue(all(record["edge_type"] == "bridge" for record in records))
+
     def test_native_three_by_four_camera_poses_become_homogeneous(self) -> None:
         native = np.broadcast_to(np.eye(4)[:3], (2, 3, 4)).copy()
         native[1, 0, 3] = 7.0

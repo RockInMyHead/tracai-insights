@@ -262,6 +262,38 @@ R3_EDGE_QUATERNION_NORMALIZATION_INSERTION = '''                    # TRACKAI_R3
                     rel_pose_values = rel_pose_values.copy()
                     rel_pose_values[3:7] /= quaternion_norm
 '''
+R3_FALLBACK_CUMULATIVE_SCALE_MARKER = (
+    "# TRACKAI_R3_FALLBACK_CUMULATIVE_SCALE_V1"
+)
+R3_FALLBACK_CUMULATIVE_SCALE_ANCHOR = '''        else:
+            scale = self._resolve_fallback_scale(
+                pose_scale=pose_scale, depth_scale=depth_scale
+            )
+        trial_state.scale_factor = scale
+'''
+R3_FALLBACK_CUMULATIVE_SCALE_REPLACEMENT = '''        else:
+            # TRACKAI_R3_FALLBACK_CUMULATIVE_SCALE_V1
+            # The depth buffers deliberately keep predictions in the raw scale of
+            # the active segment.  Therefore depth_scale maps the new raw segment
+            # only into the previous raw segment, while pose_scale already maps it
+            # into the accumulated global pose scale.  Compare like with like:
+            # new_raw -> previous_raw -> accumulated_global.
+            previous_scale = float(state.scale_factor)
+            depth_scale_global = depth_scale
+            if depth_scale is not None:
+                depth_scale_value = float(depth_scale)
+                if (
+                    math.isfinite(depth_scale_value)
+                    and depth_scale_value > 0.0
+                    and math.isfinite(previous_scale)
+                    and previous_scale > 0.0
+                ):
+                    depth_scale_global = previous_scale * depth_scale_value
+            scale = self._resolve_fallback_scale(
+                pose_scale=pose_scale, depth_scale=depth_scale_global
+            )
+        trial_state.scale_factor = scale
+'''
 
 
 def emit(event_type, data=None):
@@ -376,6 +408,32 @@ def _patch_r3_online_source(source: str) -> tuple[str, dict]:
     return patched, {"status": "patched", "changed": True}
 
 
+def _patch_r3_fallback_cumulative_scale(source: str) -> tuple[str, dict]:
+    """Keep the accumulated global scale across repeated fallback replays."""
+    if R3_FALLBACK_CUMULATIVE_SCALE_MARKER in source:
+        return source, {"status": "already_available", "changed": False}
+    if R3_FALLBACK_CUMULATIVE_SCALE_ANCHOR not in source:
+        return source, {
+            "status": "unsupported_online_source",
+            "changed": False,
+            "reason": "fallback scale resolution anchor not found",
+        }
+    patched = source.replace(
+        R3_FALLBACK_CUMULATIVE_SCALE_ANCHOR,
+        R3_FALLBACK_CUMULATIVE_SCALE_REPLACEMENT,
+        1,
+    )
+    try:
+        compile(patched, "online_inference.py", "exec")
+    except SyntaxError as exc:
+        return source, {
+            "status": "patch_compile_failed",
+            "changed": False,
+            "reason": f"{exc.msg} at line {exc.lineno}",
+        }
+    return patched, {"status": "patched", "changed": True}
+
+
 def _patch_r3_edge_history_export(source: str) -> tuple[str, dict]:
     """Make infer.py export the preserved full history instead of bridge-only history."""
     if R3_EDGE_HISTORY_EXPORT_REPLACEMENT in source:
@@ -457,6 +515,9 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
             "reason": f"{type(exc).__name__}: {exc}",
         }
     patched_online, online_diagnostics = _patch_r3_online_source(online_source)
+    patched_online, fallback_scale_diagnostics = (
+        _patch_r3_fallback_cumulative_scale(patched_online)
+    )
     changed = any(
         item["changed"]
         for item in (
@@ -464,6 +525,7 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
             history_export_diagnostics,
             quaternion_diagnostics,
             online_diagnostics,
+            fallback_scale_diagnostics,
         )
     )
     diagnostics = {
@@ -475,6 +537,7 @@ def _ensure_r3_pose_graph_export(r3_dir: str | Path = R3_DIR) -> dict:
         "history_export": history_export_diagnostics,
         "quaternion_normalization": quaternion_diagnostics,
         "edge_history": online_diagnostics,
+        "fallback_cumulative_scale": fallback_scale_diagnostics,
     }
     if not changed:
         return diagnostics
@@ -1330,6 +1393,57 @@ def _save_merged_pose_graph(
     return count
 
 
+def _fallback_edges_from_pose_graph_part(
+    part: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    """Build the compact bridge log used to recover fallback boundaries.
+
+    Long-video inference deletes per-block output directories after merging.
+    Without copying bridge provenance first, the combined run falsely reports
+    that no fallback occurred and downstream diagnostics cannot locate scale
+    epochs.  Frame indices in ``part`` are already mapped to the combined
+    camera namespace.
+    """
+    import numpy as np
+
+    if not part:
+        return []
+    try:
+        frame_i = np.asarray(part["frame_i"], dtype=np.int64).reshape(-1)
+        frame_j = np.asarray(part["frame_j"], dtype=np.int64).reshape(-1)
+        edge_type = np.asarray(part["edge_type"], dtype=np.uint8).reshape(-1)
+        confidence = np.asarray(part["confidence"], dtype=np.float64).reshape(-1)
+        fallback_epoch = np.asarray(
+            part.get("fallback_epoch", np.full(len(frame_i), -1)),
+            dtype=np.int32,
+        ).reshape(-1)
+    except (KeyError, TypeError, ValueError):
+        return []
+    if not (
+        len(frame_i)
+        == len(frame_j)
+        == len(edge_type)
+        == len(confidence)
+        == len(fallback_epoch)
+    ):
+        return []
+
+    records: list[dict[str, object]] = []
+    for left, right, kind, score, epoch in zip(
+        frame_i, frame_j, edge_type, confidence, fallback_epoch
+    ):
+        if int(kind) != 2:
+            continue
+        records.append({
+            "frame_i": int(left),
+            "frame_j": int(right),
+            "edge_type": "bridge",
+            "confidence": float(score) if np.isfinite(score) else None,
+            "fallback_epoch": int(epoch),
+        })
+    return records
+
+
 def run_r3_inference_segmented(
     frames_dir: str,
     output_dir: str,
@@ -1363,6 +1477,7 @@ def run_r3_inference_segmented(
     }
     first_run_params: dict = {}
     pose_graph_parts: list[dict[str, object]] = []
+    fallback_edges: list[dict[str, object]] = []
     keep_segments = (os.getenv("R3_KEEP_SEGMENT_OUTPUTS") or "false").lower() in {"1", "true", "yes", "on"}
 
     for window in windows:
@@ -1442,6 +1557,9 @@ def run_r3_inference_segmented(
         )
         if pose_graph_part is not None:
             pose_graph_parts.append(pose_graph_part)
+            fallback_edges.extend(
+                _fallback_edges_from_pose_graph_part(pose_graph_part)
+            )
         new_global_indices = sorted(set(merged_poses) - previously_merged)
         for batch_start in range(0, len(new_global_indices), 100):
             batch_indices = new_global_indices[batch_start:batch_start + 100]
@@ -1475,6 +1593,23 @@ def run_r3_inference_segmented(
         combined_output,
         pose_graph_parts,
     )
+    # ``collect_results`` and the main server derive accepted fallback
+    # boundaries from this compact log.  Persist it before deleting block
+    # directories so every internal reset remains visible in the combined run.
+    (combined_output / "pose_edge_log.json").write_text(
+        json.dumps(sanitize_json(fallback_edges), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    try:
+        bridge_window = int(first_run_params.get("fallback_num_bridge_frames") or 10)
+    except (TypeError, ValueError):
+        bridge_window = 10
+    fallback_summary = summarize_fallback_edges(
+        fallback_edges,
+        point_count=len(source_frames),
+        bridge_window=bridge_window,
+    )
+    manifest["fallback_summary"] = fallback_summary
     manifest["merged_poses"] = len(merged_poses)
     (combined_output / "segment_manifest.json").write_text(
         json.dumps(sanitize_json(manifest), ensure_ascii=False, indent=2),
@@ -1491,6 +1626,9 @@ def run_r3_inference_segmented(
         "max_frames": segment_frames,
         "inference_time_s": round(sum(item["inference_seconds"] for item in manifest["segments"]), 2),
         "rel_pose_reconstruction_method": os.getenv("R3_REL_POSE_METHOD", "pgo"),
+        "fallback_boundaries": fallback_summary["boundaries"],
+        "fallback_boundary_source": "merged_segment_pose_graph",
+        "fallback_events": fallback_summary["events"],
     })
     (combined_output / "run_params.json").write_text(
         json.dumps(sanitize_json(first_run_params), indent=2),
