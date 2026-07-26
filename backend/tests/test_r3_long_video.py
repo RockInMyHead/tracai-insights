@@ -82,6 +82,50 @@ class R3LongVideoTests(unittest.TestCase):
         self.assertAlmostEqual(float(aligned[12][0, 3]), 12.0, places=5)
         self.assertEqual(diagnostics["overlap_pairs"], 3)
 
+    def test_strong_overlap_is_not_clipped_by_previous_block_scale(self) -> None:
+        local = [yaw_pose(float(i), float(i % 3), i * 2.0) for i in range(16)]
+        world_rotation = yaw_pose(0.0, 0.0, 18.0)[:3, :3]
+        global_poses = [
+            transform_camera_pose(
+                pose,
+                world_rotation,
+                1.9,
+                np.asarray([7.0, 0.2, -4.0]),
+            )
+            for pose in local
+        ]
+
+        _, scale, _, diagnostics = estimate_pose_similarity(
+            global_poses,
+            local,
+            scale_prior=1.0,
+            maximum_relative_scale_change=1.25,
+        )
+
+        self.assertAlmostEqual(scale, 1.9, places=6)
+        self.assertTrue(diagnostics["strong_overlap"])
+        self.assertFalse(diagnostics["scale_prior_applied"])
+        self.assertEqual(diagnostics["scale_source"], "overlap")
+
+    def test_sparse_overlap_retains_scale_safety_prior(self) -> None:
+        local = [yaw_pose(0.0, 0.0, 0.0), yaw_pose(1.0, 0.0, 0.0)]
+        global_poses = [yaw_pose(0.0, 0.0, 0.0), yaw_pose(2.0, 0.0, 0.0)]
+
+        _, scale, _, diagnostics = estimate_pose_similarity(
+            global_poses,
+            local,
+            scale_prior=1.0,
+            maximum_relative_scale_change=1.25,
+        )
+
+        self.assertAlmostEqual(scale, 1.25, places=6)
+        self.assertFalse(diagnostics["strong_overlap"])
+        self.assertTrue(diagnostics["scale_prior_applied"])
+        self.assertEqual(
+            diagnostics["scale_source"],
+            "overlap_with_continuity_prior",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,13 +90,21 @@ def estimate_pose_similarity(
     raw_scale = float(np.median(scale_candidates)) if scale_candidates else 1.0
     if not np.isfinite(raw_scale) or raw_scale <= 0.0:
         raw_scale = 1.0
-    # Each block is allowed a local scale correction, but a weak overlap must
-    # not resize the entire remaining 25-minute route. Keep the new block near
-    # the robust scale of recent accepted blocks. This is a continuity prior,
-    # not a metric/global rescale of the reconstructed path.
+    # A large overlap directly observes the gauge change between blocks and is
+    # stronger evidence than the scale used by an earlier, independently
+    # initialized block.  The old unconditional prior clipped a well-supported
+    # 1.90 correction to 1.25 in the five-minute golden run, recreating the
+    # very scale discontinuity that the overlap is meant to remove.  Retain the
+    # continuity prior only when overlap evidence is genuinely sparse.
     scale = raw_scale
     prior_applied = False
-    if scale_prior is not None and np.isfinite(scale_prior) and scale_prior > 0.0:
+    strong_overlap = len(global_points) >= 12 and len(scale_candidates) >= 30
+    if (
+        not strong_overlap
+        and scale_prior is not None
+        and np.isfinite(scale_prior)
+        and scale_prior > 0.0
+    ):
         relative_limit = max(1.01, float(maximum_relative_scale_change))
         lower = float(scale_prior) / relative_limit
         upper = float(scale_prior) * relative_limit
@@ -114,6 +122,10 @@ def estimate_pose_similarity(
         "raw_scale": round(raw_scale, 8),
         "scale_prior": round(float(scale_prior), 8) if scale_prior is not None else None,
         "scale_prior_applied": prior_applied,
+        "strong_overlap": strong_overlap,
+        "scale_source": "overlap" if strong_overlap else (
+            "overlap_with_continuity_prior" if scale_prior is not None else "overlap"
+        ),
         "scale": round(scale, 8),
         "median_residual": round(float(np.median(residuals)), 8),
         "max_residual": round(float(np.max(residuals)), 8),
