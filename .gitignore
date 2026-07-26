@@ -69,3 +69,5 @@ scripts/
 # Temp / test
 test.txt
 test_small.txt
+outputs/
+tmp/

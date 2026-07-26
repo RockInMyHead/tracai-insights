@@ -1,0 +1,240 @@
+{
+  "experiment_id": "golden5-mask2-20260726",
+  "video_duration_seconds": 305.53333333333336,
+  "r3_total_time_seconds": 279.6,
+  "frame_count": 2503,
+  "raw_metrics": {
+    "available": true,
+    "point_count": 2503,
+    "dimensions": 2,
+    "path_length": 75.79290741391169,
+    "endpoint_displacement": 34.52513410520117,
+    "net_progress_ratio": 0.4555193260585241,
+    "bbox_diagonal": 36.3866891429436,
+    "span_ratio": 0.48008039781654915,
+    "bbox_extent": [
+      35.005609,
+      9.929677
+    ],
+    "bbox_area": 347.594390558293,
+    "tortuosity": 2.195296539123177,
+    "step_p50": 0.02299068684894559,
+    "step_p90": 0.06403157509442643,
+    "step_p99": 0.13013475772847558,
+    "sharp_reverse_ratio": 0.03937007874015748,
+    "turn_count": 89,
+    "absolute_turn_p50_degrees": 10.449329545765279,
+    "absolute_turn_p90_degrees": 61.4328098677205
+  },
+  "reference_metrics": {
+    "available": true,
+    "point_count": 50,
+    "dimensions": 2,
+    "path_length": 2085.4445724350035,
+    "endpoint_displacement": 1578.0234400024187,
+    "net_progress_ratio": 0.7566844311569928,
+    "bbox_diagonal": 1596.3457576764122,
+    "span_ratio": 0.7654702401476389,
+    "bbox_extent": [
+      1574.3007000000002,
+      264.3805666666666
+    ],
+    "bbox_area": 416214.5111697299,
+    "tortuosity": 1.32155487654341,
+    "step_p50": 41.42488229087833,
+    "step_p90": 63.29378342432751,
+    "step_p99": 77.8564955788562,
+    "sharp_reverse_ratio": 0.0,
+    "turn_count": 16,
+    "absolute_turn_p50_degrees": 7.076324835534753,
+    "absolute_turn_p90_degrees": 44.46154792049111
+  },
+  "shape_comparison": {
+    "available": true,
+    "similarity": {
+      "available": true,
+      "mode": "fixed_start_and_direction",
+      "scale": 41.60910682948126,
+      "rotation_degrees": 180.02409267988833,
+      "reflection_applied": false,
+      "translation_fitted_from_centroid": false,
+      "reference_start": [
+        2230.458,
+        673.74
+      ],
+      "candidate_start": [
+        0.0,
+        -0.0
+      ],
+      "aligned_start": [
+        2230.458,
+        673.74
+      ],
+      "start_error": 0.0,
+      "direction_error_degrees": 0.0
+    },
+    "normalized_frechet_distance": 0.2971248681744284,
+    "normalized_chamfer_distance": 0.1472276427607844,
+    "turn_sequence_agreement": 0.32142857142857145,
+    "local_direction_agreement": 0.7683311670904177,
+    "segment_length_log_rmse": 0.5149319082959921,
+    "endpoint_ratio": 0.9103540269866209,
+    "span_ratio": 0.9492045935249076,
+    "curvature_p90_ratio": 0.9390745793651742,
+    "straight_run_preservation": 0.7741935483870968
+  },
+  "anchor_alignment": {
+    "available": true,
+    "mode": "fixed_start_and_direction",
+    "scale": 38.61431245751617,
+    "rotation_degrees": 170.12625641828959,
+    "reflection_applied": false,
+    "translation_fitted_from_centroid": false,
+    "reference_start": [
+      2230.458,
+      673.74
+    ],
+    "candidate_start": [
+      0.0,
+      -0.0
+    ],
+    "aligned_start": [
+      2230.458,
+      673.74
+    ],
+    "start_error": 0.0,
+    "direction_error_degrees": 0.0
+  },
+  "start_error_pixels": 0.0,
+  "start_error_meters": 0.0,
+  "map_alignment_accepted": false,
+  "map_observation_source": null,
+  "map_diagnostics": {
+    "engine": "floorplan_constraint_engine_v9_shape_preserving",
+    "map_id": "kerama_marazzi_2025",
+    "plan_width": 5298,
+    "plan_height": 3743,
+    "meters_per_pixel": 0.049629166698546515,
+    "person_radius_meters": 0.18,
+    "point_count": 2503,
+    "accepted": false,
+    "observation_policy": "authoritative",
+    "loop_closure_verified": false,
+    "independent_corridor_recovery_enabled": false,
+    "topology_recovery_enabled": false,
+    "support_mask_enabled": true,
+    "support_coverage_ratio": 0.07011871,
+    "walkable_bbox_cells": [
+      147,
+      130,
+      859,
+      548
+    ],
+    "annotation_bbox_cells": [
+      0,
+      102,
+      1322,
+      910
+    ],
+    "requested_start_pixels": [
+      2230.458,
+      673.74
+    ],
+    "nearest_walkable_start_pixels": [
+      2230.0,
+      674.0
+    ],
+    "start_snap_meters": 0.026,
+    "start_anchor_locked": true,
+    "observation_progress": {
+      "net_progress_ratio": 0.455519,
+      "span_length_ratio": 0.48008,
+      "tortuosity": 2.195297
+    },
+    "reason": "constraint_solution_not_found",
+    "rejection_reasons": [
+      "different_walkable_components",
+      "local_search_exhausted"
+    ],
+    "route_failure_counts": {
+      "different_walkable_components": 21,
+      "local_search_exhausted": 1
+    },
+    "hypothesis_count": 40,
+    "metric_hypothesis_count": 40,
+    "beam_size": 22,
+    "constrained_hypotheses_attempted": 22,
+    "topology_recovery_attempted": 0,
+    "topology_recovery_accepted": 0,
+    "topology_recovery_diagnostics": [],
+    "segmented_recovery_attempted": 0,
+    "segmented_recovery_accepted": 0,
+    "segmented_recovery_diagnostics": [],
+    "raw_collision_ratio": 0.192932,
+    "anchor_source": "request",
+    "trajectory_observation_source": null,
+    "observation_source_selection": {
+      "primary": "r3",
+      "selected": null,
+      "reason": "no_candidate_satisfied_floorplan",
+      "r3_severely_fragmented": false,
+      "fragmentation_policy": "soft_prior_not_veto",
+      "selection_policy": "r3_primary_only_left_heading_v6",
+      "fusion_map_candidate_enabled": false,
+      "candidate_results": [
+        {
+          "source": "r3",
+          "variant": "primary",
+          "selection_tier": 0,
+          "accepted": false,
+          "reason": "constraint_solution_not_found",
+          "rejection_reasons": [
+            "different_walkable_components",
+            "local_search_exhausted"
+          ],
+          "constrained_score": null,
+          "source_prior": 0.05,
+          "selection_score": null,
+          "correction_p95_meters": null,
+          "length_ratio": 1.0,
+          "estimated_speed_mps": null,
+          "estimated_speed_ratio": null,
+          "observation_stabilization": null,
+          "fusion_supported": false,
+          "timestamp_provenance": null,
+          "loop_closure_verified": false,
+          "corrected_progress": null
+        },
+        {
+          "source": "r3",
+          "variant": "r3_image_y_down",
+          "selection_tier": 0,
+          "accepted": false,
+          "reason": "constraint_solution_not_found",
+          "rejection_reasons": [
+            "different_walkable_components",
+            "local_search_exhausted"
+          ],
+          "constrained_score": null,
+          "source_prior": 0.06,
+          "selection_score": null,
+          "correction_p95_meters": null,
+          "length_ratio": 1.0,
+          "estimated_speed_mps": null,
+          "estimated_speed_ratio": null,
+          "observation_stabilization": null,
+          "fusion_supported": false,
+          "timestamp_provenance": null,
+          "loop_closure_verified": false,
+          "corrected_progress": null
+        }
+      ],
+      "best_rejected_candidate": {
+        "source": "r3",
+        "variant": "primary",
+        "reason": "constraint_solution_not_found"
+      }
+    },
+    "constraint_revision": "kerama_operator_left_route_local_repair_v30"
+  }
+}
