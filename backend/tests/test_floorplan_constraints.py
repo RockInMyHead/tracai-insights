@@ -1110,7 +1110,10 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         direction = engine.config.default_anchor_direction_pixels
         self.assertIsNotNone(start)
         self.assertIsNotNone(direction)
-        expected_start = points[0]
+        expected_start = np.asarray([
+            engine.config.width * 0.421,
+            engine.config.height * 0.180,
+        ])
         np.testing.assert_allclose(start, expected_start, atol=1e-6)
         result = engine.align(
             observation.tolist(),
@@ -1129,7 +1132,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertFalse(result["accepted"], result["diagnostics"])
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
-        self.assertGreater(result["diagnostics"]["start_snap_meters"], 1.9)
+        self.assertLessEqual(result["diagnostics"]["start_snap_meters"], 0.05)
         np.testing.assert_allclose(
             result["diagnostics"]["requested_start_pixels"],
             expected_start,
