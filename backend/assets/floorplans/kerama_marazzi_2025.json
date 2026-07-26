@@ -20,19 +20,19 @@
   "person_radius_meters": 0.18,
   "walking_speed_mps": 1.2,
   "default_start_anchor": {
-    "source": "operator_admin_anchor_percent_v6",
+    "source": "operator_admin_anchor_percent_v7",
     "reference_pixels": [
-      2230.458,
-      673.74
+      2219.862,
+      677.483
     ],
     "direction_pixels": [
-      1992.048,
-      692.455
+      1997.346,
+      699.941
     ],
     "trajectory_points_used": false,
     "coordinate_system": "plan_percent",
-    "reference_percent": [42.1, 18.0],
-    "direction_percent": [37.6, 18.5]
+    "reference_percent": [41.9, 18.1],
+    "direction_percent": [37.7, 18.7]
   },
   "obstacle_mask_file": "kerama_marazzi_2025_mask_2_obstacles.png",
   "obstacle_mask_sha256": "96e2bc23bcb60d8145126d902096da809b03a7669d496cc965260a4bbf807e52",

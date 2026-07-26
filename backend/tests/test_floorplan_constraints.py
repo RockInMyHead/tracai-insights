@@ -1113,10 +1113,15 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertIsNotNone(start)
         self.assertIsNotNone(direction)
         expected_start = np.asarray([
-            engine.config.width * 0.421,
-            engine.config.height * 0.180,
+            engine.config.width * 0.419,
+            engine.config.height * 0.181,
+        ])
+        expected_direction = np.asarray([
+            engine.config.width * 0.377,
+            engine.config.height * 0.187,
         ])
         np.testing.assert_allclose(start, expected_start, atol=1e-6)
+        np.testing.assert_allclose(direction, expected_direction, atol=1e-6)
         result = engine.align(
             observation.tolist(),
             {
@@ -1134,7 +1139,13 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         self.assertFalse(result["accepted"], result["diagnostics"])
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
-        self.assertLessEqual(result["diagnostics"]["start_snap_meters"], 0.05)
+        # The operator point is exact; the occupancy search works on a
+        # four-pixel grid, so its internal walkable cell may be up to one grid
+        # cell away without changing the requested/published anchor.
+        self.assertLessEqual(
+            result["diagnostics"]["start_snap_meters"],
+            engine.config.grid_cell_pixels * engine.config.meters_per_pixel,
+        )
         np.testing.assert_allclose(
             result["diagnostics"]["requested_start_pixels"],
             expected_start,
