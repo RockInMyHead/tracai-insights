@@ -2,6 +2,11 @@ name: Build full Windows desktop
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - agent/windows-local-r3-runtime
+    paths:
+      - ".github/workflows/build-windows-full.yml"
 
 permissions:
   contents: read
