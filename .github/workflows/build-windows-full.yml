@@ -51,6 +51,9 @@ jobs:
       - name: Install desktop dependencies
         run: npm ci
 
+      - name: Test desktop video upload
+        run: node --test electron/*.test.cjs
+
       - name: Assemble bundled Windows GPU runtime
         shell: pwsh
         run: |
@@ -60,6 +63,20 @@ jobs:
 
       - name: Build Windows installer
         run: npm run build:desktop:win
+
+      - name: Launch packaged desktop application
+        shell: pwsh
+        run: |
+          $application = "release\win-unpacked\TrackAI.exe"
+          if (-not (Test-Path $application)) {
+            throw "Packaged TrackAI application is missing"
+          }
+          $process = Start-Process $application -ArgumentList "--disable-gpu" -PassThru
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) {
+            throw "Packaged TrackAI exited during startup with code $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id -Force
 
       - name: Verify installer
         shell: pwsh
