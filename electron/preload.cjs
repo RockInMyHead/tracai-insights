@@ -7,15 +7,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
 contextBridge.exposeInMainWorld('trackai', {
   isDesktop: true,
-  version: process.env.npm_package_version || '1.18.1',
+  version: process.env.npm_package_version || '1.18.2',
   serverUrl: 'http://93.189.231.189',
   processing: {
     resolveMode: () => ipcRenderer.invoke('processing:resolve-mode'),
+  },
+  logs: {
+    download: () => ipcRenderer.invoke('logs:download'),
   },
   localCpu: {
     process: (video) => ipcRenderer.invoke('local-cpu:process', video),
     history: () => ipcRenderer.invoke('local-cpu:history'),
     analysis: (videoId) => ipcRenderer.invoke('local-cpu:analysis', videoId),
+  },
+  localGpu: {
+    process: (video) => ipcRenderer.invoke('local-gpu:process', video),
+    history: () => ipcRenderer.invoke('local-gpu:history'),
+    analysis: (videoId) => ipcRenderer.invoke('local-gpu:analysis', videoId),
   },
   openExternal: (url) => shell.openExternal(url),
   copyToClipboard: (text) => clipboard.writeText(String(text)),

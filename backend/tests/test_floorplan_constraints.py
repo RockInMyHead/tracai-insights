@@ -10,8 +10,10 @@ from backend.floorplan_constraints import (
     _polyline_progress_metrics,
     _polyline_sharp_reverse_ratio,
     _speed_prior_penalty,
+    _stabilize_authoritative_map_observation,
     _stabilize_independent_observation,
     _trajectory_fractions,
+    _turn_topology_metrics,
     apply_floorplan_constraints,
     get_floorplan_engine,
 )
@@ -137,7 +139,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         if "shape_gate_details" in result["diagnostics"]:
             self.assertFalse(
-                result["diagnostics"]["shape_gate_details"]["p95_within_budget"]
+                all(result["diagnostics"]["shape_gate_details"].values()),
+                result["diagnostics"]["shape_gate_details"],
             )
 
     def test_start_inside_restricted_area_is_rejected_without_hidden_projection(self) -> None:
@@ -344,7 +347,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["route_observed_length_ratio"], 1.0)
         self.assertFalse(metrics["spike"], metrics)
 
-    def test_authoritative_spike_is_rejected_without_global_route_rewrite(self) -> None:
+    def test_short_authoritative_spike_is_not_globally_rewritten(self) -> None:
         mask = np.zeros((120, 120), dtype=bool)
         mask[10:110, 55:65] = True
         engine = FloorplanConstraintEngine.from_mask(
@@ -357,21 +360,20 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             [45.5, 60.5], [53.0, 60.5], [60.5, 60.5],
             [68.0, 60.5], [75.5, 60.5],
         ])
-        with patch.object(
-            engine,
-            "_multilevel_viterbi_map_match",
-        ) as matcher:
-            result = engine.align(
-                observed.tolist(),
-                {"x": 45.5 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
-                {"x": 53.0 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
-                coordinate_convention="x_right_y_down",
-                scale_candidates=[1.0],
-                yaw_offsets_degrees=[0.0],
-            )
+        result = engine.align(
+            observed.tolist(),
+            {"x": 45.5 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
+            {"x": 53.0 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
+            coordinate_convention="x_right_y_down",
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+        )
         self.assertFalse(result["accepted"], result["diagnostics"])
         self.assertEqual(result["diagnostics"]["topology_recovery_attempted"], 0)
-        matcher.assert_not_called()
+        self.assertIn(
+            "topology_destroying_map_correction",
+            result["diagnostics"]["rejection_reasons"],
+        )
 
     def test_sharp_reverse_ratio_flags_triangular_spike(self) -> None:
         # Straight walk with one large triangular detour (classic bad A* spike).
@@ -482,9 +484,12 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
         )
         self.assertFalse(result["accepted"], result["diagnostics"])
-        self.assertIn(
-            "different_walkable_components",
-            result["diagnostics"]["rejection_reasons"],
+        self.assertTrue(
+            {
+                "different_walkable_components",
+                "topology_destroying_map_correction",
+            }.intersection(result["diagnostics"]["rejection_reasons"]),
+            result["diagnostics"],
         )
 
     def test_wrapper_preserves_visual_trajectory_when_map_context_is_incomplete(self) -> None:
@@ -570,7 +575,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
         self.assertLessEqual(result["diagnostics"]["correction_p95_meters"], 1.05)
 
-    def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
+    def test_guarded_fusion_does_not_promote_untrusted_independent(self) -> None:
         source_path = [
             [0, 0, 0], [100, 0, 0], [200, 0, 0],
             [300, 0, 0], [400, 0, 0], [500, 0, 0],
@@ -601,7 +606,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
             })
 
-        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
         selection = updated["floorplan_constraint"]["observation_source_selection"]
         independent = next(
             item for item in selection["candidate_results"]
@@ -975,6 +980,52 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(np.allclose(stable[[0, -1]], raw[[0, -1]]))
         self.assertLess(stable_length, raw_length * 0.65)
 
+    def test_authoritative_macro_motion_removes_pose_jitter_and_locks_endpoints(
+        self,
+    ) -> None:
+        count = 600
+        x = np.linspace(0.0, 100.0, count)
+        jitter = np.where(np.arange(count) % 2 == 0, -0.5, 0.5)
+        raw = np.column_stack((x, jitter))
+
+        macro, diagnostics = _stabilize_authoritative_map_observation(raw)
+
+        self.assertTrue(diagnostics["applied"], diagnostics)
+        np.testing.assert_allclose(macro[[0, -1]], raw[[0, -1]], atol=1e-9)
+        self.assertLess(
+            np.linalg.norm(np.diff(macro, axis=0), axis=1).sum(),
+            np.linalg.norm(np.diff(raw, axis=0), axis=1).sum() * 0.7,
+        )
+
+    def test_opposite_turn_sequence_cannot_be_overridden_by_graph_score(self) -> None:
+        source = np.asarray([
+            [0.0, 0.0], [20.0, 0.0], [40.0, 0.0],
+            [40.0, 20.0], [40.0, 40.0],
+            [60.0, 40.0], [80.0, 40.0],
+        ])
+        opposite = source.copy()
+        opposite[:, 1] *= -1.0
+
+        metrics = _turn_topology_metrics(source, opposite)
+
+        self.assertFalse(metrics["event_sequence_preserved"], metrics)
+        self.assertGreater(metrics["sign_mismatch_ratio"], 0.0)
+
+    def test_turn_event_count_change_is_not_topology_preserving(self) -> None:
+        source = np.asarray([
+            [0.0, 0.0], [30.0, 0.0], [30.0, 30.0],
+            [60.0, 30.0], [60.0, 60.0],
+        ])
+        corrected = np.asarray([
+            [0.0, 0.0], [15.0, 0.0], [30.0, 0.0],
+            [45.0, 0.0], [60.0, 0.0],
+        ])
+
+        metrics = _turn_topology_metrics(source, corrected)
+
+        self.assertFalse(metrics["event_sequence_preserved"], metrics)
+        self.assertGreater(metrics["event_count_delta"], 0)
+
     def test_scale_prior_uses_walkable_extent_not_annotation_bbox(self) -> None:
         mask = np.zeros((100, 200), dtype=bool)
         # Tiny annotation island vs large walkable free space.
@@ -1079,7 +1130,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(engine._collision_runs(matched), [])
         self.assertGreater(diagnostics["corridor_graph_nodes"], 0)
 
-    def test_second_order_hmm_is_disabled_in_production(self) -> None:
+    def test_second_order_graph_does_not_replace_better_safe_baseline(self) -> None:
         mask = np.zeros((120, 180), dtype=bool)
         mask[42:78, 78:102] = True
         engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
@@ -1091,10 +1142,12 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(result["accepted"], result["diagnostics"])
         nonlinear = result["diagnostics"]["nonlinear_map_matching"]
         self.assertFalse(nonlinear["attempted"])
-        self.assertFalse(nonlinear["production_enabled"])
+        self.assertTrue(nonlinear["production_enabled"])
+        self.assertFalse(nonlinear["accepted"])
+        self.assertEqual(nonlinear["reason"], "global_solution_stable")
         self.assertEqual(
             nonlinear["method"],
-            "corridor_graph_multilevel_viterbi_v3_second_order",
+            "corridor_graph_multilevel_viterbi_v4_turn_events_branch_commitment",
         )
         if "fine" in nonlinear and nonlinear["fine"].get("reason") is None:
             self.assertEqual(nonlinear["fine"]["order"], 2)

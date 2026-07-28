@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "python": "3.11",
+  "architecture": "x64",
+  "torch": "2.10.0+cu126",
+  "cuda_runtime": "12.6",
+  "minimum_nvidia_driver_windows": "560.76",
+  "minimum_vram_mb": 12000,
+  "weight": "R3/ckpt/r3_long.safetensors",
+  "complete": false
+}

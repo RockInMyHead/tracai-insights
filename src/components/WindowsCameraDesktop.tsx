@@ -3,13 +3,14 @@ import { Button } from "@/components/ui/button";
 import TrajectoryMap, { type TrajectoryData, type TurnPoint } from "@/components/TrajectoryMap";
 import { apiClient, type VideoAnalysisResult, type VideoListItem } from "@/lib/api";
 import { getCameraImportAPI, type CameraImportedVideo, type CameraImportProgress } from "@/lib/cameraImport";
-import { Camera, ChevronDown, History, Loader2, MapPinned, Upload } from "lucide-react";
+import { Camera, ChevronDown, Download, History, Loader2, MapPinned, Upload } from "lucide-react";
+import { toast } from "sonner";
 
 const FLOORPLAN_URL = "/floorplans/kerama-marazzi-2025.png";
 const CAMERA_OWNER = "Экшен-камера";
 
 type DesktopState = "ready" | "looking" | "copying" | "processing" | "done" | "needs_camera" | "error";
-type ProcessingMode = "online" | "local";
+type ProcessingMode = "online" | "local_gpu" | "local_cpu";
 
 function getDesktopBridge() {
   return (window as unknown as { trackai?: Window["trackai"] }).trackai;
@@ -36,6 +37,7 @@ export default function WindowsCameraDesktop() {
   const [message, setMessage] = useState("Подключите экшен-камеру и нажмите «Загрузить»");
   const [progress, setProgress] = useState<CameraImportProgress | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [logsDownloading, setLogsDownloading] = useState(false);
   const [history, setHistory] = useState<VideoListItem[]>([]);
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [stats, setStats] = useState<Record<string, unknown>>({});
@@ -44,15 +46,21 @@ export default function WindowsCameraDesktop() {
   const resolveProcessingMode = useCallback(async () => {
     const bridge = getDesktopBridge();
     const next = await bridge?.processing?.resolveMode?.();
-    const mode = next?.mode === "local" ? "local" : "online";
+    const mode: ProcessingMode = next?.mode === "local_gpu"
+      ? "local_gpu"
+      : next?.mode === "local_cpu"
+        ? "local_cpu"
+        : "online";
     processingModeRef.current = mode;
     return mode;
   }, []);
 
   const refreshHistory = useCallback(async () => {
     try {
-      if (processingModeRef.current === "local") {
-        const items = await getDesktopBridge()?.localCpu?.history?.();
+      if (processingModeRef.current !== "online") {
+        const items = processingModeRef.current === "local_gpu"
+          ? await getDesktopBridge()?.localGpu?.history?.()
+          : await getDesktopBridge()?.localCpu?.history?.();
         setHistory((items || []) as VideoListItem[]);
       } else {
         const response = await apiClient.getUploadedVideosList();
@@ -77,8 +85,10 @@ export default function WindowsCameraDesktop() {
       for (let index = 0; index < videos.length; index += 1) {
         const video = videos[index];
         setMessage(`Анализируем ${index + 1} из ${videos.length}: ${video.original_filename || video.filename}`);
-        if (processingModeRef.current === "local") {
-          const local = await getDesktopBridge()?.localCpu?.process(video);
+        if (processingModeRef.current !== "online") {
+          const local = processingModeRef.current === "local_gpu"
+            ? await getDesktopBridge()?.localGpu?.process(video)
+            : await getDesktopBridge()?.localCpu?.process(video);
           const nextTrajectory = getDesktopTrajectory((local as VideoAnalysisResult | undefined)?.data, video.video_id);
           if (!nextTrajectory.length) throw new Error("Не удалось построить траекторию для этого видео");
           setTrajectories((current) => [...current, ...nextTrajectory]);
@@ -178,8 +188,10 @@ export default function WindowsCameraDesktop() {
 
   const openHistoryItem = async (video: VideoListItem) => {
     try {
-      const result = processingModeRef.current === "local"
-        ? await getDesktopBridge()?.localCpu?.analysis(video.video_id) as { data?: VideoAnalysisResult["data"] }
+      const result = processingModeRef.current !== "online"
+        ? processingModeRef.current === "local_gpu"
+          ? await getDesktopBridge()?.localGpu?.analysis(video.video_id) as { data?: VideoAnalysisResult["data"] }
+          : await getDesktopBridge()?.localCpu?.analysis(video.video_id) as { data?: VideoAnalysisResult["data"] }
         : await apiClient.getVideoAnalysis(video.video_id);
       if (!result) throw new Error("Результат анализа не найден");
       const next = getDesktopTrajectory(result.data, video.video_id);
@@ -195,6 +207,25 @@ export default function WindowsCameraDesktop() {
     }
   };
 
+  const downloadLogs = async () => {
+    const download = getDesktopBridge()?.logs?.download;
+    if (!download) {
+      toast.error("Экспорт логов доступен только в приложении TrackAI для Windows.");
+      return;
+    }
+    setLogsDownloading(true);
+    try {
+      const result = await download();
+      if (result.ok) {
+        toast.success(`Логи сохранены: ${result.fileName || "TrackAI-logs.zip"}`);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Не удалось сохранить логи");
+    } finally {
+      setLogsDownloading(false);
+    }
+  };
+
   const busy = ["looking", "copying", "processing"].includes(state);
   const buttonText = busy ? "Выполняется" : "Загрузить";
 
@@ -202,13 +233,19 @@ export default function WindowsCameraDesktop() {
     <main className="min-h-[100dvh] bg-slate-50 text-slate-950">
       <header className="flex h-16 items-center justify-between border-b border-slate-200 bg-slate-50 px-6">
         <div className="flex items-center gap-3 font-semibold tracking-tight"><MapPinned className="h-5 w-5 text-teal-700" />TrackAI</div>
-        <div className="relative">
-          <Button variant="ghost" className="gap-2 text-slate-700 hover:bg-slate-200 hover:text-slate-950" onClick={() => { setHistoryOpen((open) => !open); void refreshHistory(); }}>
-            <History className="h-4 w-4" />История<ChevronDown className="h-4 w-4" />
+        <div className="flex items-center gap-2">
+          <Button variant="outline" className="gap-2 border-slate-300 bg-white text-slate-700 hover:bg-slate-200 hover:text-slate-950" disabled={logsDownloading} onClick={() => void downloadLogs()}>
+            {logsDownloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+            СКАЧАТЬ ЛОГИ
           </Button>
-          {historyOpen && <div className="absolute right-0 top-11 z-10 w-96 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-xl shadow-slate-300/40">
-            {history.length ? history.slice(0, 12).map((video) => <button key={video.video_id} onClick={() => void openHistoryItem(video)} className="block w-full border-b border-slate-200 px-4 py-3 text-left text-sm last:border-0 hover:bg-slate-100"><span className="block truncate text-slate-900">{video.filename}</span><span className="text-xs text-slate-500">{video.has_analysis ? "Траектория готова" : "В обработке"}</span></button>) : <p className="px-4 py-5 text-sm text-slate-500">История пока пуста</p>}
-          </div>}
+          <div className="relative">
+            <Button variant="ghost" className="gap-2 text-slate-700 hover:bg-slate-200 hover:text-slate-950" onClick={() => { setHistoryOpen((open) => !open); void refreshHistory(); }}>
+              <History className="h-4 w-4" />История<ChevronDown className="h-4 w-4" />
+            </Button>
+            {historyOpen && <div className="absolute right-0 top-11 z-10 w-96 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 shadow-xl shadow-slate-300/40">
+              {history.length ? history.slice(0, 12).map((video) => <button key={video.video_id} onClick={() => void openHistoryItem(video)} className="block w-full border-b border-slate-200 px-4 py-3 text-left text-sm last:border-0 hover:bg-slate-100"><span className="block truncate text-slate-900">{video.filename}</span><span className="text-xs text-slate-500">{video.has_analysis ? "Траектория готова" : "В обработке"}</span></button>) : <p className="px-4 py-5 text-sm text-slate-500">История пока пуста</p>}
+            </div>}
+          </div>
         </div>
       </header>
 

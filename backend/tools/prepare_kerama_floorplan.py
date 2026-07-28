@@ -4,9 +4,9 @@
 Usage:
   python backend/tools/prepare_kerama_floorplan.py ORIGINAL.pdf MARKED.pdf
 
-The marked PDF is the canonical plan displayed by the service.  The original
-PDF is used only to isolate the user's added red no-go annotation from red
-labels that were already present in the CAD drawing.
+MARKED.pdf can be either the original plan with annotations added, or a
+dedicated semantic mask where red is blocked and green is walkable.  In the
+semantic-mask case ORIGINAL.pdf remains the user-facing floor plan.
 """
 
 from __future__ import annotations
@@ -61,10 +61,25 @@ def main() -> None:
 
         red = (marked[:, :, 0] > 190) & (marked[:, :, 1] < 130) & (marked[:, :, 2] < 130)
         original_red = (original[:, :, 0] > 190) & (original[:, :, 1] < 130) & (original[:, :, 2] < 130)
+        green = (
+            (marked[:, :, 1] > 190)
+            & (marked[:, :, 0] < 130)
+            & (marked[:, :, 2] < 130)
+        )
+        original_green = (
+            (original[:, :, 1] > 190)
+            & (original[:, :, 0] < 130)
+            & (original[:, :, 2] < 130)
+        )
+        semantic_mask_mode = bool(red.mean() > 0.50 and green.mean() > 0.01)
         changed = np.max(np.abs(original.astype(np.int16) - marked.astype(np.int16)), axis=2) > 40
-        seed = red & changed & ~original_red
+        seed = red if semantic_mask_mode else red & changed & ~original_red
         neighbourhood = ndimage.binary_dilation(seed, iterations=2)
-        mask = red & changed & (~original_red | neighbourhood)
+        mask = (
+            red
+            if semantic_mask_mode
+            else red & changed & (~original_red | neighbourhood)
+        )
         labels, count = ndimage.label(mask)
         ids, sizes = np.unique(labels, return_counts=True)
         keep = ids[(ids != 0) & (sizes >= 20)]
@@ -88,17 +103,7 @@ def main() -> None:
         # and dilation bridge antialiasing/text holes in the painted corridor;
         # the red obstacle mask is still applied afterwards and therefore has
         # final authority wherever the annotations overlap.
-        green = (
-            (marked[:, :, 1] > 190)
-            & (marked[:, :, 0] < 130)
-            & (marked[:, :, 2] < 130)
-        )
-        original_green = (
-            (original[:, :, 1] > 190)
-            & (original[:, :, 0] < 130)
-            & (original[:, :, 2] < 130)
-        )
-        green_seed = green & changed & ~original_green
+        green_seed = green if semantic_mask_mode else green & changed & ~original_green
         green_labels, _ = ndimage.label(green_seed)
         green_ids, green_sizes = np.unique(green_labels, return_counts=True)
         green_keep = green_ids[(green_ids != 0) & (green_sizes >= 20)]
@@ -131,7 +136,11 @@ def main() -> None:
         )
 
         display_path = PUBLIC / "kerama-marazzi-2025.png"
-        marked_image.save(display_path, optimize=True)
+        (
+            Image.fromarray(original)
+            if semantic_mask_mode
+            else marked_image
+        ).save(display_path, optimize=True)
         obstacle_path = BACKEND / "kerama_marazzi_2025_obstacles.png"
 
         # A distance halo around every CAD primitive is not a walkability
@@ -188,7 +197,9 @@ def main() -> None:
         )
 
     source_pdf = PUBLIC / "kerama-marazzi-2025.pdf"
-    source_pdf.write_bytes(marked_pdf.read_bytes())
+    source_pdf.write_bytes(
+        original_pdf.read_bytes() if semantic_mask_mode else marked_pdf.read_bytes()
+    )
     x1, y1, x2, y2 = OFFICE_INTERIOR
     office_pixels = (x2 - x1) * (y2 - y1)
     metadata = {
@@ -226,13 +237,21 @@ def main() -> None:
             "green_corridor_margin_pixels": green_corridor_margin_pixels,
         },
         "source_pdf_sha256": hashlib.sha256(source_pdf.read_bytes()).hexdigest(),
+        "mask_pdf_sha256": hashlib.sha256(marked_pdf.read_bytes()).hexdigest(),
+        "mask_input_mode": (
+            "semantic_red_green_pdf" if semantic_mask_mode else "overlay_annotations"
+        ),
         "display_image_sha256": hashlib.sha256(display_path.read_bytes()).hexdigest(),
         "source_pdf": source_pdf.name,
         "display_image": display_path.name,
         "annotation_component_count": int(len(keep)),
         "annotation_pixel_count": int(mask.sum()),
         "obstacle_annotation": {
-            "method": "changed_red_operator_annotation",
+            "method": (
+                "semantic_red_mask"
+                if semantic_mask_mode
+                else "changed_red_operator_annotation"
+            ),
             "boundary_cleanup_pixels": red_boundary_cleanup_pixels,
             "physical_person_halo_applied_by_engine": True,
             "remaining_red_is_absolute": True,
@@ -240,7 +259,11 @@ def main() -> None:
             "route_specific_overrides": False,
         },
         "walkable_annotation": {
-            "method": "changed_green_operator_annotation",
+            "method": (
+                "semantic_green_mask"
+                if semantic_mask_mode
+                else "changed_green_operator_annotation"
+            ),
             "component_count": int(len(green_keep)),
             "pixel_count": int(green_mask.sum()),
             "support_pixels_added": int(np.count_nonzero(green_support)),

@@ -109,6 +109,40 @@ export interface VideoAnalysisResult {
   message: string;
 }
 
+export interface FloorplanGraphNode {
+  id: string;
+  kind: 'junction' | 'endpoint' | 'manual';
+  x: number;
+  y: number;
+  degree: number;
+  enabled: boolean;
+}
+
+export interface FloorplanGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  points: number[][];
+  length_meters: number;
+  minimum_width_meters: number | null;
+  median_width_meters: number | null;
+  bidirectional: boolean;
+  enabled: boolean;
+}
+
+export interface FloorplanTopologyGraph {
+  schema_version: 'trackai.floorplan_graph.v1';
+  map_id: string;
+  coordinate_system: 'plan_pixels_x_right_y_down';
+  width: number;
+  height: number;
+  meters_per_pixel: number;
+  source: Record<string, string | number>;
+  nodes: FloorplanGraphNode[];
+  edges: FloorplanGraphEdge[];
+  validation: Record<string, number>;
+}
+
 export type R3TrajectorySource = "raw" | "robust_candidate" | "scale_aware_candidate";
 
 export interface TrackingOptions {
@@ -449,6 +483,29 @@ export class ApiClient {
       throw new Error('Failed to fetch admin tasks');
     }
     return response.json();
+  }
+
+  async generateFloorplanTopologyGraph(
+    mapId: string,
+    minimumEdgeMeters = 1.5,
+    graphScalePixels = 8,
+  ): Promise<FloorplanTopologyGraph> {
+    const query = new URLSearchParams({
+      minimum_edge_meters: String(minimumEdgeMeters),
+      graph_scale_pixels: String(graphScalePixels),
+    });
+    const response = await agentFetch(
+      `${this.baseUrl}/api/admin/floorplans/${mapId}/topology-graph?${query}`,
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || 'Не удалось построить граф проходов');
+    }
+    return response.json();
+  }
+
+  getFloorplanSupportMaskUrl(mapId: string): string {
+    return `${this.baseUrl}/api/admin/floorplans/${mapId}/support-mask.png`;
   }
 
   async getAdminTask(id: string): Promise<TrackingTask> {

@@ -1,7 +1,10 @@
 const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const path = require('path');
 const { createCameraImportService } = require('./cameraImport.cjs');
+const { createDesktopLogService } = require('./desktopLogs.cjs');
 const localCpuTracker = require('./localCpuTracker.cjs');
+const localGpuRuntime = require('./localGpuRuntime.cjs');
+const adminMirror = require('./adminMirror.cjs');
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 const APP_URL = 'http://93.189.231.189';
@@ -9,7 +12,8 @@ const DESKTOP_APP_URL = `${APP_URL}/trajectory?desktop=1`;
 
 let mainWindow = null;
 let cameraImportService = null;
-let processingMode = 'online';
+let desktopLogs = null;
+let processingMode = 'local_cpu';
 
 const cameraImportSettings = {
   enabled: false,
@@ -25,15 +29,25 @@ function broadcastToRenderer(channel, payload) {
 function setupCameraImport() {
   cameraImportService = createCameraImportService({
     serverUrl: APP_URL,
-    importFile: (input) => processingMode === 'local'
-      ? localCpuTracker.copyToLocal(input)
-      : require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input }),
+    importFile: async (input) => {
+      if (processingMode === 'online') {
+        return require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input });
+      }
+      const copied = await localCpuTracker.copyToLocal(input);
+      adminMirror.enqueueVideo(copied);
+      void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
+      return copied;
+    },
     getOwnerName: () => cameraImportSettings.ownerName,
     isEnabled: () => cameraImportSettings.enabled,
     onStatus: (status) => broadcastToRenderer('camera-import:status', status),
     onProgress: (progress) => broadcastToRenderer('camera-import:progress', progress),
-    onBatchComplete: (uploaded) => broadcastToRenderer('camera-import:complete', uploaded),
+    onBatchComplete: (uploaded) => {
+      desktopLogs?.log('info', 'camera-import:batch-complete', { count: uploaded.length });
+      broadcastToRenderer('camera-import:complete', uploaded);
+    },
     onError: (error) => {
+      desktopLogs?.log('error', 'camera-import:error', error);
       broadcastToRenderer('camera-import:error', {
         message: error instanceof Error ? error.message : String(error),
       });
@@ -69,19 +83,43 @@ function setupCameraImport() {
   ipcMain.handle('camera-import:get-status', () => cameraImportService.getStatus());
 
   ipcMain.handle('processing:resolve-mode', async () => {
+    const gpu = await localGpuRuntime.start((level, event, data) => desktopLogs?.log(level, event, data));
+    if (gpu.ready) {
+      processingMode = 'local_gpu';
+      desktopLogs?.log('info', 'processing:mode-resolved', {
+        mode: processingMode,
+        gpu_memory_mb: gpu.gpu?.memoryMb,
+        cuda_runtime: gpu.health?.cuda_runtime,
+      });
+      return { mode: processingMode, label: 'Локально' };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
     try {
       const response = await fetch(`${APP_URL}/api/health`, { signal: controller.signal });
-      processingMode = response.ok ? 'online' : 'local';
+      processingMode = response.ok ? 'online' : 'local_cpu';
     } catch {
-      processingMode = 'local';
+      processingMode = 'local_cpu';
     } finally {
       clearTimeout(timer);
     }
-    return { mode: processingMode, label: processingMode === 'online' ? 'RTX 3090' : 'Локально (CPU)' };
+    desktopLogs?.log('info', 'processing:mode-resolved', { mode: processingMode });
+    return { mode: processingMode, label: processingMode === 'online' ? 'Сетевая обработка' : 'Локально' };
   });
-  ipcMain.handle('local-cpu:process', (_event, video) => localCpuTracker.processLocalVideo(video));
+  ipcMain.handle('local-gpu:process', async (_event, video) => {
+    const result = await localGpuRuntime.processVideo(video);
+    adminMirror.enqueueResult(video.video_id, result.data);
+    void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
+    return result;
+  });
+  ipcMain.handle('local-gpu:history', () => localGpuRuntime.getHistory());
+  ipcMain.handle('local-gpu:analysis', (_event, videoId) => localGpuRuntime.getAnalysis(videoId));
+  ipcMain.handle('local-cpu:process', async (_event, video) => {
+    const result = await localCpuTracker.processLocalVideo(video);
+    adminMirror.enqueueResult(video.video_id, result.data);
+    void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
+    return result;
+  });
   ipcMain.handle('local-cpu:history', () => localCpuTracker.getHistory());
   ipcMain.handle('local-cpu:analysis', (_event, videoId) => localCpuTracker.getAnalysis(videoId));
 
@@ -145,8 +183,12 @@ function createWindow() {
     show: false,
     backgroundColor: '#07111f',
   });
+  desktopLogs?.attachWindow(mainWindow);
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    desktopLogs?.log('info', 'window:ready-to-show');
+    mainWindow.show();
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (!url.startsWith(APP_URL)) {
@@ -165,6 +207,11 @@ function createWindow() {
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, url, isMainFrame) => {
     if (!isMainFrame || errorCode === -3) return;
+    desktopLogs?.log('error', 'window:did-fail-load', {
+      errorCode,
+      errorDescription,
+      url,
+    });
     dialog.showMessageBox(mainWindow, {
       type: 'error',
       title: 'TrackAI недоступен',
@@ -190,7 +237,14 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  desktopLogs = createDesktopLogService({
+    app,
+    dialog,
+    getProcessingMode: () => processingMode,
+  });
+  ipcMain.handle('logs:download', () => desktopLogs.download(mainWindow));
   setupCameraImport();
+  void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
   createWindow();
 });
 
@@ -198,6 +252,7 @@ app.on('window-all-closed', () => {
   if (cameraImportService) {
     cameraImportService.stop();
   }
+  localGpuRuntime.stop();
   if (process.platform !== 'darwin') {
     app.quit();
   }

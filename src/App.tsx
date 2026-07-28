@@ -10,6 +10,7 @@ import TrajectoryAnalysis from "./pages/TrajectoryAnalysis";
 import Support from "./pages/Support";
 import Download from "./pages/Download";
 import Admin from "./pages/Admin";
+import AdminGraphEditor from "./pages/AdminGraphEditor";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -23,6 +24,7 @@ const AppRoutes = () => (
     <Route path="/support" element={<Support />} />
     <Route path="/download" element={<Download />} />
     <Route path="/admin" element={<Admin />} />
+    <Route path="/admin/graph-editor" element={<AdminGraphEditor />} />
     <Route path="/admin-desktop" element={<Admin />} />
     <Route path="/admin-desctop" element={<Admin />} />
     <Route path="*" element={<NotFound />} />

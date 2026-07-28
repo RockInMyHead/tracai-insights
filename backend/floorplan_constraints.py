@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_operator_left_route_local_repair_v30"
+    "kerama_corridor_graph_turn_events_branch_commitment_v32"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -58,9 +58,22 @@ MAX_LOCAL_MAP_CORRECTION_HARD_METERS = 6.0
 # One metre plus one grid-quantisation allowance (4 px ~= 0.20 m).
 MASK_LOCAL_REPAIR_LIMIT_METERS = 1.05
 MASK_LOCAL_REPAIR_HARD_LIMIT_METERS = 1.5
+# Graph map-matching is a different estimator from local obstacle repair.  It
+# may select another part of the same connected aisle network, but only while
+# the mapped curve still agrees with the observation's metric length and turn
+# sequence.  These are hard plausibility bounds, not a search radius.
+GRAPH_MAP_MATCH_P95_CORRECTION_METERS = 12.0
+GRAPH_MAP_MATCH_HARD_CORRECTION_METERS = 18.0
+GRAPH_MAP_MATCH_MIN_OBSERVATIONS = 8
+GRAPH_MAP_MATCH_TARGET_ACTIVE_SPEED_RATIO = 0.50
+GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR = 1.00
 TURN_TOPOLOGY_MIN_DEGREES = 18.0
 MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES = 28.0
 MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO = 0.0
+MAX_TURN_EVENT_COUNT_DELTA = 2
+MAX_TURN_EVENT_ARC_SHIFT = 0.12
+AUTHORITATIVE_MIN_SELECTION_MARGIN = 0.18
+AUTHORITATIVE_MAX_AMBIGUOUS_ENDPOINT_METERS = 3.0
 MAX_AUTHORITATIVE_SHARP_REVERSE_RATIO = 0.18
 INDEPENDENT_LOOP_CLOSED_MIN_LENGTH_RATIO = 0.65
 STANDARD_YAW_OFFSETS_DEGREES = (
@@ -83,6 +96,7 @@ INDEPENDENT_MAX_AMBIGUOUS_SCALE_RATIO = 1.18
 MAX_START_SNAP_METERS = 1.50
 MAX_PUBLISHED_START_ERROR_METERS = 0.05
 MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES = 5.0
+GRAPH_MAP_MATCH_MAX_INITIAL_DIRECTION_ERROR_DEGREES = 10.0
 MAX_PUBLISHED_SEGMENT_METERS = 0.75
 
 
@@ -155,6 +169,69 @@ def _normalise_points(value: Any) -> np.ndarray:
         if all(math.isfinite(component) for component in point):
             points.append(point)
     return np.asarray(points, dtype=np.float64)
+
+
+def _stabilize_authoritative_map_observation(
+    points: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Extract plant-scale motion from a long, high-rate R3 polyline.
+
+    R3 remains the published observation. This filtered copy is used only by
+    map estimation so frame-to-frame pose jitter cannot masquerade as aisle
+    length or hundreds of alternating turns. A symmetric Gaussian preserves
+    temporal order; an affine endpoint correction locks both endpoints.
+    """
+    raw = np.asarray(points, dtype=np.float64)
+    diagnostics: dict[str, Any] = {
+        "method": "endpoint_locked_gaussian_macro_motion_v1",
+        "applied": False,
+        "point_count": int(len(raw)),
+    }
+    if len(raw) < 120:
+        return raw.copy(), diagnostics
+
+    sigma = min(24.0, max(2.0, len(raw) / 250.0))
+    filtered = ndimage.gaussian_filter1d(
+        raw, sigma=sigma, axis=0, mode="nearest"
+    )
+    fractions = np.linspace(0.0, 1.0, len(raw))[:, None]
+    filtered += (
+        (1.0 - fractions) * (raw[0] - filtered[0])
+        + fractions * (raw[-1] - filtered[-1])
+    )
+    raw_length = _polyline_length(raw)
+    filtered_length = _polyline_length(filtered)
+    span = max(float(np.linalg.norm(np.ptp(raw, axis=0))), 1e-9)
+    maximum_shift = float(np.max(np.linalg.norm(filtered - raw, axis=1)))
+    noise_length_ratio = raw_length / max(filtered_length, 1e-12)
+    turn_preservation = _turn_topology_metrics(raw, filtered)
+    turn_events_preserved = bool(
+        float(turn_preservation["mean_abs_turn_error_degrees"])
+        <= MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES
+        and float(turn_preservation["sign_mismatch_ratio"])
+        <= MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO
+        and int(turn_preservation["event_count_delta"])
+        <= MAX_TURN_EVENT_COUNT_DELTA
+    )
+    safe = bool(
+        filtered_length > 1e-9
+        and maximum_shift <= span * 0.04
+        and noise_length_ratio >= 1.08
+    )
+    diagnostics.update({
+        "applied": safe,
+        "sigma_observations": round(float(sigma), 3),
+        "raw_length_units": round(raw_length, 8),
+        "macro_length_units": round(
+            filtered_length if safe else raw_length, 8
+        ),
+        "noise_length_ratio": round(noise_length_ratio, 6),
+        "maximum_filter_shift_units": round(maximum_shift, 8),
+        "endpoint_locked": True,
+        "turn_events_preserved": turn_events_preserved,
+        "turn_event_comparison": turn_preservation,
+    })
+    return (filtered if safe else raw.copy()), diagnostics
 
 
 def _polyline_length(points: np.ndarray) -> float:
@@ -244,6 +321,11 @@ def _turn_topology_metrics(
             "mean_abs_turn_error_degrees": 0.0,
             "max_abs_turn_error_degrees": 0.0,
             "sign_mismatch_ratio": 0.0,
+            "source_event_count": 0,
+            "corrected_event_count": 0,
+            "event_count_delta": 0,
+            "maximum_event_arc_shift": 0.0,
+            "event_sequence_preserved": True,
         }
     if len(corrected) < 2:
         return {
@@ -251,6 +333,11 @@ def _turn_topology_metrics(
             "mean_abs_turn_error_degrees": 180.0,
             "max_abs_turn_error_degrees": 180.0,
             "sign_mismatch_ratio": 1.0,
+            "source_event_count": 0,
+            "corrected_event_count": 0,
+            "event_count_delta": 0,
+            "maximum_event_arc_shift": 1.0,
+            "event_sequence_preserved": False,
         }
     fractions = np.linspace(0.0, 1.0, int(samples))
     source_points = _resample_polyline(source, fractions)
@@ -306,6 +393,14 @@ def _turn_topology_metrics(
             "mean_abs_turn_error_degrees": 0.0,
             "max_abs_turn_error_degrees": 0.0,
             "sign_mismatch_ratio": 0.0,
+            "source_event_count": 0,
+            "corrected_event_count": len(corrected_events),
+            "event_count_delta": len(corrected_events),
+            "maximum_event_arc_shift": 0.0,
+            # A straight observation may legitimately acquire two same-area
+            # detour corners while going around one obstacle. With no measured
+            # source event there is no left/right sequence to substitute.
+            "event_sequence_preserved": True,
         }
 
     # Match events in order and tolerate a local arc-length displacement.
@@ -314,6 +409,7 @@ def _turn_topology_metrics(
     cursor = 0
     errors: list[float] = []
     mismatches = 0
+    matched_arc_shifts: list[float] = []
     for source_fraction, source_angle in source_events:
         candidates = [
             (candidate_index, event)
@@ -336,15 +432,30 @@ def _turn_topology_metrics(
             ),
         )
         cursor = best_index + 1
+        matched_arc_shifts.append(abs(float(corrected_events[best_index][0] - source_fraction)))
         delta = (corrected_angle - source_angle + 180.0) % 360.0 - 180.0
         errors.append(abs(float(delta)))
         mismatches += int(np.sign(corrected_angle) != np.sign(source_angle))
 
+    event_count_delta = abs(len(corrected_events) - len(source_events))
+    mean_error = float(np.mean(errors))
+    sign_mismatch_ratio = float(mismatches / len(source_events))
+    maximum_arc_shift = max(matched_arc_shifts, default=1.0)
     return {
         "turn_count": len(source_events),
-        "mean_abs_turn_error_degrees": float(np.mean(errors)),
+        "mean_abs_turn_error_degrees": mean_error,
         "max_abs_turn_error_degrees": float(np.max(errors)),
-        "sign_mismatch_ratio": float(mismatches / len(source_events)),
+        "sign_mismatch_ratio": sign_mismatch_ratio,
+        "source_event_count": len(source_events),
+        "corrected_event_count": len(corrected_events),
+        "event_count_delta": event_count_delta,
+        "maximum_event_arc_shift": maximum_arc_shift,
+        "event_sequence_preserved": bool(
+            mean_error <= MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES
+            and sign_mismatch_ratio <= MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO
+            and event_count_delta <= MAX_TURN_EVENT_COUNT_DELTA
+            and maximum_arc_shift <= MAX_TURN_EVENT_ARC_SHIFT
+        ),
     }
 
 
@@ -799,7 +910,11 @@ class FloorplanConstraintEngine:
         # Quarter-cell sampling is deliberately shared with line-of-sight
         # validation.  Coarser, differently phased samples can miss one grid
         # cell and falsely certify a diagonal that clips a machine corner.
-        spacing = max(self.config.grid_cell_pixels * 0.25, 0.5)
+        # Half-pixel phasing catches a one-cell diagonal corner even when the
+        # segment crosses it exactly at the midpoint. Quarter-cell-of-grid
+        # sampling (1 px on the production 4 px grid) could skip that cell,
+        # while later densification materialised the missed midpoint.
+        spacing = max(self.config.grid_cell_pixels * 0.125, 0.5)
         samples: list[np.ndarray] = [points[0]]
         for start, end in zip(points[:-1], points[1:]):
             count = max(1, int(math.ceil(float(np.linalg.norm(end - start)) / spacing)))
@@ -1148,6 +1263,31 @@ class FloorplanConstraintEngine:
                         candidate -= 1
                     simplified.append(route[candidate])
                     anchor = candidate
+                # Grid search runs between cell centres, but callers stitch
+                # this route into a continuous measured polyline. Reattach
+                # the exact free endpoints through verified sub-cell
+                # connectors so quantisation cannot create a new collision at
+                # either splice (or move the operator's start anchor).
+                if (
+                    not self._point_occupied(start_point)
+                    and float(np.linalg.norm(
+                        np.asarray(start_point) - simplified[0]
+                    )) > 1e-9
+                    and not self._segment_collides(
+                        np.asarray(start_point), simplified[0]
+                    )
+                ):
+                    simplified.insert(0, np.asarray(start_point).copy())
+                if (
+                    not self._point_occupied(end_point)
+                    and float(np.linalg.norm(
+                        np.asarray(end_point) - simplified[-1]
+                    )) > 1e-9
+                    and not self._segment_collides(
+                        simplified[-1], np.asarray(end_point)
+                    )
+                ):
+                    simplified.append(np.asarray(end_point).copy())
                 return np.asarray(simplified, dtype=np.float64)
             for dx, dy, step in neighbors:
                 nx, ny = current[0] + dx, current[1] + dy
@@ -1687,6 +1827,7 @@ class FloorplanConstraintEngine:
             }
         radius_pixels = radius_meters / max(self.config.meters_per_pixel, 1e-9)
         edge_cache: dict[tuple[int, int, int], float] = {}
+        edge_route_cache: dict[tuple[int, int, int], np.ndarray] = {}
         routed_edge_count = 0
 
         def edge(layer: int, left: int, right: int) -> float:
@@ -1695,7 +1836,28 @@ class FloorplanConstraintEngine:
             if key in edge_cache:
                 return edge_cache[key]
             start, end = states[layer - 1][left], states[layer][right]
+            visual = observed[layer] - observed[layer - 1]
+            mapped = end - start
+            visual_length = max(float(np.linalg.norm(visual)), 1e-6)
+            mapped_chord_length = max(float(np.linalg.norm(mapped)), 1e-6)
+            direction_cosine = float(np.clip(
+                np.dot(visual, mapped)
+                / (visual_length * mapped_chord_length),
+                -1.0,
+                1.0,
+            ))
+            chord_ratio = mapped_chord_length / visual_length
+            # Cheap geometric pruning must happen before A*: candidates that
+            # already disagree in chord scale/direction cannot become valid by
+            # adding a more expensive detour.
+            if (
+                not 0.10 <= chord_ratio <= 5.00
+                or direction_cosine < -0.75
+            ):
+                edge_cache[key] = float("inf")
+                return float("inf")
             routed_edge = False
+            routed_path: Optional[np.ndarray] = None
             if self._segment_collides(start, end):
                 start_cell = self._nearest_free(self._pixel_to_cell(start))
                 end_cell = self._nearest_free(self._pixel_to_cell(end))
@@ -1711,17 +1873,56 @@ class FloorplanConstraintEngine:
                     edge_cache[key] = value
                     return value
                 routed_edge = True
-                routed_edge_count += 1
-            visual = observed[layer] - observed[layer - 1]
-            mapped = end - start
-            visual_length = max(float(np.linalg.norm(visual)), 1e-6)
-            mapped_length = max(float(np.linalg.norm(mapped)), 1e-6)
-            cosine = float(np.clip(
-                np.dot(visual, mapped) / (visual_length * mapped_length), -1.0, 1.0
-            ))
+                observed_edge = np.vstack((
+                    observed[layer - 1], observed[layer]
+                ))
+                for margin_meters in (6.0,):
+                    margin_cells = max(
+                        2,
+                        int(math.ceil(
+                            margin_meters / max(self.cell_meters, 1e-9)
+                        )),
+                    )
+                    candidate_route = self._astar(
+                        start,
+                        end,
+                        observed_edge,
+                        _search_margin_cells=margin_cells,
+                    )
+                    if candidate_route is None:
+                        continue
+                    detour = self._detour_metrics(
+                        candidate_route, start, end, observed_edge
+                    )
+                    if (
+                        layer > 1
+                        and bool(detour["spike"])
+                    ):
+                        continue
+                    routed_path = candidate_route
+                    break
+                if routed_path is None:
+                    value = float("inf")
+                    edge_cache[key] = value
+                    return value
+                edge_route_cache[key] = routed_path
+            mapped_length = max(
+                _polyline_length(routed_path)
+                if routed_path is not None
+                else float(np.linalg.norm(mapped)),
+                1e-6,
+            )
+            if (
+                layer == 1
+                and math.degrees(math.acos(direction_cosine))
+                > GRAPH_MAP_MATCH_MAX_INITIAL_DIRECTION_ERROR_DEGREES
+            ):
+                value = float("inf")
+                edge_cache[key] = value
+                return value
             value = (
                 1.35 * abs(math.log(mapped_length / visual_length))
-                + 1.7 * (1.0 - cosine)
+                + 1.7 * (1.0 - direction_cosine)
                 + (0.65 if routed_edge else 0.0)
             )
             edge_cache[key] = value
@@ -1729,10 +1930,18 @@ class FloorplanConstraintEngine:
 
         def emission(layer: int, state: int) -> float:
             point = states[layer][state]
-            value = 0.7 * (
+            observation_error = (
                 float(np.linalg.norm(point - observed[layer]))
                 / max(radius_pixels, 1.0)
-            ) ** 2
+            )
+            guide_error = (
+                float(np.linalg.norm(point - guided[layer]))
+                / max(radius_pixels, 1.0)
+            )
+            # The guide represents the branch selected at the previous level.
+            # Keeping a separate guide term prevents a state from hopping to a
+            # nearby parallel aisle merely because both are close to R3.
+            value = 0.7 * observation_error ** 2 + 0.45 * guide_error ** 2
             x, y = self._pixel_to_cell(point)
             return value + 0.08 * math.exp(
                 -float(self.clearance_meters[y, x]) / 0.45
@@ -1770,12 +1979,31 @@ class FloorplanConstraintEngine:
                 and abs(mapped_turn) >= math.radians(12.0)
                 and visual_turn * mapped_turn < 0.0
             ):
-                value += 1.50
+                # Local anchor turns are noisy; make the opposite sign very
+                # expensive but keep the dynamic programme connected. The
+                # complete discrete turn-event sequence remains a hard gate
+                # after route reconstruction.
+                value += 4.0
             if (
                 abs(mapped_turn) >= math.radians(150.0)
                 and abs(visual_turn) <= math.radians(90.0)
             ):
                 value += 2.00
+            # Branch commitment: on parallel aisles the correction vector is
+            # approximately lateral. A sudden reversal or large jump of that
+            # vector is a branch switch, not ordinary observation noise.
+            prior_correction = states[layer - 1][left] - observed[layer - 1]
+            next_correction = states[layer][right] - observed[layer]
+            correction_jump = float(np.linalg.norm(
+                next_correction - prior_correction
+            )) / max(radius_pixels, 1.0)
+            value += 1.35 * correction_jump
+            if (
+                np.linalg.norm(prior_correction) > radius_pixels * 0.18
+                and np.linalg.norm(next_correction) > radius_pixels * 0.18
+                and float(np.dot(prior_correction, next_correction)) < 0.0
+            ):
+                value += 2.25
             return value
 
         initial_costs = np.asarray([emission(0, index) for index in range(len(states[0]))])
@@ -1831,17 +2059,94 @@ class FloorplanConstraintEngine:
                 pair_costs = next_costs
 
             flat_ranking = np.argsort(pair_costs, axis=None)
-            best_flat = int(flat_ranking[0])
-            left, right = np.unravel_index(best_flat, pair_costs.shape)
-            indices = [int(left), int(right)]
-            for parent in reversed(parents):
-                grand = int(parent[indices[0], indices[1]])
-                if grand < 0:
-                    return None, {"reason": "viterbi_backtrack_failed"}
-                indices.insert(0, grand)
+            terminal_candidates: list[
+                tuple[tuple[float, float, float, float], list[int], int]
+            ] = []
+            for ranked_flat in flat_ranking[: min(100, len(flat_ranking))]:
+                ranked_flat = int(ranked_flat)
+                if not math.isfinite(float(pair_costs.reshape(-1)[ranked_flat])):
+                    continue
+                left, right = np.unravel_index(
+                    ranked_flat, pair_costs.shape
+                )
+                candidate_indices = [int(left), int(right)]
+                valid_backtrack = True
+                for parent in reversed(parents):
+                    grand = int(parent[
+                        candidate_indices[0], candidate_indices[1]
+                    ])
+                    if grand < 0:
+                        valid_backtrack = False
+                        break
+                    candidate_indices.insert(0, grand)
+                if not valid_backtrack:
+                    continue
+                candidate_path = np.asarray([
+                    states[layer][candidate_indices[layer]]
+                    for layer in range(len(states))
+                ])
+                topology = _turn_topology_metrics(
+                    observed, candidate_path, samples=96
+                )
+                terminal_candidates.append((
+                    (
+                        0.0
+                        if bool(topology["event_sequence_preserved"])
+                        else 1.0,
+                        float(topology["sign_mismatch_ratio"]),
+                        float(topology["mean_abs_turn_error_degrees"]),
+                        float(pair_costs.reshape(-1)[ranked_flat]),
+                    ),
+                    candidate_indices,
+                    ranked_flat,
+                ))
+            if not terminal_candidates:
+                return None, {"reason": "viterbi_backtrack_failed"}
+            _, indices, selected_flat = min(
+                terminal_candidates, key=lambda item: item[0]
+            )
             ranking = flat_ranking
             final_costs = pair_costs.reshape(-1)
+            selected_objective = float(final_costs[selected_flat])
+            selected_rank = int(np.where(flat_ranking == selected_flat)[0][0])
+            terminal_candidates_evaluated = len(terminal_candidates)
+        if len(states) == 1:
+            selected_objective = float(final_costs[ranking[0]])
+            selected_rank = 0
+            terminal_candidates_evaluated = 1
         path = np.asarray([states[layer][indices[layer]] for layer in range(len(states))])
+        terminal_paths: list[dict[str, Any]] = []
+        if len(states) > 1:
+            for _, candidate_indices, candidate_flat in terminal_candidates:
+                candidate_path = np.asarray([
+                    states[layer][candidate_indices[layer]]
+                    for layer in range(len(states))
+                ])
+                candidate_routes: dict[int, np.ndarray] = {}
+                for layer in range(1, len(candidate_indices)):
+                    route = edge_route_cache.get((
+                        layer,
+                        int(candidate_indices[layer - 1]),
+                        int(candidate_indices[layer]),
+                    ))
+                    if route is not None:
+                        candidate_routes[layer - 1] = route
+                terminal_paths.append({
+                    "path": candidate_path,
+                    "edge_routes": candidate_routes,
+                    "objective": float(final_costs[candidate_flat]),
+                    "cost_rank": int(
+                        np.where(ranking == candidate_flat)[0][0]
+                    ),
+                })
+        selected_edge_routes: dict[int, np.ndarray] = {}
+        for layer in range(1, len(indices)):
+            route = edge_route_cache.get(
+                (layer, int(indices[layer - 1]), int(indices[layer]))
+            )
+            if route is not None:
+                selected_edge_routes[layer - 1] = route
+        routed_edge_count = len(selected_edge_routes)
         margin = (
             float(final_costs[ranking[1]] - final_costs[ranking[0]])
             if len(ranking) > 1 and math.isfinite(float(final_costs[ranking[1]]))
@@ -1849,7 +2154,9 @@ class FloorplanConstraintEngine:
         )
         return path, {
             "reason": None,
-            "objective": round(float(final_costs[ranking[0]]), 6),
+            "objective": round(selected_objective, 6),
+            "viterbi_cost_rank": selected_rank,
+            "terminal_candidates_evaluated": terminal_candidates_evaluated,
             "margin": round(margin, 6) if margin is not None else None,
             "order": 2,
             "anchors": len(fractions),
@@ -1859,6 +2166,8 @@ class FloorplanConstraintEngine:
             "component_routed_edges": routed_edge_count,
             "component_edges_enabled": allow_component_edges,
             "required_component": required_component,
+            "_selected_edge_routes": selected_edge_routes,
+            "_terminal_paths": terminal_paths,
         }
 
     def _multilevel_viterbi_map_match(
@@ -1871,33 +2180,54 @@ class FloorplanConstraintEngine:
         diagnostics: dict[str, Any] = {
             "attempted": True,
             "accepted": False,
-            "method": "corridor_graph_multilevel_viterbi_v3_second_order",
+            "method": "corridor_graph_multilevel_viterbi_v4_turn_events_branch_commitment",
             "corridor_graph_nodes": int(len(self._corridor_nodes)),
         }
         coarse_fractions = self._adaptive_anchor_fractions(observation, maximum=14)
         coarse = None
         coarse_diag: dict[str, Any] = {"reason": "not_attempted"}
         coarse_attempts: list[dict[str, Any]] = []
+        # Always prove that the local corridor cannot explain the observation
+        # before widening into plant-scale branch search.
         search_levels = (
-            ((12.0, 18), (24.0, 22), (40.0, 28))
-            if allow_global_recovery else ((12.0, 18),)
+            (
+                (6.0, 16, False),
+                (12.0, 18, False),
+                (12.0, 10, True),
+                (24.0, 10, True),
+                (40.0, 10, True),
+            )
+            if allow_global_recovery
+            else ((6.0, 16, False), (12.0, 18, False))
         )
-        for radius_meters, candidate_limit in search_levels:
+        for radius_meters, candidate_limit, component_edges in search_levels:
             coarse, coarse_diag = self._viterbi_level(
                 observation,
                 baseline,
                 coarse_fractions,
                 radius_meters=radius_meters,
                 candidate_limit=candidate_limit,
-                allow_component_edges=allow_global_recovery,
+                allow_component_edges=component_edges,
             )
             coarse_attempts.append({
                 "radius_meters": radius_meters,
                 "candidate_limit": candidate_limit,
-                **coarse_diag,
+                "recovery_stage": (
+                    "local_direct_edges" if not component_edges and radius_meters <= 6.0
+                    else "expanded_local_direct_edges" if not component_edges
+                    else "component_edges_after_direct_failure"
+                    if radius_meters <= 12.0
+                    else "global_after_local_failure"
+                ),
+                **{
+                    key: value for key, value in coarse_diag.items()
+                    if not key.startswith("_")
+                },
             })
             if coarse is not None:
                 break
+        coarse_diag.pop("_selected_edge_routes", None)
+        coarse_diag.pop("_terminal_paths", None)
         diagnostics["coarse"] = coarse_diag
         diagnostics["coarse_attempts"] = coarse_attempts
         diagnostics["global_recovery_enabled"] = allow_global_recovery
@@ -1909,23 +2239,195 @@ class FloorplanConstraintEngine:
         fine, fine_diag = self._viterbi_level(
             observation, fine_guide, fine_fractions,
             radius_meters=4.0, candidate_limit=14,
-            allow_component_edges=allow_global_recovery,
+            allow_component_edges=False,
         )
+        fine_attempts = [{
+            "radius_meters": 4.0,
+            "component_edges_enabled": False,
+            **{
+                key: value for key, value in fine_diag.items()
+                if not key.startswith("_")
+            },
+        }]
+        if fine is None and allow_global_recovery:
+            fine, fine_diag = self._viterbi_level(
+                observation, fine_guide, fine_fractions,
+                radius_meters=4.0, candidate_limit=14,
+                allow_component_edges=True,
+            )
+            fine_attempts.append({
+                "radius_meters": 4.0,
+                "component_edges_enabled": True,
+                **{
+                    key: value for key, value in fine_diag.items()
+                    if not key.startswith("_")
+                },
+            })
+        selected_fine_edge_routes = fine_diag.pop("_selected_edge_routes", {})
+        terminal_paths = fine_diag.pop("_terminal_paths", [])
         diagnostics["fine"] = fine_diag
+        diagnostics["fine_attempts"] = fine_attempts
         if fine is None:
             diagnostics["reason"] = fine_diag.get("reason")
             return None, diagnostics
-        source_fraction = _trajectory_fractions(observation)
-        fine_observed = _resample_polyline(observation, fine_fractions)
-        correction = fine - fine_observed
-        warped = observation.copy()
-        warped[:, 0] += np.interp(source_fraction, fine_fractions, correction[:, 0])
-        warped[:, 1] += np.interp(source_fraction, fine_fractions, correction[:, 1])
-        repaired, reroutes = self._repair_collisions(warped)
-        if repaired is None or self._collision_runs(repaired):
-            diagnostics["reason"] = "dense_reconstruction_not_safe"
+
+        # Rank complete reconstructed candidates. Anchor-only topology is not
+        # sufficient because a routed edge may add turns that are absent from
+        # its endpoint chord.
+        reconstructed_candidates: list[
+            tuple[tuple[float, float, float, float], np.ndarray, dict[int, np.ndarray], dict[str, Any]]
+        ] = []
+        for terminal in terminal_paths:
+            terminal_path = np.asarray(terminal["path"], dtype=np.float64)
+            terminal_routes = terminal["edge_routes"]
+            stitched_candidate: list[np.ndarray] = []
+            for edge_index, (left, right) in enumerate(
+                zip(terminal_path[:-1], terminal_path[1:])
+            ):
+                route = terminal_routes.get(edge_index)
+                if route is None:
+                    route = np.vstack((left, right))
+                if (
+                    stitched_candidate
+                    and np.linalg.norm(stitched_candidate[-1] - route[0]) < 1e-6
+                ):
+                    route = route[1:]
+                stitched_candidate.extend(route)
+            reconstructed = np.asarray(stitched_candidate, dtype=np.float64)
+            if len(reconstructed) < 2 or self._collision_runs(reconstructed):
+                continue
+            topology = _turn_topology_metrics(
+                observation, reconstructed
+            )
+            reconstructed_candidates.append((
+                (
+                    0.0 if bool(topology["event_sequence_preserved"]) else 1.0,
+                    float(topology["sign_mismatch_ratio"]),
+                    float(topology["mean_abs_turn_error_degrees"]),
+                    float(terminal["objective"]),
+                ),
+                terminal_path,
+                terminal_routes,
+                topology,
+            ))
+        if reconstructed_candidates:
+            (
+                _,
+                fine,
+                selected_fine_edge_routes,
+                selected_reconstructed_topology,
+            ) = min(reconstructed_candidates, key=lambda item: item[0])
+            diagnostics["fine"]["reconstructed_candidates_evaluated"] = len(
+                reconstructed_candidates
+            )
+            diagnostics["fine"]["selected_reconstructed_turn_topology"] = (
+                selected_reconstructed_topology
+            )
+
+        # The first map state is represented by a grid-cell centre, while the
+        # operator's start marker is a sub-cell plan coordinate. Preserve that
+        # exact authoritative anchor whenever the short connector is safe.
+        # Otherwise a perfectly valid graph route would fail the later
+        # centimetre-level publication lock solely due to grid quantisation.
+        start_anchor_preserved = bool(
+            not self._point_occupied(observation[0])
+            and not self._segment_collides(observation[0], fine[0])
+        )
+        if start_anchor_preserved:
+            fine = fine.copy()
+            fine[0] = observation[0]
+
+        # The HMM has selected a globally coherent sequence of corridor
+        # anchors.  Reconstruct the final polyline along the actual connected
+        # free-space graph.  The previous implementation interpolated anchor
+        # corrections back onto every R3 sample and then called the bounded
+        # local A*.  That reintroduced obstacle-crossing chords and defeated
+        # the purpose of global graph matching.
+        stitched: list[np.ndarray] = []
+        routed_edges = 0
+        graph_route_margins = tuple(
+            max(2, int(math.ceil(meters / max(self.cell_meters, 1e-9))))
+            for meters in (6.0, 12.0)
+        )
+        routed_edge_diagnostics: list[dict[str, Any]] = []
+        for edge_index, (start, end) in enumerate(zip(fine[:-1], fine[1:])):
+            selected_route = selected_fine_edge_routes.get(edge_index)
+            if selected_route is not None:
+                route = selected_route
+                routed_edges += 1
+            elif self._segment_collides(start, end):
+                observed_edge = _resample_polyline(
+                    observation,
+                    np.asarray(
+                        [fine_fractions[edge_index], fine_fractions[edge_index + 1]],
+                        dtype=np.float64,
+                    ),
+                )
+                route = None
+                selected_margin_meters = None
+                for margin_meters, margin_cells in zip(
+                    (6.0, 12.0), graph_route_margins
+                ):
+                    candidate_route = self._astar(
+                        start,
+                        end,
+                        observed_edge,
+                        _search_margin_cells=margin_cells,
+                    )
+                    if candidate_route is None:
+                        continue
+                    # Viterbi selected this edge using the observed direction
+                    # and turn sequence. Reject an A* reconstruction that
+                    # silently changes its homotopy or invents a remote aisle.
+                    detour = self._detour_metrics(
+                        candidate_route, start, end, observed_edge
+                    )
+                    edge_topology = _turn_topology_metrics(
+                        observed_edge, candidate_route, samples=48
+                    )
+                    if (
+                        bool(detour["spike"])
+                        or not bool(edge_topology["event_sequence_preserved"])
+                    ):
+                        continue
+                    route = candidate_route
+                    selected_margin_meters = margin_meters
+                    routed_edge_diagnostics.append({
+                        "edge": int(edge_index),
+                        "search_margin_meters": margin_meters,
+                        "route_observed_length_ratio": round(
+                            float(detour["route_observed_length_ratio"]), 6
+                        ),
+                        "turn_topology": edge_topology,
+                    })
+                    break
+                if route is None:
+                    diagnostics.update({
+                        "reason": "graph_edge_topology_preserving_route_not_found",
+                        "failed_edge": int(edge_index),
+                        "allowed_search_margins_meters": [6.0, 12.0],
+                    })
+                    return None, diagnostics
+                routed_edges += 1
+            else:
+                route = np.vstack((start, end))
+            if stitched and np.linalg.norm(stitched[-1] - route[0]) < 1e-6:
+                route = route[1:]
+            stitched.extend(route)
+
+        repaired = np.asarray(stitched, dtype=np.float64)
+        if len(repaired) < 2 or self._collision_runs(repaired):
+            diagnostics["reason"] = "graph_reconstruction_not_safe"
             return None, diagnostics
-        diagnostics.update({"reason": None, "post_repair_segments": int(reroutes)})
+        diagnostics.update({
+            "reason": None,
+            "post_repair_segments": int(routed_edges),
+            "graph_edges": int(max(0, len(fine) - 1)),
+            "graph_routed_edges": int(routed_edges),
+            "graph_reconstruction": "bounded_observation_guided_astar",
+            "routed_edge_diagnostics": routed_edge_diagnostics,
+            "start_anchor_preserved": start_anchor_preserved,
+        })
         return repaired, diagnostics
 
     def align(
@@ -1948,15 +2450,25 @@ class FloorplanConstraintEngine:
         if observation_policy not in {"authoritative", "independent"}:
             observation_policy = "authoritative"
         raw = _normalise_points(trajectory)
-        # Global graph matching is kept as an explicit diagnostic tool only.
-        # Production must preserve the R3 curve and may make only short local
-        # obstacle repairs; otherwise a valid-looking route can jump to a
-        # completely different green corridor on the plan.
-        topology_recovery_enabled = os.getenv(
-            "TRACKAI_ENABLE_EXPERIMENTAL_TOPOLOGY_RECOVERY", "0"
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        # Authoritative R3 observations use the corridor graph in production.
+        # It remains possible to disable the feature operationally without a
+        # deploy. Independent/monocular observations still need an explicit
+        # opt-in because their scale and topology are less constrained.
+        graph_matching_setting = os.getenv(
+            "TRACKAI_ENABLE_GRAPH_MAP_MATCHING", "1"
+        ).strip().lower()
+        graph_matching_configured = graph_matching_setting not in {
+            "0", "false", "no", "off",
+        }
+        topology_recovery_enabled = bool(
+            graph_matching_configured
+            and (
+                observation_policy == "authoritative"
+                or allow_independent_corridor_recovery
+            )
+        )
         base_diagnostics: dict[str, Any] = {
-            "engine": "floorplan_constraint_engine_v9_shape_preserving",
+            "engine": "floorplan_constraint_engine_v10_graph_map_matching",
             "map_id": self.config.map_id,
             "plan_width": self.config.width,
             "plan_height": self.config.height,
@@ -1970,6 +2482,7 @@ class FloorplanConstraintEngine:
                 allow_independent_corridor_recovery and topology_recovery_enabled
             ),
             "topology_recovery_enabled": topology_recovery_enabled,
+            "graph_map_matching_configured": graph_matching_configured,
             "support_mask_enabled": self._support_mask is not None,
             "support_coverage_ratio": (
                 round(float(np.mean(self._support_mask)), 8)
@@ -2014,9 +2527,28 @@ class FloorplanConstraintEngine:
         relative = raw - raw[0]
         if coordinate_convention == "x_forward_y_left_z_up":
             relative[:, 1] *= -1.0
+        if observation_policy == "authoritative":
+            estimation_relative, macro_motion_diagnostics = (
+                _stabilize_authoritative_map_observation(relative)
+            )
+        else:
+            estimation_relative = relative
+            macro_motion_diagnostics = {
+                "method": None,
+                "applied": False,
+                "point_count": int(len(relative)),
+            }
+        base_diagnostics["macro_motion_stabilization"] = (
+            macro_motion_diagnostics
+        )
         observation_progress = _polyline_progress_metrics(relative)
+        estimation_progress = _polyline_progress_metrics(estimation_relative)
         base_diagnostics["observation_progress"] = {
             key: round(float(observation_progress[key]), 6)
+            for key in ("net_progress_ratio", "span_length_ratio", "tortuosity")
+        }
+        base_diagnostics["map_estimation_progress"] = {
+            key: round(float(estimation_progress[key]), 6)
             for key in ("net_progress_ratio", "span_length_ratio", "tortuosity")
         }
         if (
@@ -2039,15 +2571,27 @@ class FloorplanConstraintEngine:
             float(direction[1] - requested_start[1]),
             float(direction[0] - requested_start[0]),
         )
-        duration = self._motion_duration_seconds(timestamps, relative)
-        candidates = list(scale_candidates) if scale_candidates is not None else self._scale_candidates(relative, duration)
+        duration = self._motion_duration_seconds(
+            timestamps, estimation_relative
+        )
+        candidates = (
+            list(scale_candidates)
+            if scale_candidates is not None
+            else self._scale_candidates(estimation_relative, duration)
+        )
         hypotheses: list[dict[str, Any]] = []
         # The supplied direction fixes rotation.  Yaw search used to rotate
         # the whole route away from the operator's anchor.
         effective_yaw_offsets = (0.0,)
         for scale in candidates:
             for yaw in effective_yaw_offsets:
-                points = self._build_hypothesis(relative, start, desired_heading, float(scale), float(yaw))
+                points = self._build_hypothesis(
+                    estimation_relative,
+                    start,
+                    desired_heading,
+                    float(scale),
+                    float(yaw),
+                )
                 score, metrics = self._score_hypothesis(
                     points,
                     duration,
@@ -2105,6 +2649,37 @@ class FloorplanConstraintEngine:
         # enforced so raw collision scores cannot freeze the wrong homotopy.
         feasible: list[dict[str, Any]] = []
         beam = self._select_diverse_beam(metric_hypotheses)
+        if (
+            topology_recovery_enabled
+            and observation_policy == "authoritative"
+            and duration is not None
+        ):
+            # A long R3 clip often contains stops. Prioritise graph hypotheses
+            # near a conservative active walking speed before the generic
+            # collision-ranked beam; raw collision is precisely what the
+            # graph is meant to resolve.
+            graph_priority = sorted(
+                metric_hypotheses,
+                key=lambda item: (
+                    abs(math.log(
+                        max(float(item["speed_ratio"]), 1e-9)
+                        / GRAPH_MAP_MATCH_TARGET_ACTIVE_SPEED_RATIO
+                    )),
+                    float(item["score"]),
+                ),
+            )[:6]
+            reordered: list[dict[str, Any]] = []
+            seen_hypotheses: set[tuple[float, float]] = set()
+            for item in graph_priority + beam:
+                key = (
+                    round(float(item["scale"]), 9),
+                    round(float(item["yaw"]), 3),
+                )
+                if key in seen_hypotheses:
+                    continue
+                seen_hypotheses.add(key)
+                reordered.append(item)
+            beam = reordered
         attempted = 0
         route_failure_counts: dict[str, int] = {}
         topology_recovery_attempted = 0
@@ -2181,6 +2756,8 @@ class FloorplanConstraintEngine:
                             "local_search_exhausted",
                             "different_walkable_components",
                         }.intersection(route_failures))
+                        and len(hypothesis["points"])
+                        >= GRAPH_MAP_MATCH_MIN_OBSERVATIONS
                         and topology_recovery_attempted < 3
                     )
                     if not can_recover_exhausted_search:
@@ -2226,6 +2803,7 @@ class FloorplanConstraintEngine:
             if (
                 topology_recovery_enabled
                 and int(repair_diagnostics.get("provisional_spike_count", 0)) > 0
+                and len(hypothesis["points"]) >= GRAPH_MAP_MATCH_MIN_OBSERVATIONS
             ):
                 topology_recovery_attempted += 1
                 nonlinear, topology_recovery = self._multilevel_viterbi_map_match(
@@ -2254,6 +2832,10 @@ class FloorplanConstraintEngine:
                 rerouted_segments += int(
                     topology_recovery.get("post_repair_segments", 0)
                 )
+            graph_matching_used = bool(
+                isinstance(topology_recovery, dict)
+                and topology_recovery.get("accepted")
+            )
             corrected_metrics = self._path_metrics(repaired)
             # Obstacles are hard constraints. A second pass may repair a
             # raster-edge nick, but no residual collision is publishable.
@@ -2286,6 +2868,16 @@ class FloorplanConstraintEngine:
                     )
                 ):
                     continue
+            if (
+                graph_matching_used
+                and float(np.linalg.norm(repaired[0] - requested_start)) > 1e-9
+                and not self._segment_collides(requested_start, repaired[0])
+            ):
+                # A raster repair may quantise the first graph vertex back to
+                # its cell centre. Reattach the exact operator anchor through
+                # a verified collision-free sub-cell connector.
+                repaired = np.vstack((requested_start, repaired))
+                corrected_metrics = self._path_metrics(repaired)
             matched = _resample_polyline(
                 repaired,
                 _trajectory_fractions(hypothesis["points"]),
@@ -2340,39 +2932,77 @@ class FloorplanConstraintEngine:
                 * self.config.meters_per_pixel
                 if len(repaired) else float("inf")
             )
-            # A floor plan may select scale/yaw and make local obstacle
-            # repairs; it may not invent a different route.  Keep the
-            # correction budget deliberately local: once the fix needs a
-            # multi-metre branch change, the observation and mask disagree and
-            # the result must not be published as if it were measured by R3.
-            correction_budget = (
-                MASK_LOCAL_REPAIR_LIMIT_METERS
-                if self._support_mask is not None
-                else max(
-                    MAX_LOCAL_MAP_CORRECTION_METERS,
-                    min(
-                        MAX_LOCAL_MAP_CORRECTION_HARD_METERS,
-                        float(hypothesis["length_meters"])
-                        * MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION,
-                    ),
+            # Do not apply the 1.05 m local-A* budget to a graph estimate.
+            # Local repair is judged by displacement; graph matching is judged
+            # primarily by connectivity, zero collisions, metric length and
+            # the ordered turn signature, with a separate global plausibility
+            # envelope to prevent arbitrary remote-aisle selection.
+            if graph_matching_used:
+                correction_budget = GRAPH_MAP_MATCH_P95_CORRECTION_METERS
+                maximum_correction_budget = (
+                    GRAPH_MAP_MATCH_HARD_CORRECTION_METERS
                 )
-            )
-            maximum_correction_budget = (
-                MASK_LOCAL_REPAIR_HARD_LIMIT_METERS
-                if self._support_mask is not None
-                else MAX_LOCAL_MAP_CORRECTION_HARD_METERS
-            )
+            else:
+                correction_budget = (
+                    MASK_LOCAL_REPAIR_LIMIT_METERS
+                    if self._support_mask is not None
+                    else max(
+                        MAX_LOCAL_MAP_CORRECTION_METERS,
+                        min(
+                            MAX_LOCAL_MAP_CORRECTION_HARD_METERS,
+                            float(hypothesis["length_meters"])
+                            * MAX_LOCAL_MAP_CORRECTION_ROUTE_FRACTION,
+                        ),
+                    )
+                )
+                maximum_correction_budget = (
+                    MASK_LOCAL_REPAIR_HARD_LIMIT_METERS
+                    if self._support_mask is not None
+                    else MAX_LOCAL_MAP_CORRECTION_HARD_METERS
+                )
             sharp_reverse_ratio = _polyline_sharp_reverse_ratio(
                 repaired,
                 meters_per_pixel=self.config.meters_per_pixel,
             )
             turn_topology = _turn_topology_metrics(hypothesis["points"], repaired)
-            turn_topology_preserved = (
-                float(turn_topology["mean_abs_turn_error_degrees"])
-                <= MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES
-                and float(turn_topology["sign_mismatch_ratio"])
-                <= MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO
+            arc_turn_topology_preserved = (
+                bool(turn_topology["event_sequence_preserved"])
             )
+            fine_graph_diagnostics = (
+                topology_recovery.get("fine")
+                if graph_matching_used
+                and isinstance(topology_recovery, dict)
+                and isinstance(topology_recovery.get("fine"), dict)
+                else {}
+            )
+            graph_sequence_cost_per_anchor = (
+                float(fine_graph_diagnostics["objective"])
+                / max(int(fine_graph_diagnostics.get("anchors", 0)), 1)
+                if fine_graph_diagnostics.get("objective") is not None
+                else float("inf")
+            )
+            graph_sequence_preserved = bool(
+                graph_matching_used
+                and macro_motion_diagnostics.get("applied")
+                and macro_motion_diagnostics.get("turn_events_preserved")
+                and graph_sequence_cost_per_anchor
+                <= GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR
+            )
+            # A low graph objective is supporting evidence only. It must never
+            # override either the failure or success of the measured complete
+            # left/right event sequence.
+            turn_topology_preserved = bool(
+                arc_turn_topology_preserved
+            )
+            turn_topology.update({
+                "arc_event_gate_preserved": arc_turn_topology_preserved,
+                "graph_sequence_gate_preserved": graph_sequence_preserved,
+                "graph_viterbi_cost_per_anchor": (
+                    graph_sequence_cost_per_anchor
+                    if math.isfinite(graph_sequence_cost_per_anchor)
+                    else None
+                ),
+            })
             maximum_sharp_reverse_ratio = (
                 INDEPENDENT_LOOP_CLOSED_MAX_SHARP_REVERSE_RATIO
                 if observation_policy == "independent" and loop_closure_verified
@@ -2401,15 +3031,32 @@ class FloorplanConstraintEngine:
                 and metric_preserved
                 and progress_preserved
             )
+            graph_estimation_score = (
+                graph_sequence_cost_per_anchor
+                + 1.25 * _speed_prior_penalty(
+                    corrected_speed_ratio,
+                    observation_policy,
+                    duration,
+                )
+                if graph_matching_used
+                and math.isfinite(graph_sequence_cost_per_anchor)
+                and math.isfinite(corrected_speed_ratio)
+                else float(hypothesis["score"])
+            )
             constrained_score = (
-                float(hypothesis["score"])
+                graph_estimation_score
                 + 0.15 * median_correction
                 + 0.22 * p95_correction
                 + 0.75 * abs(math.log(max(length_ratio, 1e-9)))
                 + 0.08 * rerouted_segments
                 + 4.0 * sharp_reverse_ratio
-                + 0.03 * float(turn_topology["mean_abs_turn_error_degrees"])
-                + 3.0 * float(turn_topology["sign_mismatch_ratio"])
+                + (
+                    0.03 * float(turn_topology["mean_abs_turn_error_degrees"])
+                    + 3.0 * float(turn_topology["sign_mismatch_ratio"])
+                    + 1.5 * min(
+                        int(turn_topology.get("event_count_delta", 0)), 4
+                    )
+                )
                 + (
                     1.25 * _speed_prior_penalty(
                         corrected_speed_ratio,
@@ -2434,6 +3081,8 @@ class FloorplanConstraintEngine:
                 "progress_preserved": progress_preserved,
                 "repair_diagnostics": repair_diagnostics,
                 "topology_recovery": topology_recovery,
+                "graph_matching_used": graph_matching_used,
+                "graph_estimation_score": graph_estimation_score,
                 "segmented_recovery": segmented_recovery,
                 "correction_budget_meters": correction_budget,
                 "maximum_correction_meters": maximum_correction,
@@ -2622,7 +3271,7 @@ class FloorplanConstraintEngine:
                     ),
                 },
             }
-        if observation_policy == "independent" and len(production_feasible) > 1:
+        if len(production_feasible) > 1:
             runner = next((
                 item for item in production_feasible[1:]
                 if (
@@ -2649,20 +3298,37 @@ class FloorplanConstraintEngine:
                     np.asarray(runner["repaired"])[-1]
                     - np.asarray(best_candidate["repaired"])[-1]
                 )) * self.config.meters_per_pixel
+                minimum_margin = (
+                    INDEPENDENT_MIN_SELECTION_MARGIN
+                    if observation_policy == "independent"
+                    else AUTHORITATIVE_MIN_SELECTION_MARGIN
+                )
+                maximum_endpoint_separation = (
+                    6.0
+                    if observation_policy == "independent"
+                    else AUTHORITATIVE_MAX_AMBIGUOUS_ENDPOINT_METERS
+                )
                 if (
-                    selection_margin < INDEPENDENT_MIN_SELECTION_MARGIN
+                    selection_margin < minimum_margin
                     and (
                         scale_ratio > INDEPENDENT_MAX_AMBIGUOUS_SCALE_RATIO
-                        or endpoint_separation_meters > 6.0
+                        or endpoint_separation_meters > maximum_endpoint_separation
                     )
                 ):
+                    source_name = (
+                        "independent"
+                        if observation_policy == "independent"
+                        else "authoritative"
+                    )
                     return {
                         "accepted": False,
                         "trajectory": [],
                         "diagnostics": {
                             **base_diagnostics,
-                            "reason": "ambiguous_independent_map_alignment",
-                            "rejection_reasons": ["independent_scale_or_topology_ambiguous"],
+                            "reason": f"ambiguous_{source_name}_map_alignment",
+                            "rejection_reasons": [
+                                f"{source_name}_scale_or_topology_ambiguous"
+                            ],
                             "runner_up_margin": round(selection_margin, 6),
                             "ambiguous_scale_ratio": round(scale_ratio, 5),
                             "ambiguous_endpoint_separation_meters": round(
@@ -2695,7 +3361,7 @@ class FloorplanConstraintEngine:
             nonlinear_diagnostics: dict[str, Any] = {
                 "attempted": False,
                 "accepted": False,
-                "method": "corridor_graph_multilevel_viterbi_v3_second_order",
+                "method": "corridor_graph_multilevel_viterbi_v4_turn_events_branch_commitment",
                 "reason": (
                     "global_solution_stable"
                     if nonlinear_map_matching_enabled
@@ -2706,11 +3372,10 @@ class FloorplanConstraintEngine:
         should_attempt_nonlinear = (
             preselection_recovery is None
             and nonlinear_map_matching_enabled
-            and (
-                rerouted_segments > 0
-                or p95_correction > 2.0
-                or float(best["corrected_length_meters"]) >= 10.0
-            )
+            # A safe local correction is already the higher-fidelity answer.
+            # Run the global graph only when the baseline had to move far
+            # enough that local shape preservation is genuinely doubtful.
+            and p95_correction > 2.0
         )
         if should_attempt_nonlinear:
             nonlinear, nonlinear_diagnostics = self._multilevel_viterbi_map_match(
@@ -2885,22 +3550,32 @@ class FloorplanConstraintEngine:
             or bool(self._collision_runs(repaired))
             or self._path_component_count(repaired) != 1
         )
-        if publication_unsafe:
+        publication_repair_passes = 0
+        while publication_unsafe and publication_repair_passes < 3:
             # Sparse graph paths can have legal vertices while the straight
             # chord between them clips an obstacle. Densification exposes the
-            # collision; give the dense line one bounded local A* repair and
-            # then enforce the exact same zero-collision publication gate.
-            publication_repaired, publication_rerouted_segments = (
+            # collision; give the dense line bounded local A* cleanup passes
+            # and then enforce the exact same zero-collision publication gate.
+            publication_repaired, repaired_segments = (
                 self._repair_collisions(repaired)
             )
-            if publication_repaired is not None:
-                repaired = _densify_polyline(
-                    publication_repaired,
-                    MAX_PUBLISHED_SEGMENT_METERS
-                    / max(self.config.meters_per_pixel, 1e-9),
-                )
-                final_metrics = self._path_metrics(repaired)
-                publication_repair_applied = True
+            publication_repair_passes += 1
+            if publication_repaired is None:
+                break
+            publication_rerouted_segments += int(repaired_segments)
+            repaired = _densify_polyline(
+                publication_repaired,
+                MAX_PUBLISHED_SEGMENT_METERS
+                / max(self.config.meters_per_pixel, 1e-9),
+            )
+            final_metrics = self._path_metrics(repaired)
+            publication_repair_applied = True
+            publication_unsafe = (
+                final_metrics["outside_ratio"] > 0.0
+                or final_metrics["collision_ratio"] > 0.0
+                or bool(self._collision_runs(repaired))
+                or self._path_component_count(repaired) != 1
+            )
         final_progress = _polyline_progress_metrics(
             repaired,
             meters_per_pixel=self.config.meters_per_pixel,
@@ -2943,6 +3618,35 @@ class FloorplanConstraintEngine:
                     "publication_rerouted_segments": int(
                         publication_rerouted_segments
                     ),
+                    "publication_repair_passes":
+                        publication_repair_passes,
+                    "selected_scale_pixels_per_unit": round(
+                        float(best["scale"]), 8
+                    ),
+                    "graph_matching_used": bool(
+                        best.get("graph_matching_used")
+                    ),
+                    "selected_topology_recovery":
+                        best.get("topology_recovery"),
+                    "nonlinear_map_matching": nonlinear_diagnostics,
+                    "final_collision_ratio": round(
+                        float(final_metrics["collision_ratio"]), 8
+                    ),
+                    "final_outside_ratio": round(
+                        float(final_metrics["outside_ratio"]), 8
+                    ),
+                    "final_component_count":
+                        self._path_component_count(repaired),
+                    "final_collision_runs": [
+                        {
+                            "left": int(left),
+                            "right": int(right),
+                            "start": repaired[left].tolist(),
+                            "end": repaired[right].tolist(),
+                            "points": repaired[left:right + 1].tolist(),
+                        }
+                        for left, right in self._collision_runs(repaired)[:3]
+                    ],
                 },
             }
         corrected_metrics = final_metrics
@@ -2979,9 +3683,14 @@ class FloorplanConstraintEngine:
         published_direction_error_degrees = abs(
             math.degrees(direction_error_radians)
         )
+        maximum_published_direction_error_degrees = (
+            GRAPH_MAP_MATCH_MAX_INITIAL_DIRECTION_ERROR_DEGREES
+            if best.get("graph_matching_used")
+            else MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES
+        )
         if (
             published_direction_error_degrees
-            > MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES
+            > maximum_published_direction_error_degrees
         ):
             return {
                 "accepted": False,
@@ -2994,7 +3703,7 @@ class FloorplanConstraintEngine:
                         published_direction_error_degrees, 6
                     ),
                     "maximum_initial_direction_error_degrees":
-                        MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES,
+                        maximum_published_direction_error_degrees,
                 },
             }
         diagnostics = {
@@ -3062,7 +3771,7 @@ class FloorplanConstraintEngine:
                 published_direction_error_degrees, 6
             ),
             "maximum_initial_direction_error_degrees":
-                MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES,
+                maximum_published_direction_error_degrees,
             "correction_median_meters": round(float(np.median(displacement_m)), 3),
             "correction_p95_meters": round(p95_correction, 3),
             "maximum_correction_meters": round(
@@ -3079,6 +3788,7 @@ class FloorplanConstraintEngine:
             "sharp_reverse_ratio": round(float(best.get("sharp_reverse_ratio", 0.0)), 4),
             "publication_repair_applied": publication_repair_applied,
             "publication_rerouted_segments": int(publication_rerouted_segments),
+            "publication_repair_passes": publication_repair_passes,
             "length_ratio": round(length_ratio, 5),
             "max_published_segment_meters": round(max_published_segment_meters, 4),
             "endpoint_displacement_meters": round(
@@ -3096,6 +3806,12 @@ class FloorplanConstraintEngine:
             "nonlinear_map_matching": nonlinear_diagnostics,
             "selected_detour_diagnostics": best.get("repair_diagnostics"),
             "selected_topology_recovery": best.get("topology_recovery"),
+            "graph_matching_used": bool(best.get("graph_matching_used")),
+            "map_matching_mode": (
+                "corridor_graph_sequence"
+                if best.get("graph_matching_used")
+                else "local_shape_preserving"
+            ),
             "selected_segmented_recovery": best.get("segmented_recovery"),
             # Kept for API compatibility; semantically this is a quality score.
             "confidence": round(confidence, 4),
@@ -3245,6 +3961,11 @@ def apply_floorplan_constraints(
         or result.get("source_timestamps_seconds")
     )
     fragmented_r3 = method.startswith("r3") and _r3_is_severely_fragmented(result)
+    kerama_raster_polarity_calibrated = bool(
+        map_id == DEFAULT_FLOORPLAN_ID
+        and method.startswith("r3")
+        and primary_convention == "x_forward_y_left_z_up"
+    )
     candidate_payload = result.get("lingbot_fusion_candidate")
     candidate_payload = candidate_payload if isinstance(candidate_payload, dict) else {}
 
@@ -3257,7 +3978,11 @@ def apply_floorplan_constraints(
         "selection_tier": 0,
         # Fragmentation lowers trust, but never removes a geometrically valid R3
         # route from competition.
-        "source_prior": 0.45 if fragmented_r3 else 0.05,
+        "source_prior": (
+            1.35 if fragmented_r3 else 0.95
+        ) if kerama_raster_polarity_calibrated else (
+            0.45 if fragmented_r3 else 0.05
+        ),
     }]
 
     if method.startswith("r3") and primary_convention == "x_forward_y_left_z_up":
@@ -3276,7 +4001,15 @@ def apply_floorplan_constraints(
             "timestamps": source_timestamps,
             "coordinate_convention": "x_right_y_down",
             "selection_tier": 0,
-            "source_prior": (0.46 if fragmented_r3 else 0.06),
+            # The operator-confirmed Kerama raster calibration resolves the
+            # R3 floor-plane gauge in image-Y-down coordinates. Keep both
+            # polarities evaluated, but prefer the calibrated one unless it
+            # fails a hard graph or publication gate.
+            "source_prior": (
+                0.05 if fragmented_r3 else 0.0
+            ) if kerama_raster_polarity_calibrated else (
+                0.46 if fragmented_r3 else 0.06
+            ),
             "polarity_candidate": "unflipped_r3_plan_y",
         })
 
@@ -3421,8 +4154,10 @@ def apply_floorplan_constraints(
         "reason": "no_candidate_satisfied_floorplan",
         "r3_severely_fragmented": bool(fragmented_r3),
         "fragmentation_policy": "soft_prior_not_veto",
-        "selection_policy": "r3_primary_only_left_heading_v6",
+        "selection_policy": "r3_corridor_graph_left_heading_v7",
         "fusion_map_candidate_enabled": fusion_map_candidate_enabled,
+        "kerama_raster_polarity_calibrated":
+            kerama_raster_polarity_calibrated,
         "candidate_results": [],
     }
     selected_observation: Optional[dict[str, Any]] = None
@@ -3430,7 +4165,7 @@ def apply_floorplan_constraints(
         "accepted": False,
         "trajectory": [],
         "diagnostics": {
-            "engine": "floorplan_constraint_engine_v8_topology_recovery",
+            "engine": "floorplan_constraint_engine_v10_graph_map_matching",
             "map_id": map_id,
             "accepted": False,
             "reason": "no_candidates_evaluated",
@@ -3660,7 +4395,7 @@ def apply_floorplan_constraints(
             "accepted": False,
             "trajectory": [],
             "diagnostics": {
-                "engine": "floorplan_constraint_engine_v8_topology_recovery",
+                "engine": "floorplan_constraint_engine_v10_graph_map_matching",
                 "map_id": map_id,
                 "accepted": False,
                 "reason": "engine_error",

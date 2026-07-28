@@ -21,6 +21,11 @@ import math as _math
 import fitz  # PyMuPDF
 
 try:
+    from floorplan_graph import build_floorplan_graph
+except ImportError:  # pragma: no cover
+    from backend.floorplan_graph import build_floorplan_graph
+
+try:
     from r3_trajectory import build_r3_trajectory
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.r3_trajectory import build_r3_trajectory
@@ -3972,6 +3977,89 @@ async def register_existing_video_task(video_id: str, request: Request) -> Dict[
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/desktop/archive-video/{video_id}")
+async def archive_desktop_video(
+    video_id: str,
+    request: Request,
+    filename: str = Query("video.mp4"),
+) -> Dict[str, Any]:
+    """Archive a locally processed desktop video without launching remote inference."""
+    safe_filename = Path(filename).name or "video.mp4"
+    target = VIDEOS_DIR / f"{video_id}_{safe_filename}"
+    total = 0
+    with target.open("wb") as output:
+        async for chunk in request.stream():
+            total += len(chunk)
+            output.write(chunk)
+    if total <= 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Пустое видео")
+    UPLOADED_VIDEOS[video_id] = target.name
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO tracking_tasks (
+            id, video_filename, original_filename, map_context, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            video_filename=excluded.video_filename,
+            original_filename=excluded.original_filename,
+            map_context=excluded.map_context,
+            status=excluded.status,
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (video_id, target.name, safe_filename, json.dumps({
+            "client_source": "desktop_local",
+            "floorplan_id": "kerama_marazzi_2025",
+        }), "processing_local"),
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True, "video_id": video_id, "bytes": total}
+
+
+@app.post("/api/desktop/local-analysis/{video_id}")
+async def save_desktop_local_analysis(
+    video_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+) -> Dict[str, Any]:
+    """Store a trusted local desktop result so admins can review or redraw it."""
+    result = payload.get("data")
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=400, detail="Некорректный результат")
+    result["video_id"] = video_id
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT video_filename, original_filename FROM tracking_tasks WHERE id = ?",
+        (video_id,),
+    )
+    task = cursor.fetchone()
+    video_filename = task[0] if task else ""
+    original_filename = task[1] if task else video_filename
+    output_path = OUTPUT_DIR / f"{video_id}_analysis.json"
+    output_path.write_text(json.dumps({
+        "video_id": video_id,
+        "video_filename": video_filename,
+        "original_filename": original_filename,
+        "scale_factor": 1.0,
+        "stabilized": False,
+        "analysis_result": result,
+    }, ensure_ascii=False), encoding="utf-8")
+    processing_status[video_id] = {
+        "status": "completed", "progress": 100, "message": "Готово",
+        "result": result, "start_time": time.time(),
+    }
+    cursor.execute(
+        "UPDATE tracking_tasks SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        ("completed", video_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True, "video_id": video_id}
+
+
 async def _submit_lingbot_session(
     video_path: Optional[Path],
     fps: int = 10,
@@ -4400,6 +4488,44 @@ async def get_uploaded_videos_list():
     except Exception as e:
         logger.error(f"Error getting uploaded videos: {e}")
         return {"success": False, "videos": [], "error": str(e)}
+
+
+@app.get("/api/admin/floorplans/{map_id}/topology-graph")
+async def admin_generate_floorplan_topology_graph(
+    map_id: str,
+    minimum_edge_meters: float = Query(1.5, ge=0.25, le=20.0),
+    graph_scale_pixels: int = Query(8, ge=2, le=32),
+) -> Dict[str, Any]:
+    """Generate an editable corridor graph without mutating production assets."""
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    try:
+        return _to_json_serializable(build_floorplan_graph(
+            metadata_path,
+            minimum_edge_meters=minimum_edge_meters,
+            graph_scale_pixels=graph_scale_pixels,
+        ))
+    except Exception as exc:
+        logger.exception("Failed to generate topology graph for %s", map_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Topology graph generation failed: {exc}",
+        ) from exc
+
+
+@app.get("/api/admin/floorplans/{map_id}/support-mask.png")
+async def admin_floorplan_support_mask(map_id: str) -> FileResponse:
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    support_path = assets / str(metadata.get("support_mask_file") or "")
+    if not support_path.exists():
+        raise HTTPException(status_code=404, detail="Support mask not found")
+    return FileResponse(support_path, media_type="image/png")
 
 
 @app.get("/api/admin/tasks")
