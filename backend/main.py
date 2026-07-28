@@ -3981,6 +3981,7 @@ async def register_existing_video_task(video_id: str, request: Request) -> Dict[
 async def archive_desktop_video(
     video_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     filename: str = Query("video.mp4"),
 ) -> Dict[str, Any]:
     """Archive a locally processed desktop video without launching remote inference."""
@@ -4016,6 +4017,17 @@ async def archive_desktop_video(
     )
     conn.commit()
     conn.close()
+    client_source = (
+        request.headers.get("X-TrackAI-Client") or "desktop_local"
+    ).strip()
+    background_tasks.add_task(
+        send_desktop_upload_notification,
+        video_id,
+        safe_filename,
+        total,
+        "local-desktop",
+        client_source,
+    )
     return {"success": True, "video_id": video_id, "bytes": total}
 
 

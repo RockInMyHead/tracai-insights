@@ -10,6 +10,7 @@ ExecStart=/root/trackai/backend/venv/bin/python3 -m uvicorn main:app --host 0.0.
 Restart=always
 RestartSec=5
 Environment=GPU_WORKER_URL=http://79.137.227.106:8003
+EnvironmentFile=-/root/trackai/config/trackai.env
 
 [Install]
 WantedBy=multi-user.target
