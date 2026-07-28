@@ -1413,10 +1413,15 @@ def _regularize_straight_runs(
         headings = np.arctan2(np.diff(xy[:, 1]), np.diff(xy[:, 0]))
         valid_heading = steps > median_step * 0.08
         if valid_heading.any():
-            valid_values = np.unwrap(headings[valid_heading])
+            valid_values = headings[valid_heading]
+            circular_mean = float(np.angle(np.mean(np.exp(1j * valid_values))))
+            circular_offsets = np.angle(np.exp(1j * (
+                valid_values - circular_mean
+            )))
             concentration = float(abs(np.mean(np.exp(1j * valid_values))))
             heading_spread = math.degrees(float(
-                np.percentile(valid_values, 90) - np.percentile(valid_values, 10)
+                np.percentile(circular_offsets, 90)
+                - np.percentile(circular_offsets, 10)
             ))
         else:
             concentration = 0.0

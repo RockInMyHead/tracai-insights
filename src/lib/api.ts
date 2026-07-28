@@ -41,6 +41,21 @@ export interface VideoAnalysisResult {
     method: string;
     trajectory: number[][];
     map_trajectory?: number[][];
+    graph_first_trajectory?: number[][];
+    graph_first_segments?: Array<{
+      start_index: number;
+      end_index: number;
+      status: "confirmed" | "uncertain";
+      edge_ids?: string[];
+    }>;
+    graph_first_metadata?: Record<string, unknown>;
+    graph_first_uncertainty?: {
+      marker?: number[] | null;
+      competing_next_edges?: Array<{
+        edge_id: string;
+        points: number[][];
+      }>;
+    };
     map_trajectory_timestamps_seconds?: number[];
     map_trajectory_source_fractions?: number[];
     floorplan_constraint?: Record<string, unknown>;
@@ -128,6 +143,8 @@ export interface FloorplanGraphEdge {
   median_width_meters: number | null;
   bidirectional: boolean;
   enabled: boolean;
+  source_edge_id?: string;
+  source_segment_index?: number;
 }
 
 export interface FloorplanTopologyGraph {
@@ -137,10 +154,17 @@ export interface FloorplanTopologyGraph {
   width: number;
   height: number;
   meters_per_pixel: number;
-  source: Record<string, string | number>;
+  source: Record<string, string | number | boolean | null>;
   nodes: FloorplanGraphNode[];
   edges: FloorplanGraphEdge[];
   validation: Record<string, number>;
+  production_validation?: {
+    file_sha256: string;
+    expected_file_sha256: string;
+    file_sha256_matches: boolean;
+    geometry_sha256: string;
+    embedded_geometry_sha256?: string | null;
+  };
 }
 
 export type R3TrajectorySource = "raw" | "robust_candidate" | "scale_aware_candidate";
@@ -500,6 +524,38 @@ export class ApiClient {
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
       throw new Error(payload.detail || 'Не удалось построить граф проходов');
+    }
+    return response.json();
+  }
+
+  async getProductionFloorplanTopologyGraph(
+    mapId: string,
+  ): Promise<FloorplanTopologyGraph> {
+    const response = await agentFetch(
+      `${this.baseUrl}/api/admin/floorplans/${mapId}/topology-graph/production`,
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || 'Не удалось загрузить production-граф');
+    }
+    return response.json();
+  }
+
+  async saveProductionFloorplanTopologyGraph(
+    mapId: string,
+    graph: FloorplanTopologyGraph,
+  ): Promise<FloorplanTopologyGraph> {
+    const response = await agentFetch(
+      `${this.baseUrl}/api/admin/floorplans/${mapId}/topology-graph/production`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(graph),
+      },
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || 'Не удалось сохранить production-граф');
     }
     return response.json();
   }
@@ -957,6 +1013,21 @@ export class ApiClient {
     /** Cleaned c2w translations for Three.js only; never use these as map X/Y. */
     raw_trajectory_3d?: number[][];
     map_trajectory?: number[][];
+    graph_first_trajectory?: number[][];
+    graph_first_segments?: Array<{
+      start_index: number;
+      end_index: number;
+      status: "confirmed" | "uncertain";
+      edge_ids?: string[];
+    }>;
+    graph_first_metadata?: Record<string, unknown>;
+    graph_first_uncertainty?: {
+      marker?: number[] | null;
+      competing_next_edges?: Array<{
+        edge_id: string;
+        points: number[][];
+      }>;
+    };
     map_trajectory_timestamps_seconds?: number[];
     map_trajectory_source_fractions?: number[];
     map_turn_points?: Array<Record<string, unknown>>;
@@ -1041,6 +1112,21 @@ export class ApiClient {
     raw_plan_trajectory?: number[][];
     raw_trajectory_3d?: number[][];
     map_trajectory?: number[][];
+    graph_first_trajectory?: number[][];
+    graph_first_segments?: Array<{
+      start_index: number;
+      end_index: number;
+      status: "confirmed" | "uncertain";
+      edge_ids?: string[];
+    }>;
+    graph_first_metadata?: Record<string, unknown>;
+    graph_first_uncertainty?: {
+      marker?: number[] | null;
+      competing_next_edges?: Array<{
+        edge_id: string;
+        points: number[][];
+      }>;
+    };
     map_trajectory_timestamps_seconds?: number[];
     map_trajectory_source_fractions?: number[];
     map_turn_points?: Array<{

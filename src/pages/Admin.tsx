@@ -783,7 +783,7 @@ const Admin = () => {
                                     >
                                         <Link to="/admin/graph-editor">
                                             <Network className="h-4 w-4" />
-                                            Граф проходов
+                                            Чертёж
                                         </Link>
                                     </Button>
                                     <Button 

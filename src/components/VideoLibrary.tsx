@@ -58,6 +58,8 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
         method?: unknown;
         trajectory?: unknown;
         map_trajectory?: unknown;
+        graph_first_trajectory?: unknown;
+        graph_first_segments?: unknown;
         plan_trajectory?: unknown;
         turn_points?: unknown;
         map_turn_points?: unknown;
@@ -73,9 +75,15 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
         Array.isArray(data.map_trajectory) && data.map_trajectory.length >= 2
           ? data.map_trajectory
           : null;
+      const savedGraphFirst =
+        Array.isArray(data.graph_first_trajectory)
+        && data.graph_first_trajectory.length >= 2
+          ? data.graph_first_trajectory
+          : null;
       // Prefer the published map route. Live /api/r3-trajectory can hang for
       // multi-minute AVI and must never block library load.
-      let trajectory = savedMap ?? data.plan_trajectory ?? data.trajectory;
+      let trajectory =
+        savedMap ?? savedGraphFirst ?? data.plan_trajectory ?? data.trajectory;
       let turnPoints = data.map_turn_points ?? data.turn_points ?? [];
       let trajectoryQuality: Record<string, unknown> | undefined;
       let liveFloorplan = floorplanConstraint;
@@ -101,6 +109,12 @@ const VideoLibrary = ({ onVideoSelected, onAnalysisLoaded }: VideoLibraryProps) 
             if (Array.isArray(current.map_trajectory) && current.map_trajectory.length >= 2) {
               trajectory = current.map_trajectory;
               turnPoints = current.map_turn_points ?? turnPoints;
+            } else if (
+              Array.isArray(current.graph_first_trajectory)
+              && current.graph_first_trajectory.length >= 2
+            ) {
+              trajectory = current.graph_first_trajectory;
+              turnPoints = [];
             } else if (Array.isArray(current.plan_trajectory) && current.plan_trajectory.length > 0) {
               trajectory = current.plan_trajectory;
               turnPoints = current.turn_points ?? turnPoints;

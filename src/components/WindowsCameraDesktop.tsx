@@ -18,16 +18,44 @@ function getDesktopBridge() {
 
 function getDesktopTrajectory(data: VideoAnalysisResult["data"], videoId: string): TrajectoryData[] {
   if (!data) return [];
-  const points = (data.map_trajectory?.length ? data.map_trajectory : data.plan_trajectory?.length ? data.plan_trajectory : data.trajectory) || [];
-  if (points.length < 2) return [];
+  const graphFirst = data.graph_first_trajectory?.length
+    ? data.graph_first_trajectory
+    : undefined;
+  const points = (
+    data.map_trajectory?.length
+      ? data.map_trajectory
+      : graphFirst?.length
+        ? graphFirst
+        : data.plan_trajectory?.length
+          ? data.plan_trajectory
+          : data.trajectory
+  ) || [];
+  if (points.length < 1) return [];
+  const uncertaintyMarker = data.graph_first_uncertainty?.marker;
+  const competingNextEdges = (
+    data.graph_first_uncertainty?.competing_next_edges || []
+  ).map((edge) => edge.points.map((point) => ({
+    x: Number(point[0]) || 0,
+    y: Number(point[1]) || 0,
+    z: Number(point[2]) || 0,
+  })));
   return [{
     trajectory: points.map((point) => ({ x: Number(point[0]) || 0, y: Number(point[1]) || 0, z: Number(point[2]) || 0 })),
     turnPoints: (data.map_turn_points || data.turn_points || []) as TurnPoint[],
     ownerName: CAMERA_OWNER,
-    color: "#0f766e",
+    color: graphFirst && !data.map_trajectory?.length ? "#f59e0b" : "#0f766e",
     videoId,
     method: data.method,
-    mapAligned: Boolean(data.map_trajectory?.length),
+    mapAligned: Boolean(data.map_trajectory?.length || graphFirst?.length),
+    uncertain: Boolean(graphFirst?.length && !data.map_trajectory?.length),
+    uncertaintyMarker: Array.isArray(uncertaintyMarker)
+      ? {
+          x: Number(uncertaintyMarker[0]) || 0,
+          y: Number(uncertaintyMarker[1]) || 0,
+          z: Number(uncertaintyMarker[2]) || 0,
+        }
+      : undefined,
+    competingNextEdges,
   }];
 }
 

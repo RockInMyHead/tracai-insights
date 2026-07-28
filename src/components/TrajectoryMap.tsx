@@ -43,6 +43,10 @@ export interface TrajectoryData {
   mapScaleFactor?: number;
   /** R³ uses reconstruction coordinates; fit its 2D projection into the floor plan before manual calibration. */
   r3AutoFitToPlan?: boolean;
+  /** Graph-only fallback segment whose correspondence to R3 is not proven. */
+  uncertain?: boolean;
+  uncertaintyMarker?: TrajectoryPoint;
+  competingNextEdges?: TrajectoryPoint[][];
 }
 
 const ADMIN_PLAN_W = 800;
@@ -1504,10 +1508,14 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       strokeWidth={floorPlan ? 5 : 4}
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      strokeDasharray={data.ownerName.includes('Тестовые') ? "4 4" : "none"}
+                      strokeDasharray={
+                        data.uncertain || data.ownerName.includes('Тестовые')
+                          ? "12 9"
+                          : "none"
+                      }
                       filter="url(#trajectoryGlow)"
                       className="animate-path-draw"
-                      opacity={0.95}
+                      opacity={data.uncertain ? 0.68 : 0.95}
                     />
 
                     {/* Trajectory points along the path */}
@@ -1525,6 +1533,46 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       ))}
                   </g>
                 );
+              })}
+              {getTransformedTrajectories.flatMap((data, trajectoryIndex) => {
+                const marker = data.uncertaintyMarker;
+                if (!marker) return [];
+                return [(
+                  <g key={`uncertainty-${trajectoryIndex}`}>
+                    {(data.competingNextEdges || []).slice(0, 2).map((edge, edgeIndex) => (
+                      <path
+                        key={`uncertainty-edge-${trajectoryIndex}-${edgeIndex}`}
+                        d={getPathString(edge)}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth={4}
+                        strokeDasharray="8 7"
+                        strokeLinecap="round"
+                        opacity={0.72}
+                      />
+                    ))}
+                    <circle
+                      cx={marker.x}
+                      cy={marker.y}
+                      r="9"
+                      fill="#f59e0b"
+                      stroke="white"
+                      strokeWidth="3"
+                    />
+                    <text
+                      x={marker.x + 13}
+                      y={marker.y - 12}
+                      fill="#92400e"
+                      fontSize="14"
+                      fontWeight="bold"
+                      stroke="white"
+                      strokeWidth="4"
+                      paintOrder="stroke"
+                    >
+                      Маршрут не определён
+                    </text>
+                  </g>
+                )];
               })}
             </g>)}
 

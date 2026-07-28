@@ -1,8 +1,9 @@
-import { ChangeEvent, PointerEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowLeft, CheckCircle2, Download, GitBranch, Loader2,
-  MousePointer2, Network, Plus, RefreshCw, Trash2, Upload,
+  MousePointer2, Plus, RefreshCw, RotateCcw, Save, Trash2, Upload,
+  ZoomIn, ZoomOut,
 } from "lucide-react";
 import Navbar from "@/components/Navbar";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -17,14 +18,110 @@ import {
 
 const MAP_ID = "kerama_marazzi_2025";
 const PLAN_URL = "/floorplans/kerama-marazzi-2025.png";
+const PLAN_WIDTH = 5298;
+const PLAN_HEIGHT = 3743;
 const ADMIN_SESSION_KEY = "trackai_admin_authenticated";
 
 type Tool = "select" | "add-node" | "connect";
+type DragState = {
+  nodeId: string;
+  pointerId: number;
+  offsetX: number;
+  offsetY: number;
+};
+type CompetingBranches = {
+  ambiguous: boolean;
+  divergence_anchor: number;
+  divergence_point: number[];
+  selected: number[][];
+  alternative: number[][];
+};
+
+const findCompetingBranches = (value: unknown): CompetingBranches | null => {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const candidate = record.competing_branches;
+  if (candidate && typeof candidate === "object") {
+    const branch = candidate as Partial<CompetingBranches>;
+    if (
+      Array.isArray(branch.selected)
+      && Array.isArray(branch.alternative)
+      && Array.isArray(branch.divergence_point)
+    ) return branch as CompetingBranches;
+  }
+  for (const child of Object.values(record)) {
+    const found = findCompetingBranches(child);
+    if (found) return found;
+  }
+  return null;
+};
 
 const length = (points: number[][]) => points.slice(1).reduce((sum, point, index) => {
   const prior = points[index];
   return sum + Math.hypot(point[0] - prior[0], point[1] - prior[1]);
 }, 0);
+
+const nextNumericId = (items: { id: string }[]) => Math.max(
+  0,
+  ...items.map((item) => Number(item.id.match(/\d+$/)?.[0] || 0)),
+) + 1;
+
+const withNodeDegrees = (graph: FloorplanTopologyGraph): FloorplanTopologyGraph => {
+  const degrees = new Map<string, number>();
+  graph.edges.filter((edge) => edge.enabled).forEach((edge) => {
+    degrees.set(edge.from, (degrees.get(edge.from) || 0) + 1);
+    degrees.set(edge.to, (degrees.get(edge.to) || 0) + 1);
+  });
+  return {
+    ...graph,
+    nodes: graph.nodes.map((node) => ({ ...node, degree: degrees.get(node.id) || 0 })),
+    validation: {
+      ...graph.validation,
+      node_count: graph.nodes.length,
+      edge_count: graph.edges.length,
+      disabled_nodes: graph.nodes.filter((node) => !node.enabled).length,
+      disabled_edges: graph.edges.filter((edge) => !edge.enabled).length,
+    },
+  };
+};
+
+const closestEdgeProjection = (
+  x: number,
+  y: number,
+  edges: FloorplanGraphEdge[],
+) => {
+  let closest: {
+    edge: FloorplanGraphEdge;
+    segmentIndex: number;
+    x: number;
+    y: number;
+    distance: number;
+  } | null = null;
+  edges.filter((edge) => edge.enabled).forEach((edge) => {
+    edge.points.slice(1).forEach((to, segmentIndex) => {
+      const from = edge.points[segmentIndex];
+      const dx = to[0] - from[0];
+      const dy = to[1] - from[1];
+      const denominator = dx * dx + dy * dy;
+      const ratio = denominator
+        ? Math.max(0, Math.min(1, ((x - from[0]) * dx + (y - from[1]) * dy) / denominator))
+        : 0;
+      const projectedX = from[0] + ratio * dx;
+      const projectedY = from[1] + ratio * dy;
+      const distance = Math.hypot(x - projectedX, y - projectedY);
+      if (!closest || distance < closest.distance) {
+        closest = {
+          edge,
+          segmentIndex,
+          x: projectedX,
+          y: projectedY,
+          distance,
+        };
+      }
+    });
+  });
+  return closest;
+};
 
 const downloadJson = (graph: FloorplanTopologyGraph) => {
   const blob = new Blob([JSON.stringify(graph, null, 2)], { type: "application/json" });
@@ -44,16 +141,64 @@ export default function AdminGraphEditor() {
   const [connectFrom, setConnectFrom] = useState<string | null>(null);
   const [minimumEdge, setMinimumEdge] = useState(1.5);
   const [scalePixels, setScalePixels] = useState(8);
-  const [showMask, setShowMask] = useState(true);
+  const [mapZoom, setMapZoom] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [savedMessage, setSavedMessage] = useState("");
+  const [competingBranches, setCompetingBranches] = useState<CompetingBranches | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
+  const dragRef = useRef<DragState | null>(null);
   const authenticated = sessionStorage.getItem(ADMIN_SESSION_KEY) === "true";
+
+  const loadProductionGraph = async () => {
+    setBusy(true);
+    setError("");
+    setSavedMessage("");
+    try {
+      setGraph(await apiClient.getProductionFloorplanTopologyGraph(MAP_ID));
+      setSelectedNode(null);
+      setSelectedEdge(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Ошибка загрузки production-графа");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveProductionGraph = async () => {
+    if (!graph) return;
+    if (validation.orphanNodes || validation.invalidEdges) {
+      setError("Исправьте сиротские узлы и некорректные рёбра перед сохранением");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setSavedMessage("");
+    try {
+      const saved = await apiClient.saveProductionFloorplanTopologyGraph(
+        MAP_ID,
+        graph,
+      );
+      setGraph(saved);
+      setSavedMessage("Граф сохранён в production и кеш matcher обновлён");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Ошибка сохранения production-графа");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (authenticated) void loadProductionGraph();
+    // Authentication is session-scoped and fixed for this page lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authenticated]);
 
   const nodeById = useMemo(
     () => new Map((graph?.nodes || []).map((node) => [node.id, node])),
     [graph],
   );
+  const visibleNodes = graph?.nodes.filter((node) => node.kind !== "attachment") || [];
   const enabledEdges = graph?.edges.filter((edge) => edge.enabled) || [];
   const validation = useMemo(() => {
     if (!graph) return { orphanNodes: 0, invalidEdges: 0 };
@@ -87,12 +232,12 @@ export default function AdminGraphEditor() {
     }
   };
 
-  const pointFromEvent = (event: PointerEvent<SVGSVGElement>) => {
+  const pointFromClient = (clientX: number, clientY: number) => {
     const svg = svgRef.current;
     if (!svg || !graph) return null;
     const point = svg.createSVGPoint();
-    point.x = event.clientX;
-    point.y = event.clientY;
+    point.x = clientX;
+    point.y = clientY;
     const matrix = svg.getScreenCTM()?.inverse();
     if (!matrix) return null;
     const transformed = point.matrixTransform(matrix);
@@ -104,10 +249,7 @@ export default function AdminGraphEditor() {
 
   const addNode = (x: number, y: number) => {
     if (!graph) return;
-    const next = Math.max(
-      0,
-      ...graph.nodes.map((node) => Number(node.id.match(/\d+$/)?.[0] || 0)),
-    ) + 1;
+    const next = nextNumericId(graph.nodes);
     const node: FloorplanGraphNode = {
       id: `node_${String(next).padStart(4, "0")}`,
       kind: "manual",
@@ -116,8 +258,39 @@ export default function AdminGraphEditor() {
       degree: 0,
       enabled: true,
     };
-    setGraph({ ...graph, nodes: [...graph.nodes, node] });
+    const projection = closestEdgeProjection(x, y, graph.edges);
+    if (!projection || projection.distance > 500) {
+      setGraph(withNodeDegrees({ ...graph, nodes: [...graph.nodes, node] }));
+      setError("Узел создан, но ближайшее ребро находится слишком далеко. Переместите узел ближе и соедините его вручную.");
+    } else {
+      const sourceEdge = projection.edge;
+      const leftPoints = [
+        ...sourceEdge.points.slice(0, projection.segmentIndex + 1),
+        [node.x, node.y],
+      ];
+      const rightPoints = [
+        [node.x, node.y],
+        ...sourceEdge.points.slice(projection.segmentIndex + 1),
+      ];
+      const edges = graph.edges.map((edge) => edge.id === sourceEdge.id ? {
+        ...edge,
+        to: node.id,
+        points: leftPoints,
+        length_meters: length(leftPoints) * graph.meters_per_pixel,
+      } : edge);
+      edges.push({
+        ...sourceEdge,
+        id: `edge_${String(nextNumericId(edges)).padStart(5, "0")}`,
+        from: node.id,
+        points: rightPoints,
+        length_meters: length(rightPoints) * graph.meters_per_pixel,
+      });
+      setGraph(withNodeDegrees({ ...graph, nodes: [...graph.nodes, node], edges }));
+      setError("");
+    }
     setSelectedNode(node.id);
+    setSelectedEdge(null);
+    setTool("select");
   };
 
   const connectNodes = (to: string) => {
@@ -144,57 +317,83 @@ export default function AdminGraphEditor() {
       bidirectional: true,
       enabled: true,
     };
-    setGraph({ ...graph, edges: [...graph.edges, edge] });
+    setGraph(withNodeDegrees({ ...graph, edges: [...graph.edges, edge] }));
     setConnectFrom(null);
     setSelectedEdge(edge.id);
   };
 
   const handleCanvasPointer = (event: PointerEvent<SVGSVGElement>) => {
     if (event.target !== event.currentTarget && tool !== "add-node") return;
-    const point = pointFromEvent(event);
+    const point = pointFromClient(event.clientX, event.clientY);
     if (point && tool === "add-node") addNode(point.x, point.y);
   };
 
-  const moveSelectedNode = (event: PointerEvent<SVGCircleElement>, nodeId: string) => {
-    if (tool !== "select" || event.buttons !== 1 || !graph) return;
-    const point = pointFromEvent(event as unknown as PointerEvent<SVGSVGElement>);
+  const beginNodeDrag = (event: PointerEvent<SVGCircleElement>, node: FloorplanGraphNode) => {
+    if (tool !== "select") return;
+    const point = pointFromClient(event.clientX, event.clientY);
     if (!point) return;
-    const nodes = graph.nodes.map((node) => (
-      node.id === nodeId ? { ...node, x: point.x, y: point.y } : node
-    ));
-    const moved = nodes.find((node) => node.id === nodeId);
-    const edges = graph.edges.map((edge) => {
-      if (!moved || (edge.from !== nodeId && edge.to !== nodeId)) return edge;
-      const points = edge.points.map((item) => [...item]);
-      if (edge.from === nodeId) points[0] = [moved.x, moved.y];
-      if (edge.to === nodeId) points[points.length - 1] = [moved.x, moved.y];
-      return {
-        ...edge,
-        points,
-        length_meters: length(points) * graph.meters_per_pixel,
-      };
+    dragRef.current = {
+      nodeId: node.id,
+      pointerId: event.pointerId,
+      offsetX: node.x - point.x,
+      offsetY: node.y - point.y,
+    };
+    svgRef.current?.setPointerCapture(event.pointerId);
+  };
+
+  const moveDraggedNode = (event: PointerEvent<SVGSVGElement>) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const point = pointFromClient(event.clientX, event.clientY);
+    if (!point) return;
+    setGraph((current) => {
+      if (!current) return current;
+      const x = Math.max(0, Math.min(current.width, point.x + drag.offsetX));
+      const y = Math.max(0, Math.min(current.height, point.y + drag.offsetY));
+      const nodes = current.nodes.map((node) => (
+        node.id === drag.nodeId ? { ...node, x, y } : node
+      ));
+      const edges = current.edges.map((edge) => {
+        if (edge.from !== drag.nodeId && edge.to !== drag.nodeId) return edge;
+        const points = edge.points.map((item) => [...item]);
+        if (edge.from === drag.nodeId) points[0] = [x, y];
+        if (edge.to === drag.nodeId) points[points.length - 1] = [x, y];
+        return {
+          ...edge,
+          points,
+          length_meters: length(points) * current.meters_per_pixel,
+        };
+      });
+      return { ...current, nodes, edges };
     });
-    setGraph({ ...graph, nodes, edges });
+  };
+
+  const endNodeDrag = (event: PointerEvent<SVGSVGElement>) => {
+    if (dragRef.current?.pointerId !== event.pointerId) return;
+    dragRef.current = null;
+    if (svgRef.current?.hasPointerCapture(event.pointerId)) {
+      svgRef.current.releasePointerCapture(event.pointerId);
+    }
   };
 
   const removeSelection = () => {
     if (!graph) return;
     if (selectedEdge) {
-      setGraph({
+      setGraph(withNodeDegrees({
         ...graph,
         edges: graph.edges.filter((edge) => edge.id !== selectedEdge),
-      });
+      }));
       setSelectedEdge(null);
       return;
     }
     if (selectedNode) {
-      setGraph({
+      setGraph(withNodeDegrees({
         ...graph,
         nodes: graph.nodes.filter((node) => node.id !== selectedNode),
         edges: graph.edges.filter(
           (edge) => edge.from !== selectedNode && edge.to !== selectedNode,
         ),
-      });
+      }));
       setSelectedNode(null);
     }
   };
@@ -213,6 +412,23 @@ export default function AdminGraphEditor() {
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Не удалось импортировать JSON");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
+  const importDiagnostics = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const payload = JSON.parse(await file.text()) as unknown;
+      const branches = findCompetingBranches(payload);
+      if (!branches) throw new Error("В файле нет диагностики competing_branches");
+      setCompetingBranches(branches);
+      setMapZoom((value) => Math.max(value, 1.5));
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Не удалось импортировать диагностику");
     } finally {
       event.target.value = "";
     }
@@ -246,12 +462,30 @@ export default function AdminGraphEditor() {
             <Button asChild variant="ghost" className="-ml-3 mb-1 text-slate-400">
               <Link to="/admin"><ArrowLeft className="mr-2 h-4 w-4" />Админ-панель</Link>
             </Button>
-            <h1 className="text-3xl font-semibold">Редактор графа проходов</h1>
+            <h1 className="text-3xl font-semibold">Чертёж</h1>
             <p className="mt-1 text-slate-400">
-              Зелёная support-mask → узлы развилок → corridor-edges → production JSON
+              План Kerama Marazzi → узлы проходов → corridor-edges → production JSON
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
+            <Button
+              onClick={saveProductionGraph}
+              disabled={!graph || busy || Boolean(validation.orphanNodes || validation.invalidEdges)}
+              className="bg-emerald-600 hover:bg-emerald-500"
+            >
+              {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+              Сохранить в production
+            </Button>
+            <Button variant="outline" onClick={loadProductionGraph} disabled={busy}>
+              {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+              Production-граф
+            </Button>
+            <Label className="cursor-pointer">
+              <Input className="hidden" type="file" accept=".json" onChange={importDiagnostics} />
+              <span className="inline-flex h-10 items-center rounded-md border border-amber-500/50 px-4 text-sm text-amber-200 hover:bg-amber-500/10">
+                <Upload className="mr-2 h-4 w-4" />Диагностика маршрута
+              </span>
+            </Label>
             <Label className="cursor-pointer">
               <Input className="hidden" type="file" accept=".json" onChange={importGraph} />
               <span className="inline-flex h-10 items-center rounded-md border border-slate-700 px-4 text-sm hover:bg-slate-800">
@@ -267,6 +501,13 @@ export default function AdminGraphEditor() {
         {error && (
           <Alert variant="destructive" className="mb-4">
             <AlertTitle>Ошибка</AlertTitle><AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        {savedMessage && (
+          <Alert className="mb-4 border-emerald-500/30 bg-emerald-500/10 text-emerald-100">
+            <CheckCircle2 className="h-4 w-4" />
+            <AlertTitle>Сохранено</AlertTitle>
+            <AlertDescription>{savedMessage}</AlertDescription>
           </Alert>
         )}
 
@@ -311,24 +552,46 @@ export default function AdminGraphEditor() {
                   <Trash2 className="mr-2 h-4 w-4" />Удалить выбранное
                 </Button>
               </div>
-              <Button variant="outline" className="w-full" onClick={() => setShowMask(!showMask)}>
-                {showMask ? "Скрыть зелёную маску" : "Показать зелёную маску"}
-              </Button>
             </CardContent>
           </Card>
 
           <Card className="overflow-hidden border-slate-800 bg-slate-900">
+            <div className="flex h-12 items-center justify-end gap-2 border-b border-slate-800 px-3">
+              <Button variant="outline" size="icon" disabled={mapZoom <= 1}
+                aria-label="Уменьшить масштаб"
+                onClick={() => setMapZoom((value) => Math.max(1, value - 0.25))}>
+                <ZoomOut className="h-4 w-4" />
+              </Button>
+              <Badge variant="secondary" className="min-w-16 justify-center">
+                {Math.round(mapZoom * 100)}%
+              </Badge>
+              <Button variant="outline" size="icon" disabled={mapZoom >= 4}
+                aria-label="Увеличить масштаб"
+                onClick={() => setMapZoom((value) => Math.min(4, value + 0.25))}>
+                <ZoomIn className="h-4 w-4" />
+              </Button>
+              <Button variant="ghost" size="icon" aria-label="Сбросить масштаб"
+                disabled={mapZoom === 1} onClick={() => setMapZoom(1)}>
+                <RotateCcw className="h-4 w-4" />
+              </Button>
+            </div>
             <div className="relative aspect-[5298/3743] min-h-[620px] overflow-auto bg-white">
-              {graph ? (
-                <svg ref={svgRef} viewBox={`0 0 ${graph.width} ${graph.height}`}
-                  className="h-full w-full touch-none" onPointerDown={handleCanvasPointer}>
-                  <image href={PLAN_URL} width={graph.width} height={graph.height} />
-                  {showMask && (
-                    <image href={apiClient.getFloorplanSupportMaskUrl(MAP_ID)}
-                      width={graph.width} height={graph.height}
-                      opacity={0.22} style={{ filter: "sepia(1) saturate(8) hue-rotate(75deg)" }} />
-                  )}
-                  {graph.edges.map((edge) => (
+              <svg ref={svgRef}
+                viewBox={`0 0 ${graph?.width || PLAN_WIDTH} ${graph?.height || PLAN_HEIGHT}`}
+                className="block touch-none"
+                style={{
+                  width: `${mapZoom * 100}%`,
+                  height: "auto",
+                  minHeight: `${mapZoom * 620}px`,
+                }}
+                onPointerDown={handleCanvasPointer}
+                onPointerMove={moveDraggedNode}
+                onPointerUp={endNodeDrag}
+                onPointerCancel={endNodeDrag}>
+                <image href={PLAN_URL}
+                  width={graph?.width || PLAN_WIDTH}
+                  height={graph?.height || PLAN_HEIGHT} />
+                {(graph?.edges || []).map((edge) => (
                     <polyline key={edge.id}
                       points={edge.points.map((point) => point.join(",")).join(" ")}
                       fill="none"
@@ -338,24 +601,43 @@ export default function AdminGraphEditor() {
                       onPointerDown={(event) => {
                         event.stopPropagation(); setSelectedEdge(edge.id); setSelectedNode(null);
                       }} />
-                  ))}
-                  {graph.nodes.map((node) => (
+                ))}
+                {competingBranches && (
+                  <>
+                    <polyline
+                      points={competingBranches.selected.map((point) => point.join(",")).join(" ")}
+                      fill="none" stroke="#22c55e" strokeWidth={18} opacity={0.9}
+                      strokeLinecap="round" strokeLinejoin="round" />
+                    <polyline
+                      points={competingBranches.alternative.map((point) => point.join(",")).join(" ")}
+                      fill="none" stroke="#f97316" strokeWidth={18} opacity={0.9}
+                      strokeDasharray="30 18" strokeLinecap="round" strokeLinejoin="round" />
+                    <circle
+                      cx={competingBranches.divergence_point[0]}
+                      cy={competingBranches.divergence_point[1]}
+                      r={28} fill="#ef4444" stroke="white" strokeWidth={8} />
+                  </>
+                )}
+                {visibleNodes.map((node) => (
                     <circle key={node.id} cx={node.x} cy={node.y}
-                      r={selectedNode === node.id ? 17 : node.kind === "junction" ? 12 : 9}
-                      fill={connectFrom === node.id ? "#f97316" : node.kind === "junction" ? "#ef4444" : "#10b981"}
+                      r={selectedNode === node.id ? 17 : ["junction", "turn"].includes(node.kind) ? 12 : 9}
+                      fill={connectFrom === node.id ? "#f97316" : ["junction", "turn"].includes(node.kind) ? "#ef4444" : "#10b981"}
                       stroke="white" strokeWidth={4}
                       onPointerDown={(event) => {
                         event.stopPropagation();
                         if (tool === "connect") connectNodes(node.id);
-                        else { setSelectedNode(node.id); setSelectedEdge(null); }
-                      }}
-                      onPointerMove={(event) => moveSelectedNode(event, node.id)} />
-                  ))}
-                </svg>
-              ) : (
-                <div className="flex h-full items-center justify-center text-center text-slate-500">
-                  <div><Network className="mx-auto mb-3 h-12 w-12" />
-                    Нажмите «Построить из зелёной маски»
+                        else {
+                          setSelectedNode(node.id);
+                          setSelectedEdge(null);
+                          beginNodeDrag(event, node);
+                        }
+                      }} />
+                ))}
+              </svg>
+              {!graph && (
+                <div className="pointer-events-none absolute inset-x-0 top-4 flex justify-center">
+                  <div className="rounded-lg border border-slate-300 bg-white/90 px-4 py-2 text-sm text-slate-600 shadow">
+                    План загружен. Нажмите «Построить из зелёной маски», чтобы показать граф.
                   </div>
                 </div>
               )}
@@ -367,7 +649,7 @@ export default function AdminGraphEditor() {
             <CardContent className="space-y-4">
               <div className="grid grid-cols-2 gap-2">
                 <div className="rounded-lg bg-slate-950 p-3">
-                  <div className="text-2xl font-semibold">{graph?.nodes.length || 0}</div>
+                  <div className="text-2xl font-semibold">{visibleNodes.length}</div>
                   <div className="text-xs text-slate-400">узлов</div>
                 </div>
                 <div className="rounded-lg bg-slate-950 p-3">
@@ -389,6 +671,36 @@ export default function AdminGraphEditor() {
                 {graph && !validation.orphanNodes && !validation.invalidEdges && (
                   <div className="flex items-center gap-2 rounded-lg bg-emerald-500/10 p-3 text-sm text-emerald-300">
                     <CheckCircle2 className="h-4 w-4" />JSON структурно валиден
+                  </div>
+                )}
+                {graph?.production_validation && (
+                  <div className={`rounded-lg border p-3 text-sm ${
+                    graph.production_validation.file_sha256_matches
+                    && graph.production_validation.geometry_sha256
+                      === graph.production_validation.embedded_geometry_sha256
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                      : "border-red-500/30 bg-red-500/10 text-red-200"
+                  }`}>
+                    <div className="font-medium">
+                      {graph.production_validation.file_sha256_matches
+                      && graph.production_validation.geometry_sha256
+                        === graph.production_validation.embedded_geometry_sha256
+                        ? "Редактор показывает точный production-граф"
+                        : "SHA или геометрия production-графа не совпадает"}
+                    </div>
+                    <div className="mt-2 break-all font-mono text-[10px] opacity-75">
+                      file: {graph.production_validation.file_sha256}<br />
+                      geometry: {graph.production_validation.geometry_sha256}
+                    </div>
+                  </div>
+                )}
+                {competingBranches && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">
+                    <div className="font-medium">Неоднозначная развилка</div>
+                    <div className="mt-1 text-xs text-amber-200/80">
+                      Зелёная линия — выбранная ветка, оранжевая — ближайший конкурент.
+                      Красная точка — место расхождения, anchor {competingBranches.divergence_anchor}.
+                    </div>
                   </div>
                 )}
               </div>

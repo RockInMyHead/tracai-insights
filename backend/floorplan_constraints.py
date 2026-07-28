@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from heapq import heappop, heappush
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy import ndimage
 
 try:
@@ -28,10 +29,15 @@ try:
 except ImportError:  # pragma: no cover - package import path
     from backend.confidence_calibration import calibrated_probability
 
+try:
+    from floorplan_graph import floorplan_graph_geometry_sha256
+except ImportError:  # pragma: no cover - package import path
+    from backend.floorplan_graph import floorplan_graph_geometry_sha256
+
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_corridor_graph_turn_events_branch_commitment_v32"
+    "kerama_event_state_branch_commit_graph_first_v35"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -96,7 +102,10 @@ INDEPENDENT_MAX_AMBIGUOUS_SCALE_RATIO = 1.18
 MAX_START_SNAP_METERS = 1.50
 MAX_PUBLISHED_START_ERROR_METERS = 0.05
 MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES = 5.0
-GRAPH_MAP_MATCH_MAX_INITIAL_DIRECTION_ERROR_DEGREES = 10.0
+GRAPH_MAP_MATCH_SOFT_INITIAL_DIRECTION_DEGREES = 30.0
+GRAPH_MAP_MATCH_HARD_INITIAL_DIRECTION_DEGREES = 70.0
+GRAPH_MAP_MATCH_INITIAL_DIRECTION_LOOKAHEAD_METERS = 5.0
+GRAPH_MAP_MATCH_PARALLEL_BRANCH_DEGREES = 15.0
 MAX_PUBLISHED_SEGMENT_METERS = 0.75
 
 
@@ -302,6 +311,59 @@ def _polyline_progress_metrics(
     }
 
 
+def _turn_events(
+    points: np.ndarray,
+    *,
+    samples: int = 128,
+    min_turn_degrees: float = TURN_TOPOLOGY_MIN_DEGREES,
+) -> list[tuple[float, float]]:
+    """Return ordered ``(arc_fraction, signed_angle_degrees)`` events."""
+    if len(points) < 3:
+        return []
+    fractions = np.linspace(0.0, 1.0, max(8, int(samples)))
+    sampled = _resample_polyline(np.asarray(points, dtype=np.float64), fractions)
+    vectors = np.diff(sampled, axis=0)
+    headings = np.unwrap(np.arctan2(vectors[:, 1], vectors[:, 0]))
+    if len(headings) >= 5:
+        kernel = np.ones(5, dtype=np.float64) / 5.0
+        headings = np.convolve(
+            np.pad(headings, (2, 2), mode="edge"),
+            kernel,
+            mode="valid",
+        )
+    increments = np.degrees(np.diff(headings))
+    active = np.abs(increments) >= 1.25
+    events: list[tuple[float, float]] = []
+    index = 0
+    while index < len(increments):
+        if not active[index]:
+            index += 1
+            continue
+        sign = math.copysign(1.0, float(increments[index]))
+        end = index + 1
+        gap = 0
+        while end < len(increments):
+            same_sign = (
+                active[end]
+                and math.copysign(1.0, float(increments[end])) == sign
+            )
+            if same_sign:
+                gap = 0
+                end += 1
+                continue
+            gap += 1
+            if gap > 2:
+                break
+            end += 1
+        stop = max(index + 1, end - gap)
+        angle = float(np.sum(increments[index:stop]))
+        if abs(angle) >= float(min_turn_degrees):
+            center = (index + stop) / 2.0 / max(len(increments), 1)
+            events.append((center, angle))
+        index = max(end, index + 1)
+    return events
+
+
 def _turn_topology_metrics(
     source: np.ndarray,
     corrected: np.ndarray,
@@ -343,50 +405,12 @@ def _turn_topology_metrics(
     source_points = _resample_polyline(source, fractions)
     corrected_points = _resample_polyline(corrected, fractions)
 
-    def turn_events(points: np.ndarray) -> list[tuple[float, float]]:
-        vectors = np.diff(points, axis=0)
-        headings = np.unwrap(np.arctan2(vectors[:, 1], vectors[:, 0]))
-        if len(headings) >= 5:
-            kernel = np.ones(5, dtype=np.float64) / 5.0
-            headings = np.convolve(
-                np.pad(headings, (2, 2), mode="edge"),
-                kernel,
-                mode="valid",
-            )
-        increments = np.degrees(np.diff(headings))
-        active = np.abs(increments) >= 1.25
-        events: list[tuple[float, float]] = []
-        index = 0
-        while index < len(increments):
-            if not active[index]:
-                index += 1
-                continue
-            sign = math.copysign(1.0, float(increments[index]))
-            end = index + 1
-            gap = 0
-            while end < len(increments):
-                same_sign = (
-                    active[end]
-                    and math.copysign(1.0, float(increments[end])) == sign
-                )
-                if same_sign:
-                    gap = 0
-                    end += 1
-                    continue
-                gap += 1
-                if gap > 2:
-                    break
-                end += 1
-            stop = max(index + 1, end - gap)
-            angle = float(np.sum(increments[index:stop]))
-            if abs(angle) >= float(min_turn_degrees):
-                center = (index + stop) / 2.0 / max(len(increments), 1)
-                events.append((center, angle))
-            index = max(end, index + 1)
-        return events
-
-    source_events = turn_events(source_points)
-    corrected_events = turn_events(corrected_points)
+    source_events = _turn_events(
+        source_points, samples=samples, min_turn_degrees=min_turn_degrees
+    )
+    corrected_events = _turn_events(
+        corrected_points, samples=samples, min_turn_degrees=min_turn_degrees
+    )
     if not source_events:
         return {
             "turn_count": 0,
@@ -675,6 +699,8 @@ class FloorplanConfig:
     obstacle_mask_sha256: str = ""
     support_mask_file: str = ""
     support_mask_sha256: str = ""
+    topology_graph_file: str = ""
+    topology_graph_sha256: str = ""
     source_pdf: str = "kerama-marazzi-2025.pdf"
     display_image: str = "kerama-marazzi-2025.png"
     default_anchor_reference_pixels: tuple[float, float] | None = None
@@ -701,13 +727,62 @@ class FloorplanConstraintEngine:
         support = None if support_mask is None else np.asarray(support_mask, dtype=bool)
         if support is not None and support.shape != mask.shape:
             raise ValueError("Floorplan support mask shape does not match obstacle mask")
+        self._topology_support_pixels_added = 0
+        self._topology_obstacle_pixels_overridden = 0
+        if support is not None and config.topology_graph_file:
+            graph_path = ASSET_ROOT / config.topology_graph_file
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+            topology_support_image = Image.new(
+                "L", (config.width, config.height), 0
+            )
+            draw = ImageDraw.Draw(topology_support_image)
+            corridor_radius_meters = config.person_radius_meters + 0.35
+            corridor_width_pixels = max(
+                3,
+                int(math.ceil(
+                    2.0 * corridor_radius_meters
+                    / max(config.meters_per_pixel, 1e-9)
+                )),
+            )
+            for edge in graph.get("edges", []):
+                if not edge.get("enabled", True):
+                    continue
+                points = [
+                    (float(point[0]), float(point[1]))
+                    for point in edge.get("points", [])
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ]
+                if len(points) >= 2:
+                    draw.line(
+                        points,
+                        fill=255,
+                        width=corridor_width_pixels,
+                        joint="curve",
+                    )
+            topology_support = (
+                np.asarray(topology_support_image, dtype=np.uint8) >= 128
+            )
+            self._topology_obstacle_pixels_overridden = int(np.count_nonzero(
+                topology_support & mask
+            ))
+            mask = mask & ~topology_support
+            self._topology_support_pixels_added = int(np.count_nonzero(
+                topology_support & ~support
+            ))
+            support = support | topology_support
         # Obstacles are authoritative even for programmatically constructed
         # engines whose input layers overlap.
         if support is not None:
             support = support & ~mask
         self._full_mask = mask | (~support if support is not None else False)
         self._support_mask = support
+        self._topology_node_points = np.empty((0, 2), dtype=np.float64)
+        self._topology_authored_node_count = 0
+        self._topology_adjacency: dict[int, list[tuple[int, float]]] = {}
+        self._topology_segment_edges: dict[tuple[int, int], str] = {}
         self._build_grid(self._full_mask, annotation_mask=mask)
+        if config.topology_graph_file:
+            self._load_topology_graph()
 
     @classmethod
     def load(cls, map_id: str = DEFAULT_FLOORPLAN_ID) -> "FloorplanConstraintEngine":
@@ -728,6 +803,8 @@ class FloorplanConstraintEngine:
             obstacle_mask_sha256=metadata.get("obstacle_mask_sha256", ""),
             support_mask_file=metadata.get("support_mask_file", ""),
             support_mask_sha256=metadata.get("support_mask_sha256", ""),
+            topology_graph_file=metadata.get("topology_graph_file", ""),
+            topology_graph_sha256=metadata.get("topology_graph_sha256", ""),
             source_pdf=metadata.get("source_pdf", "kerama-marazzi-2025.pdf"),
             display_image=metadata.get("display_image", "kerama-marazzi-2025.png"),
             default_anchor_reference_pixels=(
@@ -759,6 +836,477 @@ class FloorplanConstraintEngine:
                     raise ValueError(f"Floorplan support mask hash mismatch for {config.map_id}")
             support = np.asarray(Image.open(support_path).convert("L")) >= 128
         return cls(config, mask, support)
+
+    def _load_topology_graph(self) -> None:
+        graph_path = ASSET_ROOT / self.config.topology_graph_file
+        if self.config.topology_graph_sha256:
+            actual_hash = hashlib.sha256(graph_path.read_bytes()).hexdigest()
+            if actual_hash != self.config.topology_graph_sha256:
+                raise ValueError(
+                    f"Floorplan topology graph hash mismatch for {self.config.map_id}"
+                )
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        if graph.get("schema_version") != "trackai.floorplan_graph.v1":
+            raise ValueError("Unsupported floorplan topology graph schema")
+        embedded_geometry_sha = str(
+            (graph.get("source") or {}).get("geometry_sha256") or ""
+        )
+        actual_geometry_sha = floorplan_graph_geometry_sha256(graph)
+        if embedded_geometry_sha and embedded_geometry_sha != actual_geometry_sha:
+            raise ValueError(
+                f"Floorplan topology graph geometry mismatch for "
+                f"{self.config.map_id}"
+            )
+        enabled_nodes = [
+            node for node in graph.get("nodes", [])
+            if node.get("enabled", True)
+        ]
+        node_index = {
+            str(node["id"]): index for index, node in enumerate(enabled_nodes)
+        }
+        authored_points = np.asarray([
+            [float(node["x"]), float(node["y"])] for node in enabled_nodes
+        ], dtype=np.float64)
+        points = authored_points.tolist()
+        adjacency: dict[int, list[tuple[int, float]]] = {
+            index: [] for index in range(len(authored_points))
+        }
+        segment_edges: dict[tuple[int, int], str] = {}
+        maximum_sample_pixels = (
+            1.0 / max(self.config.meters_per_pixel, 1e-9)
+        )
+        for edge in graph.get("edges", []):
+            if not edge.get("enabled", True):
+                continue
+            left = node_index.get(str(edge.get("from") or ""))
+            right = node_index.get(str(edge.get("to") or ""))
+            if left is None or right is None or left == right:
+                continue
+            start = authored_points[left]
+            end = authored_points[right]
+            distance = float(np.linalg.norm(end - start))
+            if distance <= 1e-9:
+                continue
+            segment_count = max(
+                1, int(math.ceil(distance / maximum_sample_pixels))
+            )
+            chain = [left]
+            for sample_index in range(1, segment_count):
+                ratio = sample_index / segment_count
+                point_index = len(points)
+                points.append(((1.0 - ratio) * start + ratio * end).tolist())
+                adjacency[point_index] = []
+                chain.append(point_index)
+            chain.append(right)
+            for chain_left, chain_right in zip(chain, chain[1:]):
+                weight = float(np.linalg.norm(
+                    np.asarray(points[chain_right])
+                    - np.asarray(points[chain_left])
+                ))
+                adjacency[chain_left].append((chain_right, weight))
+                edge_id = str(edge.get("id") or "")
+                segment_edges[(chain_left, chain_right)] = edge_id
+                if edge.get("bidirectional", True):
+                    adjacency[chain_right].append((chain_left, weight))
+                    segment_edges[(chain_right, chain_left)] = edge_id
+        self._topology_node_points = np.asarray(points, dtype=np.float64)
+        self._topology_authored_node_count = len(authored_points)
+        self._topology_adjacency = adjacency
+        self._topology_segment_edges = segment_edges
+        self._corridor_nodes = np.rint(
+            self._topology_node_points
+            / max(self.config.grid_cell_pixels, 1)
+        ).astype(np.int32)
+
+    def _topology_route(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> Optional[np.ndarray]:
+        if len(self._topology_node_points) == 0:
+            return None
+        start_index = int(np.argmin(np.linalg.norm(
+            self._topology_node_points - start[None, :], axis=1
+        )))
+        end_index = int(np.argmin(np.linalg.norm(
+            self._topology_node_points - end[None, :], axis=1
+        )))
+        if start_index == end_index:
+            return None
+        distances = {start_index: 0.0}
+        parents: dict[int, int] = {}
+        queue = [(0.0, start_index)]
+        while queue:
+            distance, node = heapq.heappop(queue)
+            if distance > distances.get(node, float("inf")):
+                continue
+            if node == end_index:
+                break
+            for neighbour, weight in self._topology_adjacency.get(node, []):
+                candidate = distance + weight
+                if candidate < distances.get(neighbour, float("inf")):
+                    distances[neighbour] = candidate
+                    parents[neighbour] = node
+                    heapq.heappush(queue, (candidate, neighbour))
+        if end_index not in distances:
+            return None
+        indices = [end_index]
+        while indices[-1] != start_index:
+            indices.append(parents[indices[-1]])
+        indices.reverse()
+        return self._topology_node_points[np.asarray(indices, dtype=int)]
+
+    def _topology_edge_sequence(self, route: np.ndarray) -> list[str]:
+        if len(route) < 2 or not self._topology_segment_edges:
+            return []
+        indices = [
+            int(np.argmin(np.linalg.norm(
+                self._topology_node_points - point[None, :], axis=1
+            )))
+            for point in route
+        ]
+        sequence: list[str] = []
+        for left, right in zip(indices, indices[1:]):
+            edge_id = self._topology_segment_edges.get((left, right))
+            if edge_id and (not sequence or sequence[-1] != edge_id):
+                sequence.append(edge_id)
+        return sequence
+
+    def _directed_edge_event_match(
+        self,
+        observation: np.ndarray,
+    ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+        """Follow connected directed graph edges using R3 turn events.
+
+        Unlike the legacy anchor matcher, this search never asks for an
+        unrelated shortest path between two observations. A hypothesis can
+        move only to a neighbour of its current graph node, so parallel aisle
+        hopping is impossible without a real connector.
+        """
+        points = np.asarray(observation, dtype=np.float64)
+        if len(points) < 3 or len(self._topology_node_points) == 0:
+            return None, {"reason": "directed_edge_match_unavailable"}
+        target_length = _polyline_length(points)
+        if target_length <= 1e-6:
+            return None, {"reason": "directed_edge_match_empty_observation"}
+        canonical_points = _resample_polyline(
+            points, np.linspace(0.0, 1.0, 128)
+        )
+        expected = _turn_events(
+            canonical_points,
+            # Use the same canonical event resolution as the production
+            # topology gate; increasing samples changes one physical bend
+            # into several noise events on long R3 sequences.
+            samples=128,
+            min_turn_degrees=TURN_TOPOLOGY_MIN_DEGREES,
+        )
+        radius_pixels = 6.0 / max(self.config.meters_per_pixel, 1e-9)
+        start_distances = np.linalg.norm(
+            self._topology_node_points - points[0][None, :], axis=1
+        )
+        start_nodes = np.argsort(start_distances)[:4]
+        initial_direction = self._topology_route_initial_direction(points)
+        initial_direction /= max(
+            float(np.linalg.norm(initial_direction)), 1e-9
+        )
+
+        initial_heading = math.atan2(
+            float(initial_direction[1]), float(initial_direction[0])
+        )
+        # cost, node, previous, path, travelled, matched events, used arcs,
+        # heading committed after the last matched R3 turn
+        beam: list[
+            tuple[
+                float, int, int, tuple[int, ...], float, int,
+                frozenset[tuple[int, int]], float,
+            ]
+        ] = []
+        for start_node in start_nodes:
+            start_node = int(start_node)
+            start_cost = (
+                float(start_distances[start_node]) / radius_pixels
+            ) ** 2
+            beam.append((
+                start_cost,
+                start_node,
+                -1,
+                (start_node,),
+                0.0,
+                0,
+                frozenset(),
+                initial_heading,
+            ))
+
+        terminals: list[
+            tuple[float, tuple[int, ...], float, int]
+        ] = []
+        best: dict[tuple[int, int, int, int, int], float] = {}
+        maximum_matched_events = 0
+        maximum_travel_fraction = 0.0
+        maximum_steps = min(max(len(self._topology_node_points), 32), 220)
+        for _ in range(maximum_steps):
+            expanded: list[
+                tuple[
+                    float, int, int, tuple[int, ...], float, int,
+                    frozenset[tuple[int, int]], float,
+                ]
+            ] = []
+            for (
+                cost, node, previous, path, travelled, event_index, used_arcs,
+                committed_heading,
+            ) in beam:
+                maximum_matched_events = max(
+                    maximum_matched_events, event_index
+                )
+                maximum_travel_fraction = max(
+                    maximum_travel_fraction,
+                    travelled / target_length,
+                )
+                if (
+                    travelled >= target_length * 0.65
+                    and event_index == len(expected)
+                ):
+                    endpoint_error = float(np.linalg.norm(
+                        self._topology_node_points[node] - points[-1]
+                    )) / radius_pixels
+                    terminals.append((
+                        cost
+                        + 2.0 * abs(travelled / target_length - 1.0)
+                        + 0.35 * endpoint_error ** 2,
+                        path,
+                        travelled,
+                        event_index,
+                    ))
+                if travelled >= target_length * 1.65:
+                    continue
+                current = self._topology_node_points[node]
+                for neighbour, edge_length in self._topology_adjacency.get(
+                    node, []
+                ):
+                    neighbour = int(neighbour)
+                    arc = (node, neighbour)
+                    if (
+                        neighbour == previous
+                        or neighbour in path
+                        or arc in used_arcs
+                    ):
+                        continue
+                    endpoint = self._topology_node_points[neighbour]
+                    direction = endpoint - current
+                    direction_length = max(
+                        float(np.linalg.norm(direction)), 1e-9
+                    )
+                    next_event_index = event_index
+                    next_committed_heading = committed_heading
+                    turn_penalty = 0.0
+                    direction_heading = math.atan2(
+                        float(direction[1]), float(direction[0])
+                    )
+                    if previous < 0:
+                        cosine = float(np.dot(
+                            initial_direction, direction / direction_length
+                        ))
+                        heading_penalty, opposite = (
+                            self._initial_direction_cost(cosine)
+                        )
+                        if opposite:
+                            continue
+                        turn_penalty += heading_penalty
+                    else:
+                        angle = math.degrees(math.atan2(
+                            math.sin(
+                                direction_heading - committed_heading
+                            ),
+                            math.cos(
+                                direction_heading - committed_heading
+                            ),
+                        ))
+                        # A physical bend may be authored as several small
+                        # edge turns. Measure the cumulative heading change
+                        # since the last consumed R3 event.
+                        if abs(angle) >= 35.0:
+                            if next_event_index >= len(expected):
+                                continue
+                            expected_fraction, expected_angle = expected[
+                                next_event_index
+                            ]
+                            event_position = travelled / target_length
+                            if float(expected_angle) * angle < 0.0:
+                                # This is not the next measured event. Keep
+                                # the connected hypothesis alive with a large
+                                # penalty and wait for a compatible branch;
+                                # the terminal full-event gate still forbids
+                                # publishing the extra turn.
+                                turn_penalty += 1.8
+                            else:
+                                turn_penalty += (
+                                2.5 * abs(
+                                    event_position - float(expected_fraction)
+                                )
+                                + 0.7 * abs(angle - float(expected_angle))
+                                / max(abs(float(expected_angle)), 35.0)
+                                )
+                                next_event_index += 1
+                                next_committed_heading = direction_heading
+                    next_length = travelled + float(edge_length)
+                    fraction = float(np.clip(
+                        next_length / target_length, 0.0, 1.0
+                    ))
+                    observed_point = _resample_polyline(
+                        points, np.asarray([fraction], dtype=np.float64)
+                    )[0]
+                    observation_error = (
+                        float(np.linalg.norm(endpoint - observed_point))
+                        / radius_pixels
+                    )
+                    next_cost = (
+                        cost + turn_penalty + 0.22 * observation_error ** 2
+                    )
+                    heading_bin = int(round(
+                        math.degrees(next_committed_heading) / 10.0
+                    ))
+                    key = (
+                        node,
+                        neighbour,
+                        next_event_index,
+                        int(round(fraction * 30.0)),
+                        heading_bin,
+                    )
+                    if next_cost >= best.get(key, float("inf")):
+                        continue
+                    best[key] = next_cost
+                    expanded.append((
+                        next_cost,
+                        neighbour,
+                        node,
+                        path + (neighbour,),
+                        next_length,
+                        next_event_index,
+                        used_arcs | {arc},
+                        next_committed_heading,
+                    ))
+            if not expanded:
+                break
+            expanded.sort(key=lambda item: item[0])
+            beam = expanded[:600]
+        if not terminals:
+            return None, {
+                "reason": "directed_edge_event_sequence_not_found",
+                "expected_turn_events": len(expected),
+                "states_evaluated": len(best),
+                "maximum_matched_turn_events": maximum_matched_events,
+                "maximum_travel_fraction": round(
+                    maximum_travel_fraction, 6
+                ),
+            }
+        terminals.sort(key=lambda item: item[0])
+        best_terminal_topology: Optional[dict[str, Any]] = None
+        best_terminal_route: Optional[np.ndarray] = None
+        for objective, path, travelled, matched_events in terminals:
+            route = self._topology_node_points[
+                np.asarray(path, dtype=int)
+            ]
+            topology = _turn_topology_metrics(points, route)
+            if (
+                best_terminal_topology is None
+                or (
+                    float(topology["sign_mismatch_ratio"]),
+                    abs(int(topology["event_count_delta"])),
+                    float(topology["mean_abs_turn_error_degrees"]),
+                )
+                < (
+                    float(best_terminal_topology["sign_mismatch_ratio"]),
+                    abs(int(best_terminal_topology["event_count_delta"])),
+                    float(best_terminal_topology[
+                        "mean_abs_turn_error_degrees"
+                    ]),
+                )
+            ):
+                best_terminal_topology = topology
+                best_terminal_route = route
+            if not bool(topology["event_sequence_preserved"]):
+                continue
+            return route, {
+                "reason": None,
+                "method": "directed_edge_event_beam_v1",
+                "objective": round(float(objective), 6),
+                "anchors": len(path),
+                "matched_turn_events": matched_events,
+                "expected_turn_events": len(expected),
+                "edge_ids": self._topology_edge_sequence(route),
+                "selected_reconstructed_turn_topology": topology,
+                "states_evaluated": len(best),
+                "branch_commitment": "connected_edges_only",
+            }
+        return None, {
+            "reason": "directed_edge_terminal_topology_mismatch",
+            "expected_turn_events": len(expected),
+            "terminal_candidates": len(terminals),
+            "states_evaluated": len(best),
+            "best_terminal_turn_topology": best_terminal_topology,
+            "best_terminal_trajectory": (
+                [
+                    [round(float(point[0]), 3), round(float(point[1]), 3)]
+                    for point in best_terminal_route
+                ]
+                if best_terminal_route is not None else []
+            ),
+            "best_terminal_edge_ids": (
+                self._topology_edge_sequence(best_terminal_route)
+                if best_terminal_route is not None else []
+            ),
+        }
+
+    def _topology_route_initial_direction(
+        self,
+        route: np.ndarray,
+        *,
+        lookahead_meters: float = GRAPH_MAP_MATCH_INITIAL_DIRECTION_LOOKAHEAD_METERS,
+    ) -> np.ndarray:
+        """Return a stable departure direction measured along a graph route.
+
+        The first topology segment can be shorter than a metre and inherits
+        small editor/snap errors.  Measuring from the snapped graph start to a
+        point several metres down the same route represents the corridor
+        direction instead of the first drawing segment.
+        """
+        points = np.asarray(route, dtype=np.float64)
+        if len(points) < 2:
+            return np.zeros(2, dtype=np.float64)
+        target_pixels = (
+            max(float(lookahead_meters), 0.0)
+            / max(self.config.meters_per_pixel, 1e-9)
+        )
+        travelled = 0.0
+        origin = points[0]
+        for left, right in zip(points, points[1:]):
+            segment = right - left
+            length = float(np.linalg.norm(segment))
+            if length <= 1e-9:
+                continue
+            if travelled + length >= target_pixels:
+                ratio = (target_pixels - travelled) / length
+                target = left + np.clip(ratio, 0.0, 1.0) * segment
+                direction = target - origin
+                if float(np.linalg.norm(direction)) > 1e-9:
+                    return direction
+            travelled += length
+        return points[-1] - origin
+
+    @staticmethod
+    def _initial_direction_cost(direction_cosine: float) -> tuple[float, bool]:
+        """Return a soft heading cost and whether the route is opposite.
+
+        Plausible start branches stay in the Viterbi beam and are resolved by
+        later turn events. Only a clearly contradictory departure is rejected.
+        """
+        angle_degrees = math.degrees(math.acos(float(np.clip(
+            direction_cosine, -1.0, 1.0
+        ))))
+        if angle_degrees > GRAPH_MAP_MATCH_HARD_INITIAL_DIRECTION_DEGREES:
+            return float("inf"), True
+        normalized = angle_degrees / max(
+            GRAPH_MAP_MATCH_SOFT_INITIAL_DIRECTION_DEGREES, 1e-9
+        )
+        return 0.45 * normalized ** 2, False
 
     @classmethod
     def from_mask(
@@ -1736,6 +2284,29 @@ class FloorplanConstraintEngine:
         fixed: bool = False,
         required_component: Optional[int] = None,
     ) -> np.ndarray:
+        if len(self._topology_node_points):
+            distances = np.minimum(
+                np.linalg.norm(
+                    self._topology_node_points - observation[None, :], axis=1
+                ),
+                0.85 * np.linalg.norm(
+                    self._topology_node_points - guide[None, :], axis=1
+                ),
+            )
+            if fixed:
+                return self._topology_node_points[[
+                    int(np.argmin(np.linalg.norm(
+                        self._topology_node_points - guide[None, :], axis=1
+                    )))
+                ]]
+            radius_pixels = (
+                radius_meters / max(self.config.meters_per_pixel, 1e-9)
+            )
+            indices = np.where(distances <= radius_pixels)[0]
+            if not len(indices):
+                return np.empty((0, 2), dtype=np.float64)
+            ranked = indices[np.argsort(distances[indices])]
+            return self._topology_node_points[ranked[:limit]].copy()
         if fixed:
             cell = self._nearest_free(self._pixel_to_cell(guide))
             if cell is None or (
@@ -1826,9 +2397,45 @@ class FloorplanConstraintEngine:
                 "required_component": required_component,
             }
         radius_pixels = radius_meters / max(self.config.meters_per_pixel, 1e-9)
+        # Establish the graph anchor first, then measure the R3 departure over
+        # the same physical lookahead used for graph candidates. Translation
+        # itself does not rotate R3, but this ordering makes both vectors share
+        # one snapped origin and one 3-8 m scale of comparison.
+        snapped_observed = (
+            observed - observed[0] + states[0][0]
+        )
+        stable_initial_direction = self._topology_route_initial_direction(
+            snapped_observed
+        )
+        stable_initial_direction_length = float(np.linalg.norm(
+            stable_initial_direction
+        ))
+        if stable_initial_direction_length <= 1e-9:
+            stable_initial_heading = self._initial_heading(
+                snapped_observed - snapped_observed[0]
+            )
+            stable_initial_direction = np.asarray([
+                math.cos(stable_initial_heading),
+                math.sin(stable_initial_heading),
+            ])
+        else:
+            stable_initial_direction /= stable_initial_direction_length
+        source_turn_events = _turn_events(
+            observed,
+            samples=max(96, len(observed) * 4),
+            min_turn_degrees=TURN_TOPOLOGY_MIN_DEGREES,
+        )
         edge_cache: dict[tuple[int, int, int], float] = {}
         edge_route_cache: dict[tuple[int, int, int], np.ndarray] = {}
+        initial_branch_directions: dict[tuple[int, int, int], np.ndarray] = {}
+        parallel_initial_branch_groups = 0
+        edge_rejections: dict[str, int] = {}
         routed_edge_count = 0
+
+        def reject_edge(key: tuple[int, int, int], reason: str) -> float:
+            edge_rejections[reason] = edge_rejections.get(reason, 0) + 1
+            edge_cache[key] = float("inf")
+            return float("inf")
 
         def edge(layer: int, left: int, right: int) -> float:
             nonlocal routed_edge_count
@@ -1839,14 +2446,38 @@ class FloorplanConstraintEngine:
             visual = observed[layer] - observed[layer - 1]
             mapped = end - start
             visual_length = max(float(np.linalg.norm(visual)), 1e-6)
+            routed_edge = False
+            routed_path: Optional[np.ndarray] = None
+            if len(self._topology_node_points):
+                routed_path = self._topology_route(start, end)
+                if routed_path is None or len(routed_path) < 2:
+                    return reject_edge(key, "explicit_graph_disconnected")
+                mapped = (
+                    self._topology_route_initial_direction(routed_path)
+                    if layer == 1
+                    else routed_path[1] - routed_path[0]
+                )
+                routed_edge = len(routed_path) > 2
+                edge_route_cache[key] = routed_path
+                if layer == 1:
+                    initial_branch_directions[key] = mapped.copy()
             mapped_chord_length = max(float(np.linalg.norm(mapped)), 1e-6)
+            direction_visual = (
+                stable_initial_direction * visual_length
+                if layer == 1 else visual
+            )
             direction_cosine = float(np.clip(
-                np.dot(visual, mapped)
+                np.dot(direction_visual, mapped)
                 / (visual_length * mapped_chord_length),
                 -1.0,
                 1.0,
             ))
-            chord_ratio = mapped_chord_length / visual_length
+            candidate_length = (
+                _polyline_length(routed_path)
+                if routed_path is not None
+                else mapped_chord_length
+            )
+            chord_ratio = candidate_length / visual_length
             # Cheap geometric pruning must happen before A*: candidates that
             # already disagree in chord scale/direction cannot become valid by
             # adding a more expensive detour.
@@ -1854,11 +2485,11 @@ class FloorplanConstraintEngine:
                 not 0.10 <= chord_ratio <= 5.00
                 or direction_cosine < -0.75
             ):
-                edge_cache[key] = float("inf")
-                return float("inf")
-            routed_edge = False
-            routed_path: Optional[np.ndarray] = None
-            if self._segment_collides(start, end):
+                return reject_edge(key, "geometry_pruned")
+            if (
+                routed_path is None
+                and self._segment_collides(start, end)
+            ):
                 start_cell = self._nearest_free(self._pixel_to_cell(start))
                 end_cell = self._nearest_free(self._pixel_to_cell(end))
                 same_component = bool(
@@ -1869,9 +2500,7 @@ class FloorplanConstraintEngine:
                     == int(self._component_ids[end_cell[1], end_cell[0]])
                 )
                 if not allow_component_edges or not same_component:
-                    value = float("inf")
-                    edge_cache[key] = value
-                    return value
+                    return reject_edge(key, "raster_component_disconnected")
                 routed_edge = True
                 observed_edge = np.vstack((
                     observed[layer - 1], observed[layer]
@@ -1902,9 +2531,7 @@ class FloorplanConstraintEngine:
                     routed_path = candidate_route
                     break
                 if routed_path is None:
-                    value = float("inf")
-                    edge_cache[key] = value
-                    return value
+                    return reject_edge(key, "astar_failed")
                 edge_route_cache[key] = routed_path
             mapped_length = max(
                 _polyline_length(routed_path)
@@ -1912,18 +2539,18 @@ class FloorplanConstraintEngine:
                 else float(np.linalg.norm(mapped)),
                 1e-6,
             )
-            if (
-                layer == 1
-                and math.degrees(math.acos(direction_cosine))
-                > GRAPH_MAP_MATCH_MAX_INITIAL_DIRECTION_ERROR_DEGREES
-            ):
-                value = float("inf")
-                edge_cache[key] = value
-                return value
+            initial_direction_penalty = 0.0
+            if layer == 1:
+                initial_direction_penalty, opposite = (
+                    self._initial_direction_cost(direction_cosine)
+                )
+                if opposite:
+                    return reject_edge(key, "initial_direction_opposite")
             value = (
                 1.35 * abs(math.log(mapped_length / visual_length))
                 + 1.7 * (1.0 - direction_cosine)
                 + (0.65 if routed_edge else 0.0)
+                + initial_direction_penalty
             )
             edge_cache[key] = value
             return value
@@ -1958,6 +2585,12 @@ class FloorplanConstraintEngine:
             visual_after = observed[layer] - observed[layer - 1]
             mapped_before = states[layer - 1][left] - states[layer - 2][grand]
             mapped_after = states[layer][right] - states[layer - 1][left]
+            prior_route = edge_route_cache.get((layer - 1, grand, left))
+            next_route = edge_route_cache.get((layer, left, right))
+            if prior_route is not None and len(prior_route) >= 2:
+                mapped_before = prior_route[-1] - prior_route[-2]
+            if next_route is not None and len(next_route) >= 2:
+                mapped_after = next_route[1] - next_route[0]
             visual_before_length = max(float(np.linalg.norm(visual_before)), 1e-6)
             visual_after_length = max(float(np.linalg.norm(visual_after)), 1e-6)
             mapped_before_length = max(float(np.linalg.norm(mapped_before)), 1e-6)
@@ -1966,6 +2599,18 @@ class FloorplanConstraintEngine:
             scale_after = mapped_after_length / visual_after_length
             visual_turn = signed_turn(visual_before, visual_after)
             mapped_turn = signed_turn(mapped_before, mapped_after)
+            anchor_fraction = float(fractions[layer - 1])
+            expected_event = min(
+                source_turn_events,
+                key=lambda item: abs(float(item[0]) - anchor_fraction),
+                default=None,
+            )
+            expected_turn = (
+                math.radians(float(expected_event[1]))
+                if expected_event is not None
+                and abs(float(expected_event[0]) - anchor_fraction) <= 0.04
+                else None
+            )
             turn_delta = math.atan2(
                 math.sin(mapped_turn - visual_turn),
                 math.cos(mapped_turn - visual_turn),
@@ -1975,15 +2620,41 @@ class FloorplanConstraintEngine:
                 + 1.20 * abs(turn_delta) / math.pi
             )
             if (
-                abs(visual_turn) >= math.radians(12.0)
+                expected_turn is not None
                 and abs(mapped_turn) >= math.radians(12.0)
-                and visual_turn * mapped_turn < 0.0
+                and expected_turn * mapped_turn < 0.0
             ):
-                # Local anchor turns are noisy; make the opposite sign very
-                # expensive but keep the dynamic programme connected. The
-                # complete discrete turn-event sequence remains a hard gate
-                # after route reconstruction.
-                value += 4.0
+                # The sign sequence is part of the dynamic-programming state,
+                # not merely a post-hoc quality score. An opposite branch can
+                # never recover the measured event sequence later.
+                edge_rejections["turn_sign_sequence_mismatch"] = (
+                    edge_rejections.get("turn_sign_sequence_mismatch", 0) + 1
+                )
+                return float("inf")
+            if prior_route is not None and next_route is not None:
+                # Branch commitment. Consecutive transitions may meet at a
+                # real graph node, but may not immediately traverse the same
+                # corridor backwards to hop onto a parallel aisle.
+                prior_in = prior_route[-1] - prior_route[-2]
+                next_out = next_route[1] - next_route[0]
+                denominator = max(
+                    float(np.linalg.norm(prior_in))
+                    * float(np.linalg.norm(next_out)),
+                    1e-9,
+                )
+                continuation_cosine = float(
+                    np.dot(prior_in, next_out) / denominator
+                )
+                visual_cosine = float(
+                    np.dot(visual_before, visual_after)
+                    / max(visual_before_length * visual_after_length, 1e-9)
+                )
+                if continuation_cosine < -0.92 and visual_cosine > -0.50:
+                    edge_rejections["branch_commitment_backtrack"] = (
+                        edge_rejections.get("branch_commitment_backtrack", 0)
+                        + 1
+                    )
+                    return float("inf")
             if (
                 abs(mapped_turn) >= math.radians(150.0)
                 and abs(visual_turn) <= math.radians(90.0)
@@ -2006,6 +2677,101 @@ class FloorplanConstraintEngine:
                 value += 2.25
             return value
 
+        def confirmed_prefix(
+            costs: np.ndarray,
+            parents_so_far: list[np.ndarray],
+            completed_layer: int,
+        ) -> dict[str, Any]:
+            """Backtrack the best finite DP history without inventing a tail."""
+            if completed_layer < 1 or not np.isfinite(costs).any():
+                return {}
+            selected_flat = int(np.nanargmin(costs))
+            left, right = np.unravel_index(selected_flat, costs.shape)
+            indices = [int(left), int(right)]
+            for parent in reversed(parents_so_far):
+                grand = int(parent[indices[0], indices[1]])
+                if grand < 0:
+                    return {}
+                indices.insert(0, grand)
+            if len(indices) != completed_layer + 1:
+                return {}
+            stitched: list[np.ndarray] = []
+            edge_ids: list[str] = []
+            previous_node_index: Optional[int] = None
+            for route_layer in range(1, len(indices)):
+                route = edge_route_cache.get((
+                    route_layer,
+                    int(indices[route_layer - 1]),
+                    int(indices[route_layer]),
+                ))
+                if route is None or len(route) < 2:
+                    break
+                if stitched and np.linalg.norm(stitched[-1] - route[0]) < 1e-6:
+                    route = route[1:]
+                stitched.extend(route)
+                for edge_id in self._topology_edge_sequence(route):
+                    if not edge_ids or edge_ids[-1] != edge_id:
+                        edge_ids.append(edge_id)
+                if route_layer == len(indices) - 1:
+                    previous_node_index = int(np.argmin(np.linalg.norm(
+                        self._topology_node_points
+                        - states[route_layer - 1][indices[route_layer - 1]][None, :],
+                        axis=1,
+                    )))
+            if len(stitched) < 2 or not edge_ids:
+                return {}
+            marker = np.asarray(stitched[-1], dtype=np.float64)
+            marker_node = int(np.argmin(np.linalg.norm(
+                self._topology_node_points - marker[None, :], axis=1
+            )))
+            next_visual = (
+                observed[min(completed_layer + 1, len(observed) - 1)]
+                - observed[completed_layer]
+            )
+            next_length = max(float(np.linalg.norm(next_visual)), 1e-9)
+            competing: list[tuple[float, dict[str, Any]]] = []
+            for neighbour, _ in self._topology_adjacency.get(marker_node, []):
+                if previous_node_index is not None and neighbour == previous_node_index:
+                    continue
+                endpoint = self._topology_node_points[neighbour]
+                vector = endpoint - marker
+                cosine = float(np.dot(next_visual, vector) / max(
+                    next_length * float(np.linalg.norm(vector)), 1e-9
+                ))
+                edge_id = self._topology_segment_edges.get(
+                    (marker_node, neighbour)
+                )
+                if not edge_id:
+                    continue
+                competing.append((
+                    -cosine,
+                    {
+                        "edge_id": edge_id,
+                        "points": [
+                            [round(float(value), 3) for value in marker],
+                            [round(float(value), 3) for value in endpoint],
+                        ],
+                        "direction_cosine": round(cosine, 5),
+                    },
+                ))
+            competing.sort(key=lambda item: item[0])
+            return {
+                "_confirmed_prefix": [
+                    [float(value[0]), float(value[1])] for value in stitched
+                ],
+                "_confirmed_edge_ids": edge_ids,
+                "_confirmed_fraction_end": round(
+                    float(fractions[completed_layer]), 8
+                ),
+                "_uncertainty_marker": [
+                    round(float(marker[0]), 3),
+                    round(float(marker[1]), 3),
+                ],
+                "_competing_next_edges": [
+                    item[1] for item in competing[:2]
+                ],
+            }
+
         initial_costs = np.asarray([emission(0, index) for index in range(len(states[0]))])
         if len(states) == 1:
             ranking = np.argsort(initial_costs)
@@ -2020,8 +2786,85 @@ class FloorplanConstraintEngine:
                     pair_costs[left, right] = (
                         float(accumulated) + edge(1, left, right) + emission(1, right)
                     )
+            # Near-collinear departures form one ambiguity class at the start.
+            # Keep every member and its own geometric cost alive; subsequent
+            # signed turn events select the concrete edge. In particular, do
+            # not reject the whole class merely because its members are close.
+            finite_initial_keys = [
+                (left, right)
+                for left in range(len(states[0]))
+                for right in range(len(states[1]))
+                if math.isfinite(float(pair_costs[left, right]))
+                and (1, left, right) in initial_branch_directions
+            ]
+            parallel_threshold = math.cos(math.radians(
+                GRAPH_MAP_MATCH_PARALLEL_BRANCH_DEGREES
+            ))
+            grouped_initial_keys: set[tuple[int, int]] = set()
+            for index, (left, right) in enumerate(finite_initial_keys):
+                if (left, right) in grouped_initial_keys:
+                    continue
+                direction = initial_branch_directions[(1, left, right)]
+                direction_norm = max(float(np.linalg.norm(direction)), 1e-9)
+                group = [(left, right)]
+                for other_left, other_right in finite_initial_keys[index + 1:]:
+                    other = initial_branch_directions[
+                        (1, other_left, other_right)
+                    ]
+                    cosine = float(np.dot(direction, other) / max(
+                        direction_norm * float(np.linalg.norm(other)), 1e-9
+                    ))
+                    if cosine >= parallel_threshold:
+                        group.append((other_left, other_right))
+                if len(group) > 1:
+                    parallel_initial_branch_groups += 1
+                    grouped_initial_keys.update(group)
             if not np.isfinite(pair_costs).any():
-                return None, {"reason": "corridor_graph_disconnected", "failed_layer": 1}
+                start_state = states[0][int(np.argmin(initial_costs))]
+                start_node = int(np.argmin(np.linalg.norm(
+                    self._topology_node_points - start_state[None, :], axis=1
+                )))
+                start_point = self._topology_node_points[start_node]
+                alternatives: list[tuple[float, dict[str, Any]]] = []
+                for neighbour, _ in self._topology_adjacency.get(start_node, []):
+                    endpoint = self._topology_node_points[neighbour]
+                    vector = endpoint - start_point
+                    cosine = float(np.dot(stable_initial_direction, vector) / max(
+                        float(np.linalg.norm(vector)), 1e-9
+                    ))
+                    edge_id = self._topology_segment_edges.get(
+                        (start_node, neighbour)
+                    )
+                    if edge_id:
+                        alternatives.append((
+                            -cosine,
+                            {
+                                "edge_id": edge_id,
+                                "points": [
+                                    [round(float(value), 3) for value in start_point],
+                                    [round(float(value), 3) for value in endpoint],
+                                ],
+                                "direction_cosine": round(cosine, 5),
+                            },
+                        ))
+                alternatives.sort(key=lambda item: item[0])
+                return None, {
+                    "reason": "corridor_graph_disconnected",
+                    "failed_layer": 1,
+                    "edge_rejections": edge_rejections,
+                    "_confirmed_prefix": [
+                        [float(start_point[0]), float(start_point[1])]
+                    ],
+                    "_confirmed_edge_ids": [],
+                    "_confirmed_fraction_end": 0.0,
+                    "_uncertainty_marker": [
+                        round(float(start_point[0]), 3),
+                        round(float(start_point[1]), 3),
+                    ],
+                    "_competing_next_edges": [
+                        item[1] for item in alternatives[:2]
+                    ],
+                }
 
             parents: list[np.ndarray] = []
             for layer in range(2, len(states)):
@@ -2054,6 +2897,10 @@ class FloorplanConstraintEngine:
                     return None, {
                         "reason": "corridor_graph_disconnected",
                         "failed_layer": layer,
+                        "edge_rejections": edge_rejections,
+                        **confirmed_prefix(
+                            pair_costs, parents, layer - 1
+                        ),
                     }
                 parents.append(parent)
                 pair_costs = next_costs
@@ -2062,7 +2909,10 @@ class FloorplanConstraintEngine:
             terminal_candidates: list[
                 tuple[tuple[float, float, float, float], list[int], int]
             ] = []
-            for ranked_flat in flat_ranking[: min(100, len(flat_ranking))]:
+            # Keep every finite terminal pair. The lowest local-cost terminal
+            # is not necessarily the only history with the correct global
+            # signed turn sequence, especially around parallel aisles.
+            for ranked_flat in flat_ranking:
                 ranked_flat = int(ranked_flat)
                 if not math.isfinite(float(pair_costs.reshape(-1)[ranked_flat])):
                     continue
@@ -2102,14 +2952,169 @@ class FloorplanConstraintEngine:
                 ))
             if not terminal_candidates:
                 return None, {"reason": "viterbi_backtrack_failed"}
-            _, indices, selected_flat = min(
+            # The matrix DP above keeps one parent per (previous,current)
+            # pair. Topologically different histories can therefore collapse
+            # before their later turn events disambiguate them. Keep a small
+            # diverse history beam for every terminal pair and rank those
+            # complete histories with the signed event sequence.
+            history_beam: dict[
+                tuple[int, int], list[tuple[float, list[int]]]
+            ] = {}
+            for left in range(len(states[0])):
+                for right in range(len(states[1])):
+                    value = float(
+                        initial_costs[left]
+                        + edge(1, left, right)
+                        + emission(1, right)
+                    )
+                    if math.isfinite(value):
+                        history_beam[(left, right)] = [
+                            (value, [left, right])
+                        ]
+            for layer in range(2, len(states)):
+                next_beam: dict[
+                    tuple[int, int], list[tuple[float, list[int]]]
+                ] = {}
+                for (grand, left), histories in history_beam.items():
+                    for right in range(len(states[layer])):
+                        transition = edge(layer, left, right)
+                        if not math.isfinite(transition):
+                            continue
+                        turn_cost = second_order(
+                            layer, grand, left, right
+                        )
+                        if not math.isfinite(turn_cost):
+                            continue
+                        suffix = transition + turn_cost + emission(layer, right)
+                        key = (left, right)
+                        bucket = next_beam.setdefault(key, [])
+                        for accumulated, history in histories:
+                            bucket.append((
+                                float(accumulated + suffix),
+                                history + [right],
+                            ))
+                expected_prefix_signs = tuple(
+                    1 if float(angle) > 0.0 else -1
+                    for fraction, angle in source_turn_events
+                    if float(fraction) <= float(fractions[layer]) + 0.02
+                )
+                signature_cache: dict[tuple[int, ...], tuple[int, ...]] = {}
+
+                def event_signature(
+                    history: list[int],
+                ) -> tuple[int, ...]:
+                    history_key = tuple(history)
+                    cached = signature_cache.get(history_key)
+                    if cached is not None:
+                        return cached
+                    anchor_path = np.asarray([
+                        states[path_layer][history[path_layer]]
+                        for path_layer in range(len(history))
+                    ], dtype=np.float64)
+                    if len(anchor_path) < 3:
+                        return ()
+                    vectors = np.diff(anchor_path, axis=0)
+                    signature_values: list[int] = []
+                    for before, after in zip(vectors, vectors[1:]):
+                        angle = math.degrees(math.atan2(
+                            float(
+                                before[0] * after[1]
+                                - before[1] * after[0]
+                            ),
+                            float(np.dot(before, after)),
+                        ))
+                        if abs(angle) >= TURN_TOPOLOGY_MIN_DEGREES:
+                            signature_values.append(
+                                1 if angle > 0.0 else -1
+                            )
+                    signature = tuple(signature_values)
+                    signature_cache[history_key] = signature
+                    return signature
+
+                for key, histories in next_beam.items():
+                    histories.sort(key=lambda item: item[0])
+                    histories = histories[:96]
+                    best_by_events: dict[
+                        tuple[int, ...], tuple[float, list[int]]
+                    ] = {}
+                    for item in histories:
+                        signature = event_signature(item[1])
+                        current = best_by_events.get(signature)
+                        if current is None or item[0] < current[0]:
+                            best_by_events[signature] = item
+
+                    def event_rank(
+                        item: tuple[float, list[int]],
+                    ) -> tuple[int, int, float]:
+                        signature = event_signature(item[1])
+                        compared = min(
+                            len(signature), len(expected_prefix_signs)
+                        )
+                        sign_errors = sum(
+                            signature[index]
+                            != expected_prefix_signs[index]
+                            for index in range(compared)
+                        )
+                        return (
+                            sign_errors,
+                            abs(len(signature) - len(expected_prefix_signs)),
+                            float(item[0]),
+                        )
+
+                    diverse = sorted(
+                        best_by_events.values(), key=event_rank
+                    )
+                    next_beam[key] = diverse[:16]
+                history_beam = next_beam
+                if not history_beam:
+                    break
+            beam_terminal_histories: list[
+                tuple[tuple[float, float, float, float], list[int], float]
+            ] = []
+            for histories in history_beam.values():
+                for objective, history in histories:
+                    candidate_path = np.asarray([
+                        states[layer][history[layer]]
+                        for layer in range(len(states))
+                    ])
+                    topology = _turn_topology_metrics(
+                        observed, candidate_path, samples=96
+                    )
+                    beam_terminal_histories.append((
+                        (
+                            0.0
+                            if bool(topology["event_sequence_preserved"])
+                            else 1.0,
+                            float(topology["sign_mismatch_ratio"]),
+                            float(topology["mean_abs_turn_error_degrees"]),
+                            float(objective),
+                        ),
+                        history,
+                        float(objective),
+                    ))
+            matrix_best = min(
                 terminal_candidates, key=lambda item: item[0]
             )
+            beam_best = (
+                min(beam_terminal_histories, key=lambda item: item[0])
+                if beam_terminal_histories else None
+            )
+            if beam_best is not None and beam_best[0] < matrix_best[0]:
+                _, indices, selected_objective = beam_best
+                selected_rank = -1
+            else:
+                _, indices, selected_flat = matrix_best
+                ranking = flat_ranking
+                final_costs = pair_costs.reshape(-1)
+                selected_objective = float(final_costs[selected_flat])
+                selected_rank = int(
+                    np.where(flat_ranking == selected_flat)[0][0]
+                )
             ranking = flat_ranking
             final_costs = pair_costs.reshape(-1)
-            selected_objective = float(final_costs[selected_flat])
-            selected_rank = int(np.where(flat_ranking == selected_flat)[0][0])
-            terminal_candidates_evaluated = len(terminal_candidates)
+            terminal_candidates_evaluated = (
+                len(terminal_candidates) + len(beam_terminal_histories)
+            )
         if len(states) == 1:
             selected_objective = float(final_costs[ranking[0]])
             selected_rank = 0
@@ -2139,6 +3144,40 @@ class FloorplanConstraintEngine:
                         np.where(ranking == candidate_flat)[0][0]
                     ),
                 })
+            existing_histories = {
+                tuple(
+                    int(np.argmin(np.linalg.norm(
+                        np.asarray(states[layer], dtype=np.float64)
+                        - point[None, :],
+                        axis=1,
+                    )))
+                    for layer, point in enumerate(item["path"])
+                )
+                for item in terminal_paths
+            }
+            for _, candidate_indices, objective in beam_terminal_histories:
+                signature = tuple(candidate_indices)
+                if signature in existing_histories:
+                    continue
+                candidate_path = np.asarray([
+                    states[layer][candidate_indices[layer]]
+                    for layer in range(len(states))
+                ])
+                candidate_routes: dict[int, np.ndarray] = {}
+                for layer in range(1, len(candidate_indices)):
+                    route = edge_route_cache.get((
+                        layer,
+                        int(candidate_indices[layer - 1]),
+                        int(candidate_indices[layer]),
+                    ))
+                    if route is not None:
+                        candidate_routes[layer - 1] = route
+                terminal_paths.append({
+                    "path": candidate_path,
+                    "edge_routes": candidate_routes,
+                    "objective": float(objective),
+                    "cost_rank": -1,
+                })
         selected_edge_routes: dict[int, np.ndarray] = {}
         for layer in range(1, len(indices)):
             route = edge_route_cache.get(
@@ -2163,11 +3202,84 @@ class FloorplanConstraintEngine:
             "states_min": min(len(layer) for layer in states),
             "states_max": max(len(layer) for layer in states),
             "implicit_edges_evaluated": len(edge_cache),
+            "edge_rejections": edge_rejections,
+            "parallel_initial_branch_groups":
+                parallel_initial_branch_groups,
+            "initial_direction_policy": {
+                "origin": "snapped_graph_start",
+                "lookahead_meters":
+                    GRAPH_MAP_MATCH_INITIAL_DIRECTION_LOOKAHEAD_METERS,
+                "soft_penalty_degrees":
+                    GRAPH_MAP_MATCH_SOFT_INITIAL_DIRECTION_DEGREES,
+                "hard_rejection_degrees":
+                    GRAPH_MAP_MATCH_HARD_INITIAL_DIRECTION_DEGREES,
+                "parallel_branch_degrees":
+                    GRAPH_MAP_MATCH_PARALLEL_BRANCH_DEGREES,
+            },
             "component_routed_edges": routed_edge_count,
             "component_edges_enabled": allow_component_edges,
             "required_component": required_component,
             "_selected_edge_routes": selected_edge_routes,
             "_terminal_paths": terminal_paths,
+        }
+
+    @staticmethod
+    def _viterbi_prefix_candidate(partial: dict[str, Any]) -> dict[str, Any]:
+        trajectory = partial.get("_confirmed_prefix") or []
+        edge_ids = partial.get("_confirmed_edge_ids") or []
+        if len(trajectory) < 2 or not edge_ids:
+            marker = partial.get("_uncertainty_marker")
+            alternatives = partial.get("_competing_next_edges") or []
+            if marker and alternatives:
+                return {
+                    "available": True,
+                    "reason": "viterbi_correspondence_lost_at_start",
+                    "trajectory": [marker],
+                    "segments": [],
+                    "confirmed_segments": 0,
+                    "uncertain_segments": 0,
+                    "confirmed_source_fraction": 0.0,
+                    "uncertainty_source_fraction_start": 0.0,
+                    "uncertainty_marker": marker,
+                    "competing_next_edges": alternatives[:2],
+                    "policy": "stop_at_last_confirmed_viterbi_node_v2",
+                }
+            return {
+                "available": False,
+                "reason": "no_confirmed_viterbi_edge",
+                "trajectory": [],
+                "segments": [],
+                "uncertainty_marker": partial.get("_uncertainty_marker"),
+                "competing_next_edges": [],
+                "policy": "stop_at_last_confirmed_viterbi_node_v2",
+            }
+        return {
+            "available": True,
+            "reason": "viterbi_correspondence_lost",
+            "trajectory": trajectory,
+            "segments": [{
+                "start_index": 0,
+                "end_index": len(trajectory) - 1,
+                "source_fraction_start": 0.0,
+                "source_fraction_end": partial.get(
+                    "_confirmed_fraction_end", 0.0
+                ),
+                "status": "confirmed",
+                "edge_ids": edge_ids,
+            }],
+            "confirmed_segments": 1,
+            "uncertain_segments": 0,
+            "confirmed_source_fraction": partial.get(
+                "_confirmed_fraction_end", 0.0
+            ),
+            "uncertainty_source_fraction_start": partial.get(
+                "_confirmed_fraction_end", 0.0
+            ),
+            "uncertainty_marker": partial.get("_uncertainty_marker"),
+            "competing_next_edges": (
+                partial.get("_competing_next_edges") or []
+            )[:2],
+            "policy": "stop_at_last_confirmed_viterbi_node_v2",
         }
 
     def _multilevel_viterbi_map_match(
@@ -2180,13 +3292,55 @@ class FloorplanConstraintEngine:
         diagnostics: dict[str, Any] = {
             "attempted": True,
             "accepted": False,
-            "method": "corridor_graph_multilevel_viterbi_v4_turn_events_branch_commitment",
+            "method": "directed_edge_events_then_anchor_fallback_v1",
             "corridor_graph_nodes": int(len(self._corridor_nodes)),
         }
+        directed_route, directed_diag = self._directed_edge_event_match(
+            observation
+        )
+        diagnostics["directed_edge_search"] = directed_diag
+        if directed_route is not None:
+            if (
+                not self._point_occupied(observation[0])
+                and not self._segment_collides(
+                    observation[0], directed_route[0]
+                )
+            ):
+                directed_route = directed_route.copy()
+                directed_route[0] = observation[0]
+            diagnostics.update({
+                "reason": None,
+                "method": "directed_edge_event_beam_v1",
+                "fine": {
+                    "reason": None,
+                    "objective": directed_diag["objective"],
+                    "anchors": directed_diag["anchors"],
+                    "selected_reconstructed_turn_topology":
+                        directed_diag[
+                            "selected_reconstructed_turn_topology"
+                        ],
+                },
+                "post_repair_segments": max(
+                    0, len(directed_route) - 1
+                ),
+                "graph_edges": max(0, len(directed_route) - 1),
+                "graph_routed_edges": max(0, len(directed_route) - 1),
+                "graph_reconstruction": "directed_connected_edges",
+                "start_anchor_preserved": bool(
+                    np.linalg.norm(directed_route[0] - observation[0]) < 1e-6
+                ),
+            })
+            return directed_route, diagnostics
+        if os.getenv("TRACKAI_DIRECTED_EDGE_ONLY", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            diagnostics["reason"] = directed_diag.get("reason")
+            return None, diagnostics
         coarse_fractions = self._adaptive_anchor_fractions(observation, maximum=14)
         coarse = None
         coarse_diag: dict[str, Any] = {"reason": "not_attempted"}
         coarse_attempts: list[dict[str, Any]] = []
+        best_partial: dict[str, Any] = {}
         # Always prove that the local corridor cannot explain the observation
         # before widening into plant-scale branch search.
         search_levels = (
@@ -2200,7 +3354,21 @@ class FloorplanConstraintEngine:
             if allow_global_recovery
             else ((6.0, 16, False), (12.0, 18, False))
         )
+        local_loss_proven = False
+        topology_blockers = {
+            "turn_sign_sequence_mismatch",
+            "branch_commitment_backtrack",
+            "unobserved_internal_turn",
+        }
         for radius_meters, candidate_limit, component_edges in search_levels:
+            if radius_meters > 12.0 and not local_loss_proven:
+                coarse_attempts.append({
+                    "radius_meters": radius_meters,
+                    "candidate_limit": candidate_limit,
+                    "recovery_stage": "global_radius_blocked",
+                    "reason": "local_correspondence_loss_not_proven",
+                })
+                continue
             coarse, coarse_diag = self._viterbi_level(
                 observation,
                 baseline,
@@ -2224,15 +3392,35 @@ class FloorplanConstraintEngine:
                     if not key.startswith("_")
                 },
             })
+            if (
+                coarse_diag.get("_confirmed_prefix")
+                and float(coarse_diag.get("_confirmed_fraction_end", 0.0))
+                > float(best_partial.get("_confirmed_fraction_end", -1.0))
+            ):
+                best_partial = {
+                    key: value for key, value in coarse_diag.items()
+                    if key.startswith("_")
+                }
             if coarse is not None:
                 break
+            if radius_meters == 12.0:
+                rejection_keys = set(
+                    (coarse_diag.get("edge_rejections") or {}).keys()
+                )
+                local_loss_proven = not bool(
+                    rejection_keys & topology_blockers
+                )
         coarse_diag.pop("_selected_edge_routes", None)
         coarse_diag.pop("_terminal_paths", None)
         diagnostics["coarse"] = coarse_diag
         diagnostics["coarse_attempts"] = coarse_attempts
         diagnostics["global_recovery_enabled"] = allow_global_recovery
+        diagnostics["local_correspondence_loss_proven"] = local_loss_proven
         if coarse is None:
             diagnostics["reason"] = coarse_diag.get("reason")
+            diagnostics["graph_first_candidate"] = (
+                self._viterbi_prefix_candidate(best_partial)
+            )
             return None, diagnostics
         fine_fractions = self._adaptive_anchor_fractions(observation, maximum=36)
         fine_guide = _resample_polyline(coarse, _trajectory_fractions(baseline))
@@ -2263,12 +3451,19 @@ class FloorplanConstraintEngine:
                     if not key.startswith("_")
                 },
             })
+        fine_partial = {
+            key: value for key, value in fine_diag.items()
+            if key.startswith("_")
+        }
         selected_fine_edge_routes = fine_diag.pop("_selected_edge_routes", {})
         terminal_paths = fine_diag.pop("_terminal_paths", [])
         diagnostics["fine"] = fine_diag
         diagnostics["fine_attempts"] = fine_attempts
         if fine is None:
             diagnostics["reason"] = fine_diag.get("reason")
+            diagnostics["graph_first_candidate"] = (
+                self._viterbi_prefix_candidate(fine_partial or best_partial)
+            )
             return None, diagnostics
 
         # Rank complete reconstructed candidates. Anchor-only topology is not
@@ -2311,18 +3506,195 @@ class FloorplanConstraintEngine:
                 topology,
             ))
         if reconstructed_candidates:
+            reconstructed_candidates.sort(key=lambda item: item[0])
             (
                 _,
                 fine,
                 selected_fine_edge_routes,
                 selected_reconstructed_topology,
-            ) = min(reconstructed_candidates, key=lambda item: item[0])
+            ) = reconstructed_candidates[0]
             diagnostics["fine"]["reconstructed_candidates_evaluated"] = len(
                 reconstructed_candidates
             )
             diagnostics["fine"]["selected_reconstructed_turn_topology"] = (
                 selected_reconstructed_topology
             )
+            if len(reconstructed_candidates) >= 2:
+                def terminal_edge_sequence(
+                    routes: dict[int, np.ndarray],
+                ) -> list[str]:
+                    raw = [
+                        edge_id
+                        for index in sorted(routes)
+                        for edge_id in self._topology_edge_sequence(routes[index])
+                    ]
+                    return [
+                        edge_id for index, edge_id in enumerate(raw)
+                        if index == 0 or edge_id != raw[index - 1]
+                    ]
+
+                selected_path = np.asarray(
+                    reconstructed_candidates[0][1], dtype=np.float64
+                )
+                selected_routes = reconstructed_candidates[0][2]
+                selected_edges = terminal_edge_sequence(selected_routes)
+                competing_index = next((
+                    index
+                    for index, candidate in enumerate(
+                        reconstructed_candidates[1:], start=1
+                    )
+                    if terminal_edge_sequence(candidate[2]) != selected_edges
+                ), None)
+                competing_path = (
+                    np.asarray(
+                        reconstructed_candidates[competing_index][1],
+                        dtype=np.float64,
+                    )
+                    if competing_index is not None else None
+                )
+                competing_edges = (
+                    terminal_edge_sequence(
+                        reconstructed_candidates[competing_index][2]
+                    )
+                    if competing_index is not None else []
+                )
+            else:
+                competing_path = None
+            if competing_path is not None:
+                compared = min(len(selected_path), len(competing_path))
+                divergence_index = next((
+                    index for index in range(compared)
+                    if float(np.linalg.norm(
+                        selected_path[index] - competing_path[index]
+                    )) > max(
+                        1.0,
+                        0.75 / max(self.config.meters_per_pixel, 1e-9),
+                    )
+                ), None)
+                if divergence_index is not None:
+                    start = max(0, divergence_index - 1)
+                    stop = min(
+                        compared,
+                        divergence_index + 5,
+                    )
+                    diagnostics["competing_branches"] = {
+                        "ambiguous": True,
+                        "divergence_anchor": int(divergence_index),
+                        "divergence_point": [
+                            round(float(value), 3)
+                            for value in selected_path[
+                                max(0, divergence_index - 1)
+                            ]
+                        ],
+                        "selected": [
+                            [round(float(value), 3) for value in point]
+                            for point in selected_path[start:stop]
+                        ],
+                        "alternative": [
+                            [round(float(value), 3) for value in point]
+                            for point in competing_path[start:stop]
+                        ],
+                        "selected_turn_topology": (
+                            reconstructed_candidates[0][3]
+                        ),
+                        "alternative_turn_topology": (
+                            reconstructed_candidates[competing_index][3]
+                        ),
+                        "selected_edge_ids": selected_edges,
+                        "alternative_edge_ids": competing_edges,
+                    }
+
+            selected_cost_per_anchor = (
+                float(diagnostics["fine"].get("objective", float("inf")))
+                / max(int(diagnostics["fine"].get("anchors", 0)), 1)
+            )
+            selected_sequence_preserved = bool(
+                selected_reconstructed_topology["event_sequence_preserved"]
+            )
+            if (
+                not selected_sequence_preserved
+                or selected_cost_per_anchor
+                > GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR
+            ):
+                # A connected path is not a successful graph match. Find the
+                # longest prefix whose complete reconstructed turn sequence is
+                # still compatible with R3 and publish only that prefix.
+                confirmed_route: list[np.ndarray] = []
+                confirmed_edge_ids: list[str] = []
+                confirmed_fraction = 0.0
+                for edge_index in range(max(0, len(fine) - 1)):
+                    route = selected_fine_edge_routes.get(edge_index)
+                    if route is None:
+                        route = np.vstack((fine[edge_index], fine[edge_index + 1]))
+                    candidate_route = list(confirmed_route)
+                    candidate_piece = route
+                    if (
+                        candidate_route
+                        and np.linalg.norm(candidate_route[-1] - route[0]) < 1e-6
+                    ):
+                        candidate_piece = route[1:]
+                    candidate_route.extend(candidate_piece)
+                    if len(candidate_route) < 2:
+                        continue
+                    fraction_end = float(fine_fractions[edge_index + 1])
+                    source_prefix = _resample_polyline(
+                        observation,
+                        np.linspace(
+                            0.0,
+                            fraction_end,
+                            max(24, 6 * (edge_index + 2)),
+                        ),
+                    )
+                    prefix_metrics = _turn_topology_metrics(
+                        source_prefix,
+                        np.asarray(candidate_route, dtype=np.float64),
+                    )
+                    if not bool(prefix_metrics["event_sequence_preserved"]):
+                        break
+                    confirmed_route = candidate_route
+                    for edge_id in self._topology_edge_sequence(route):
+                        if (
+                            not confirmed_edge_ids
+                            or confirmed_edge_ids[-1] != edge_id
+                        ):
+                            confirmed_edge_ids.append(edge_id)
+                    confirmed_fraction = fraction_end
+                partial: dict[str, Any] = {}
+                if len(confirmed_route) >= 2 and confirmed_edge_ids:
+                    marker = np.asarray(confirmed_route[-1], dtype=np.float64)
+                    partial = {
+                        "_confirmed_prefix": [
+                            [float(point[0]), float(point[1])]
+                            for point in confirmed_route
+                        ],
+                        "_confirmed_edge_ids": confirmed_edge_ids,
+                        "_confirmed_fraction_end": round(
+                            confirmed_fraction, 8
+                        ),
+                        "_uncertainty_marker": [
+                            round(float(marker[0]), 3),
+                            round(float(marker[1]), 3),
+                        ],
+                        "_competing_next_edges": [],
+                    }
+                diagnostics["reason"] = (
+                    "turn_event_sequence_mismatch"
+                    if not selected_sequence_preserved
+                    else "viterbi_cost_exceeded"
+                )
+                diagnostics["graph_first_candidate"] = (
+                    self._viterbi_prefix_candidate(partial)
+                )
+                diagnostics["strict_graph_gate"] = {
+                    "event_sequence_preserved":
+                        selected_sequence_preserved,
+                    "viterbi_cost_per_anchor": round(
+                        selected_cost_per_anchor, 6
+                    ),
+                    "maximum_viterbi_cost_per_anchor":
+                        GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR,
+                }
+                return None, diagnostics
 
         # The first map state is represented by a grid-cell centre, while the
         # operator's start marker is a sub-cell plan coordinate. Preserve that
@@ -2800,9 +4172,19 @@ class FloorplanConstraintEngine:
                     )
             else:
                 topology_recovery = None
+            operator_graph_match_required = bool(
+                topology_recovery_enabled
+                and observation_policy == "authoritative"
+                and self._topology_authored_node_count > 0
+                and len(hypothesis["points"])
+                >= GRAPH_MAP_MATCH_MIN_OBSERVATIONS
+            )
             if (
                 topology_recovery_enabled
-                and int(repair_diagnostics.get("provisional_spike_count", 0)) > 0
+                and (
+                    int(repair_diagnostics.get("provisional_spike_count", 0)) > 0
+                    or operator_graph_match_required
+                )
                 and len(hypothesis["points"]) >= GRAPH_MAP_MATCH_MIN_OBSERVATIONS
             ):
                 topology_recovery_attempted += 1
@@ -2812,7 +4194,12 @@ class FloorplanConstraintEngine:
                     allow_global_recovery=observation_policy == "authoritative",
                 )
                 topology_recovery.update({
-                    "phase": "preselection_spike_recovery",
+                    "phase": (
+                        "operator_graph_edge_sequence"
+                        if operator_graph_match_required
+                        else "preselection_spike_recovery"
+                    ),
+                    "operator_graph_mandatory": operator_graph_match_required,
                     "provisional_detours": repair_diagnostics.get("detours", []),
                     "production_enabled": True,
                     "scale": round(float(hypothesis["scale"]), 9),
@@ -2841,12 +4228,14 @@ class FloorplanConstraintEngine:
             # raster-edge nick, but no residual collision is publishable.
             residual_collision_budget = 0.0
             residual_segment_budget_meters = 0.0
-            if corrected_metrics["outside_ratio"] > 0.0 or (
+            if not graph_matching_used and (
+                corrected_metrics["outside_ratio"] > 0.0 or (
                 self._collision_runs(repaired)
                 and (
                     corrected_metrics["collision_ratio"] > residual_collision_budget
                     or self._max_collision_run_meters(repaired)
                     > residual_segment_budget_meters
+                )
                 )
             ):
                 route_failures = []
@@ -3025,8 +4414,16 @@ class FloorplanConstraintEngine:
                 and maximum_correction <= maximum_correction_budget
                 and minimum_length_ratio <= length_ratio <= 1.50
                 and sharp_reverse_ratio <= maximum_sharp_reverse_ratio
-                and corrected_metrics["collision_ratio"] <= residual_collision_budget
-                and max_residual_collision_meters <= residual_segment_budget_meters
+                and (
+                    graph_matching_used
+                    or corrected_metrics["collision_ratio"]
+                    <= residual_collision_budget
+                )
+                and (
+                    graph_matching_used
+                    or max_residual_collision_meters
+                    <= residual_segment_budget_meters
+                )
                 and turn_topology_preserved
                 and metric_preserved
                 and progress_preserved
@@ -3099,6 +4496,25 @@ class FloorplanConstraintEngine:
             })
 
         if not feasible:
+            partial_candidates = [
+                item.get("graph_first_candidate")
+                for item in topology_recovery_diagnostics
+                if isinstance(item.get("graph_first_candidate"), dict)
+                and item["graph_first_candidate"].get("available")
+            ]
+            graph_first_candidate = max(
+                partial_candidates,
+                key=lambda item: float(
+                    item.get("confirmed_source_fraction", 0.0)
+                ),
+                default={
+                    "available": False,
+                    "reason": "no_confirmed_viterbi_edge",
+                    "trajectory": [],
+                    "segments": [],
+                    "policy": "stop_at_last_confirmed_viterbi_node_v2",
+                },
+            )
             return {
                 "accepted": False,
                 "trajectory": [],
@@ -3123,6 +4539,7 @@ class FloorplanConstraintEngine:
                     "segmented_recovery_attempted": segmented_recovery_attempted,
                     "segmented_recovery_accepted": segmented_recovery_accepted,
                     "segmented_recovery_diagnostics": segmented_recovery_diagnostics,
+                    "graph_first_candidate": graph_first_candidate,
                     "raw_collision_ratio": round(float(hypotheses[0]["collision_ratio"]), 6),
                 },
             }
@@ -3173,6 +4590,36 @@ class FloorplanConstraintEngine:
                 shape_fallback_budget = float("inf")
         if not production_feasible:
             closest = feasible[0]
+            topology_candidate = (
+                (closest.get("topology_recovery") or {}).get(
+                    "graph_first_candidate"
+                )
+            )
+            partial_candidates = [
+                candidate
+                for recovery in topology_recovery_diagnostics
+                for candidate in [recovery.get("graph_first_candidate")]
+                if isinstance(candidate, dict)
+                and candidate.get("available")
+            ]
+            if (
+                isinstance(topology_candidate, dict)
+                and topology_candidate.get("available")
+            ):
+                partial_candidates.append(topology_candidate)
+            graph_first_candidate = max(
+                partial_candidates,
+                key=lambda item: float(
+                    item.get("confirmed_source_fraction", 0.0)
+                ),
+                default={
+                    "available": False,
+                    "reason": "strict_gate_rejected_without_partial_prefix",
+                    "trajectory": [],
+                    "segments": [],
+                    "policy": "stop_at_last_confirmed_viterbi_node_v2",
+                },
+            )
             closest_displacement = closest["displacement_m"]
             closest_p95 = (
                 float(np.percentile(closest_displacement, 95))
@@ -3188,6 +4635,10 @@ class FloorplanConstraintEngine:
                         if not bool(closest.get("metric_preserved", True))
                         else "insufficient_independent_net_progress"
                         if not bool(closest.get("progress_preserved", True))
+                        else "turn_event_sequence_mismatch"
+                        if not bool(
+                            closest.get("turn_topology_preserved", False)
+                        )
                         else "map_correction_exceeds_observation_budget"
                     ),
                     "rejection_reasons": [
@@ -3195,6 +4646,10 @@ class FloorplanConstraintEngine:
                         if not bool(closest.get("metric_preserved", True))
                         else "compressed_or_looping_independent_observation"
                         if not bool(closest.get("progress_preserved", True))
+                        else "turn_event_sequence_mismatch"
+                        if not bool(
+                            closest.get("turn_topology_preserved", False)
+                        )
                         else "topology_destroying_map_correction"
                     ],
                     "hypothesis_count": len(hypotheses),
@@ -3207,6 +4662,7 @@ class FloorplanConstraintEngine:
                     "segmented_recovery_attempted": segmented_recovery_attempted,
                     "segmented_recovery_accepted": segmented_recovery_accepted,
                     "segmented_recovery_diagnostics": segmented_recovery_diagnostics,
+                    "graph_first_candidate": graph_first_candidate,
                     "correction_p95_meters": round(closest_p95, 3),
                     "correction_budget_meters": round(
                         float(closest["correction_budget_meters"]), 3
@@ -3361,7 +4817,7 @@ class FloorplanConstraintEngine:
             nonlinear_diagnostics: dict[str, Any] = {
                 "attempted": False,
                 "accepted": False,
-                "method": "corridor_graph_multilevel_viterbi_v4_turn_events_branch_commitment",
+                "method": "corridor_graph_multilevel_viterbi_v5_signed_events_branch_lock",
                 "reason": (
                     "global_solution_stable"
                     if nonlinear_map_matching_enabled
@@ -3372,12 +4828,21 @@ class FloorplanConstraintEngine:
         should_attempt_nonlinear = (
             preselection_recovery is None
             and nonlinear_map_matching_enabled
-            # A safe local correction is already the higher-fidelity answer.
-            # Run the global graph only when the baseline had to move far
-            # enough that local shape preservation is genuinely doubtful.
-            and p95_correction > 2.0
+            and (
+                # An operator-authored production graph is authoritative:
+                # always select/verify its edge sequence before publishing,
+                # even when local A* happened to make only a small correction.
+                # Raster-only maps retain the conservative legacy threshold.
+                (
+                    observation_policy == "authoritative"
+                    and self._topology_authored_node_count > 0
+                    and len(best["points"]) >= GRAPH_MAP_MATCH_MIN_OBSERVATIONS
+                )
+                or p95_correction > 2.0
+            )
         )
         if should_attempt_nonlinear:
+            topology_recovery_attempted += 1
             nonlinear, nonlinear_diagnostics = self._multilevel_viterbi_map_match(
                 best["points"],
                 repaired,
@@ -3385,6 +4850,11 @@ class FloorplanConstraintEngine:
             )
             nonlinear_diagnostics["production_enabled"] = True
             nonlinear_diagnostics["phase"] = "postselection_refinement"
+            nonlinear_diagnostics["operator_graph_mandatory"] = bool(
+                observation_policy == "authoritative"
+                and self._topology_authored_node_count > 0
+            )
+            topology_recovery_diagnostics.append(nonlinear_diagnostics)
             if nonlinear is not None:
                 nonlinear_matched = _resample_polyline(
                     nonlinear, _trajectory_fractions(best["points"])
@@ -3468,6 +4938,7 @@ class FloorplanConstraintEngine:
                     "metric_preserved": nonlinear_metric_preserved,
                 })
                 if improves and bounded:
+                    topology_recovery_accepted += 1
                     repaired = nonlinear
                     corrected_metrics = self._path_metrics(repaired)
                     displacement_m = nonlinear_displacement
@@ -3684,7 +5155,7 @@ class FloorplanConstraintEngine:
             math.degrees(direction_error_radians)
         )
         maximum_published_direction_error_degrees = (
-            GRAPH_MAP_MATCH_MAX_INITIAL_DIRECTION_ERROR_DEGREES
+            GRAPH_MAP_MATCH_HARD_INITIAL_DIRECTION_DEGREES
             if best.get("graph_matching_used")
             else MAX_PUBLISHED_INITIAL_DIRECTION_ERROR_DEGREES
         )
@@ -3839,6 +5310,11 @@ def get_floorplan_engine(map_id: str = DEFAULT_FLOORPLAN_ID) -> FloorplanConstra
         engine = FloorplanConstraintEngine.load(map_id)
         _ENGINE_CACHE[map_id] = engine
     return engine
+
+
+def invalidate_floorplan_engine(map_id: str = DEFAULT_FLOORPLAN_ID) -> None:
+    """Drop a cached engine after an atomic production graph update."""
+    _ENGINE_CACHE.pop(map_id, None)
 
 
 def _map_turn_points(
@@ -4161,6 +5637,7 @@ def apply_floorplan_constraints(
         "candidate_results": [],
     }
     selected_observation: Optional[dict[str, Any]] = None
+    authoritative_graph_diagnostics: list[dict[str, Any]] = []
     alignment: dict[str, Any] = {
         "accepted": False,
         "trajectory": [],
@@ -4235,6 +5712,8 @@ def apply_floorplan_constraints(
                 )
                 diag = dict(candidate_alignment.get("diagnostics") or {})
                 diag["anchor_source"] = anchor_source
+                if observation["source"] != "lingbot_independent":
+                    authoritative_graph_diagnostics.append(diag)
                 candidate_alignment = {**candidate_alignment, "diagnostics": diag}
                 if (
                     observation["source"] == "lingbot_independent"
@@ -4317,6 +5796,16 @@ def apply_floorplan_constraints(
                         observation.get("loop_closure_verified", False)
                     ),
                     "corrected_progress": diag.get("corrected_progress"),
+                    "topology_recovery_enabled": bool(
+                        diag.get("topology_recovery_enabled", False)
+                    ),
+                    "topology_recovery_attempted": int(
+                        diag.get("topology_recovery_attempted", 0) or 0
+                    ),
+                    "topology_recovery_accepted": int(
+                        diag.get("topology_recovery_accepted", 0) or 0
+                    ),
+                    "graph_first_candidate": diag.get("graph_first_candidate"),
                 })
             accepted = [
                 item for item in tier_evaluated
@@ -4406,6 +5895,97 @@ def apply_floorplan_constraints(
 
     updated = dict(result)
     diagnostics = dict(alignment.get("diagnostics") or {})
+    # When every observation is rejected, ``alignment`` above intentionally
+    # points at the most informative rejection.  That candidate may be an
+    # independent LingBot observation, for which graph recovery is disabled.
+    # Never let its candidate-local flag masquerade as the state of the
+    # authoritative R3 graph matcher for the whole production run.
+    reported_candidate_topology_enabled = bool(
+        diagnostics.get("topology_recovery_enabled", False)
+    )
+    authoritative_topology_enabled = any(
+        bool(item.get("topology_recovery_enabled", False))
+        for item in authoritative_graph_diagnostics
+    )
+    authoritative_topology_attempted = sum(
+        int(item.get("topology_recovery_attempted", 0) or 0)
+        for item in authoritative_graph_diagnostics
+    )
+    authoritative_topology_accepted = sum(
+        int(item.get("topology_recovery_accepted", 0) or 0)
+        for item in authoritative_graph_diagnostics
+    )
+    diagnostics["reported_candidate_topology_recovery_enabled"] = (
+        reported_candidate_topology_enabled
+    )
+    diagnostics["topology_recovery_enabled"] = (
+        authoritative_topology_enabled
+        if authoritative_graph_diagnostics
+        else reported_candidate_topology_enabled
+    )
+    diagnostics["authoritative_topology_recovery_attempted"] = (
+        authoritative_topology_attempted
+    )
+    diagnostics["authoritative_topology_recovery_accepted"] = (
+        authoritative_topology_accepted
+    )
+    diagnostics["authoritative_graph_matching"] = {
+        "candidate_count": len(authoritative_graph_diagnostics),
+        "configured": any(
+            bool(item.get("graph_map_matching_configured", False))
+            for item in authoritative_graph_diagnostics
+        ),
+        "enabled": authoritative_topology_enabled,
+        "attempted": authoritative_topology_attempted,
+        "accepted": authoritative_topology_accepted,
+    }
+    graph_first_sources = [
+        item
+        for item in source_selection["candidate_results"]
+        if item.get("source") != "lingbot_independent"
+        and isinstance(item.get("graph_first_candidate"), dict)
+        and item["graph_first_candidate"].get("available")
+    ]
+    graph_first_source = max(
+        graph_first_sources,
+        key=lambda item: float(
+            item["graph_first_candidate"].get(
+                "confirmed_source_fraction", 0.0
+            )
+        ),
+        default=None,
+    )
+    if not alignment.get("accepted") and graph_first_source is not None:
+        graph_first = graph_first_source["graph_first_candidate"]
+        updated["graph_first_trajectory"] = graph_first["trajectory"]
+        updated["graph_first_segments"] = graph_first["segments"]
+        updated["graph_first_uncertainty"] = {
+            "marker": graph_first.get("uncertainty_marker"),
+            "competing_next_edges": graph_first.get(
+                "competing_next_edges", []
+            ),
+        }
+        updated["graph_first_metadata"] = {
+            "map_id": map_id,
+            "source": graph_first_source.get("source"),
+            "variant": graph_first_source.get("variant"),
+            "strict_map_trajectory_accepted": False,
+            "confirmed_source_fraction":
+                graph_first.get("confirmed_source_fraction"),
+            "uncertainty_source_fraction_start":
+                graph_first.get("uncertainty_source_fraction_start"),
+            "confirmed_segments": graph_first.get("confirmed_segments", 0),
+            "uncertain_segments": graph_first.get("uncertain_segments", 0),
+            "policy": graph_first.get("policy"),
+            "uncertainty_marker": graph_first.get("uncertainty_marker"),
+            "competing_next_edge_count": len(
+                graph_first.get("competing_next_edges") or []
+            ),
+        }
+        diagnostics["graph_first_output_published"] = True
+        diagnostics["graph_first_output"] = updated["graph_first_metadata"]
+    else:
+        diagnostics["graph_first_output_published"] = False
     selected_source = (
         str(selected_observation["source"])
         if selected_observation is not None and alignment.get("accepted")

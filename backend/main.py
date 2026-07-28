@@ -21,9 +21,19 @@ import math as _math
 import fitz  # PyMuPDF
 
 try:
-    from floorplan_graph import build_floorplan_graph
+    from floorplan_graph import (
+        build_floorplan_graph,
+        floorplan_graph_geometry_sha256,
+        normalize_floorplan_graph,
+        validate_floorplan_graph,
+    )
 except ImportError:  # pragma: no cover
-    from backend.floorplan_graph import build_floorplan_graph
+    from backend.floorplan_graph import (
+        build_floorplan_graph,
+        floorplan_graph_geometry_sha256,
+        normalize_floorplan_graph,
+        validate_floorplan_graph,
+    )
 
 try:
     from r3_trajectory import build_r3_trajectory
@@ -35,12 +45,14 @@ try:
         DEFAULT_FLOORPLAN_ID,
         FLOORPLAN_CONSTRAINT_REVISION,
         apply_floorplan_constraints,
+        invalidate_floorplan_engine,
     )
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.floorplan_constraints import (
         DEFAULT_FLOORPLAN_ID,
         FLOORPLAN_CONSTRAINT_REVISION,
         apply_floorplan_constraints,
+        invalidate_floorplan_engine,
     )
 
 try:
@@ -4525,6 +4537,127 @@ async def admin_generate_floorplan_topology_graph(
             status_code=500,
             detail=f"Topology graph generation failed: {exc}",
         ) from exc
+
+
+@app.get("/api/admin/floorplans/{map_id}/topology-graph/production")
+async def admin_get_production_floorplan_topology_graph(
+    map_id: str,
+) -> Dict[str, Any]:
+    """Return the exact graph consumed by production map matching."""
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    graph_name = str(metadata.get("topology_graph_file") or "")
+    graph_path = assets / graph_name
+    if not graph_name or not graph_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Production topology graph not configured",
+        )
+    payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    file_sha256 = __import__("hashlib").sha256(graph_path.read_bytes()).hexdigest()
+    expected_sha256 = str(metadata.get("topology_graph_sha256") or "")
+    if expected_sha256 and file_sha256 != expected_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail="Production topology graph SHA mismatch",
+        )
+    payload["production_validation"] = {
+        "file_sha256": file_sha256,
+        "expected_file_sha256": expected_sha256,
+        "file_sha256_matches": file_sha256 == expected_sha256,
+        "geometry_sha256": floorplan_graph_geometry_sha256(payload),
+        "embedded_geometry_sha256": (
+            (payload.get("source") or {}).get("geometry_sha256")
+        ),
+    }
+    return _to_json_serializable(payload)
+
+
+@app.post("/api/admin/floorplans/{map_id}/topology-graph/production")
+async def admin_save_production_floorplan_topology_graph(
+    map_id: str,
+    graph: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """Atomically persist the exact graph edited by the administrator."""
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if str(graph.get("map_id") or "") != map_id:
+        raise HTTPException(status_code=422, detail="Graph map_id mismatch")
+    if (
+        int(graph.get("width") or 0) != int(metadata.get("width") or 0)
+        or int(graph.get("height") or 0) != int(metadata.get("height") or 0)
+    ):
+        raise HTTPException(status_code=422, detail="Graph dimensions mismatch")
+    payload = json.loads(json.dumps(graph))
+    payload.pop("production_validation", None)
+    if any(
+        not isinstance(edge.get("points"), list)
+        or len(edge.get("points") or []) != 2
+        for edge in payload.get("edges", [])
+    ):
+        payload = normalize_floorplan_graph(payload)
+    try:
+        validation = validate_floorplan_graph(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    payload["validation"] = {
+        **(payload.get("validation") or {}),
+        **validation,
+    }
+    source = dict(payload.get("source") or {})
+    source["geometry_sha256"] = floorplan_graph_geometry_sha256(payload)
+    source["saved_from_admin"] = True
+    source["saved_at_unix"] = round(time.time(), 3)
+    payload["source"] = source
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    file_sha256 = __import__("hashlib").sha256(encoded).hexdigest()
+    graph_name = str(
+        metadata.get("topology_graph_file")
+        or f"{map_id}.topology-graph.v1.json"
+    )
+    graph_path = assets / graph_name
+    updated_metadata = {
+        **metadata,
+        "topology_graph_file": graph_name,
+        "topology_graph_sha256": file_sha256,
+    }
+    metadata_encoded = json.dumps(
+        updated_metadata,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    token = uuid.uuid4().hex
+    graph_temporary = graph_path.with_name(f".{graph_path.name}.{token}.tmp")
+    metadata_temporary = metadata_path.with_name(
+        f".{metadata_path.name}.{token}.tmp"
+    )
+    try:
+        graph_temporary.write_bytes(encoded)
+        metadata_temporary.write_bytes(metadata_encoded)
+        os.replace(graph_temporary, graph_path)
+        os.replace(metadata_temporary, metadata_path)
+    finally:
+        graph_temporary.unlink(missing_ok=True)
+        metadata_temporary.unlink(missing_ok=True)
+    invalidate_floorplan_engine(map_id)
+    payload["production_validation"] = {
+        "file_sha256": file_sha256,
+        "expected_file_sha256": file_sha256,
+        "file_sha256_matches": True,
+        "geometry_sha256": floorplan_graph_geometry_sha256(payload),
+        "embedded_geometry_sha256": source["geometry_sha256"],
+    }
+    return _to_json_serializable(payload)
 
 
 @app.get("/api/admin/floorplans/{map_id}/support-mask.png")
