@@ -19,7 +19,30 @@ interface TrackAIWindowBridge {
   copyToClipboard?: (text: string) => void;
   readFromClipboard?: () => string;
   cameraImport?: TrackAICameraImportBridge;
-  processing?: { resolveMode: () => Promise<{ mode: 'online' | 'local_gpu' | 'local_cpu'; label: string }> };
+  processing?: {
+    resolveMode: () => Promise<{
+      mode: 'online' | 'local_gpu' | 'local_cpu';
+      label: string;
+      reason?: string | null;
+      localGpuReason?: string;
+      localGpuDetails?: {
+        reason?: string;
+        minimumDriver?: string;
+        driverUrl?: string;
+        gpus?: Array<{
+          name?: string;
+          memoryMb?: number;
+          driver?: string;
+        }>;
+      };
+      gpu?: {
+        name?: string;
+        memoryMb?: number;
+        driver?: string;
+      };
+      minimumDriver?: string;
+    }>;
+  };
   logs?: {
     download: () => Promise<{
       ok: boolean;

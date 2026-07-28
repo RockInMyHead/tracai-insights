@@ -14,6 +14,7 @@ let mainWindow = null;
 let cameraImportService = null;
 let desktopLogs = null;
 let processingMode = 'local_cpu';
+let processingModeDetails = {};
 
 const cameraImportSettings = {
   enabled: false,
@@ -86,12 +87,19 @@ function setupCameraImport() {
     const gpu = await localGpuRuntime.start((level, event, data) => desktopLogs?.log(level, event, data));
     if (gpu.ready) {
       processingMode = 'local_gpu';
+      processingModeDetails = {
+        mode: processingMode,
+        label: 'Локально',
+        reason: null,
+        gpu: gpu.gpu,
+        minimumDriver: gpu.manifest?.minimum_nvidia_driver_windows,
+      };
       desktopLogs?.log('info', 'processing:mode-resolved', {
         mode: processingMode,
         gpu_memory_mb: gpu.gpu?.memoryMb,
         cuda_runtime: gpu.health?.cuda_runtime,
       });
-      return { mode: processingMode, label: 'Локально' };
+      return processingModeDetails;
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
@@ -103,8 +111,19 @@ function setupCameraImport() {
     } finally {
       clearTimeout(timer);
     }
-    desktopLogs?.log('info', 'processing:mode-resolved', { mode: processingMode });
-    return { mode: processingMode, label: processingMode === 'online' ? 'Сетевая обработка' : 'Локально' };
+    processingModeDetails = {
+      mode: processingMode,
+      label: processingMode === 'online' ? 'Сетевая обработка' : 'Локально',
+      localGpuReason: gpu.reason,
+      localGpuDetails: {
+        reason: gpu.reason,
+        gpus: gpu.gpus,
+        minimumDriver: gpu.minimumDriver,
+        driverUrl: gpu.driverUrl,
+      },
+    };
+    desktopLogs?.log('info', 'processing:mode-resolved', processingModeDetails);
+    return processingModeDetails;
   });
   ipcMain.handle('local-gpu:process', async (_event, video) => {
     const result = await localGpuRuntime.processVideo(video);

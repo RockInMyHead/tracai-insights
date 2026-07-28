@@ -4,6 +4,7 @@ const { spawn, execFile } = require('child_process');
 const { app } = require('electron');
 
 const PORT = 18765;
+const NVIDIA_DRIVER_URL = 'https://www.nvidia.com/Download/index.aspx';
 let worker = null;
 let starting = null;
 
@@ -36,10 +37,10 @@ async function inspect() {
   const manifestPath = path.join(root, 'runtime-manifest.json');
   const python = path.join(root, 'python', 'python.exe');
   if (!fs.existsSync(manifestPath) || !fs.existsSync(python)) {
-    return { ready: false, reason: 'runtime_missing' };
+    return { ready: false, reason: 'runtime_missing', root };
   }
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  if (!manifest.complete) return { ready: false, reason: 'runtime_incomplete' };
+  if (!manifest.complete) return { ready: false, reason: 'runtime_incomplete', root, manifest };
   let rows;
   try {
     rows = await execFileText('nvidia-smi', [
@@ -47,7 +48,14 @@ async function inspect() {
       '--format=csv,noheader,nounits',
     ]);
   } catch {
-    return { ready: false, reason: 'nvidia_driver_missing' };
+    return {
+      ready: false,
+      reason: 'nvidia_driver_missing',
+      root,
+      manifest,
+      driverUrl: NVIDIA_DRIVER_URL,
+      minimumDriver: manifest.minimum_nvidia_driver_windows,
+    };
   }
   const gpus = rows.split(/\r?\n/).filter(Boolean).map((line) => {
     const [name, memory, driver] = line.split(',').map((value) => value.trim());
@@ -58,7 +66,15 @@ async function inspect() {
     && versionAtLeast(gpu.driver, manifest.minimum_nvidia_driver_windows));
   return compatible
     ? { ready: true, root, python, manifest, gpu: compatible }
-    : { ready: false, reason: 'gpu_incompatible' };
+    : {
+        ready: false,
+        reason: 'gpu_incompatible',
+        root,
+        manifest,
+        gpus,
+        driverUrl: NVIDIA_DRIVER_URL,
+        minimumDriver: manifest.minimum_nvidia_driver_windows,
+      };
 }
 
 async function health() {

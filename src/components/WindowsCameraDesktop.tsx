@@ -11,6 +11,7 @@ const CAMERA_OWNER = "Экшен-камера";
 
 type DesktopState = "ready" | "looking" | "copying" | "processing" | "done" | "needs_camera" | "error";
 type ProcessingMode = "online" | "local_gpu" | "local_cpu";
+type ProcessingResolution = Awaited<ReturnType<NonNullable<Window["trackai"]>["processing"]["resolveMode"]>>;
 
 function getDesktopBridge() {
   return (window as unknown as { trackai?: Window["trackai"] }).trackai;
@@ -69,6 +70,7 @@ export default function WindowsCameraDesktop() {
   const [history, setHistory] = useState<VideoListItem[]>([]);
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [stats, setStats] = useState<Record<string, unknown>>({});
+  const [processingStatus, setProcessingStatus] = useState<ProcessingResolution | null>(null);
   const processingModeRef = useRef<ProcessingMode>("online");
 
   const resolveProcessingMode = useCallback(async () => {
@@ -80,8 +82,47 @@ export default function WindowsCameraDesktop() {
         ? "local_cpu"
         : "online";
     processingModeRef.current = mode;
+    if (next) setProcessingStatus(next);
     return mode;
   }, []);
+
+  const runtimeNotice = useMemo(() => {
+    if (!processingStatus || processingStatus.mode === "local_gpu") return null;
+    const reason = processingStatus.localGpuReason || processingStatus.localGpuDetails?.reason;
+    if (reason === "nvidia_driver_missing") {
+      return {
+        title: "Локальная GPU-обработка недоступна: не установлен драйвер NVIDIA.",
+        detail: `Установите NVIDIA Driver версии ${processingStatus.localGpuDetails?.minimumDriver || "560.76"} или новее. До этого TrackAI будет использовать сетевую обработку, если сервер доступен.`,
+        driverUrl: processingStatus.localGpuDetails?.driverUrl,
+      };
+    }
+    if (reason === "gpu_incompatible") {
+      const gpu = processingStatus.localGpuDetails?.gpus?.[0];
+      const gpuText = gpu?.name
+        ? `${gpu.name}, VRAM ${gpu.memoryMb || 0} MB, driver ${gpu.driver || "unknown"}`
+        : "Совместимая NVIDIA GPU не найдена";
+      return {
+        title: "Локальная GPU-обработка недоступна: GPU или драйвер не подходят.",
+        detail: `${gpuText}. Нужна NVIDIA GPU с VRAM от 12 GB и driver ${processingStatus.localGpuDetails?.minimumDriver || "560.76"} или новее.`,
+        driverUrl: processingStatus.localGpuDetails?.driverUrl,
+      };
+    }
+    if (reason === "runtime_missing" || reason === "runtime_incomplete") {
+      return {
+        title: "Локальная GPU-обработка недоступна: в установщике нет полного R3 runtime.",
+        detail: "Установите полную Windows-сборку TrackAI с bundled GPU runtime.",
+        driverUrl: undefined,
+      };
+    }
+    if (processingStatus.mode === "online") {
+      return {
+        title: "Используется сетевая обработка.",
+        detail: "Локальный GPU runtime не выбран, видео будет отправлено на сервер TrackAI.",
+        driverUrl: undefined,
+      };
+    }
+    return null;
+  }, [processingStatus]);
 
   const refreshHistory = useCallback(async () => {
     try {
@@ -285,6 +326,13 @@ export default function WindowsCameraDesktop() {
           <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-700 text-base font-semibold text-slate-50 hover:bg-teal-800 active:translate-y-px" disabled={busy} onClick={() => void handleUpload()}>
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Upload className="h-5 w-5" />}{buttonText}
           </Button>
+          {runtimeNotice && <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+            <p className="font-semibold">{runtimeNotice.title}</p>
+            <p className="mt-1 leading-5">{runtimeNotice.detail}</p>
+            {runtimeNotice.driverUrl && <button type="button" className="mt-2 text-left font-semibold text-amber-900 underline underline-offset-2" onClick={() => getDesktopBridge()?.openExternal?.(runtimeNotice.driverUrl!)}>
+              Открыть страницу NVIDIA Driver
+            </button>}
+          </div>}
           <p className={`mt-4 text-sm ${state === "error" ? "text-rose-700" : state === "needs_camera" ? "text-amber-700" : "text-slate-600"}`}>{message}</p>
           {progress && <p className="mt-2 text-xs text-teal-700">{Math.round(progress.percent)}% скопировано</p>}
         </div>

@@ -32,7 +32,49 @@ except ImportError:  # pragma: no cover - package import path
 try:
     from floorplan_graph import floorplan_graph_geometry_sha256
 except ImportError:  # pragma: no cover - package import path
-    from backend.floorplan_graph import floorplan_graph_geometry_sha256
+    try:
+        from backend.floorplan_graph import floorplan_graph_geometry_sha256
+    except ImportError:  # pragma: no cover - minimal runtime without graph builder deps
+        def floorplan_graph_geometry_sha256(graph: dict[str, Any]) -> str:
+            """Hash enabled production geometry without importing graph builder deps."""
+            payload = {
+                "schema_version": graph.get("schema_version"),
+                "map_id": graph.get("map_id"),
+                "nodes": [
+                    {
+                        "id": str(node.get("id")),
+                        "kind": str(node.get("kind")),
+                        "x": float(node.get("x")),
+                        "y": float(node.get("y")),
+                        "enabled": bool(node.get("enabled", True)),
+                    }
+                    for node in graph.get("nodes", [])
+                ],
+                "edges": [
+                    {
+                        "id": str(edge.get("id")),
+                        "source_edge_id": str(
+                            edge.get("source_edge_id") or edge.get("id")
+                        ),
+                        "from": str(edge.get("from")),
+                        "to": str(edge.get("to")),
+                        "points": [
+                            [float(point[0]), float(point[1])]
+                            for point in edge.get("points", [])
+                        ],
+                        "bidirectional": bool(edge.get("bidirectional", True)),
+                        "enabled": bool(edge.get("enabled", True)),
+                    }
+                    for edge in graph.get("edges", [])
+                ],
+            }
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
 
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
@@ -780,6 +822,7 @@ class FloorplanConstraintEngine:
         self._topology_authored_node_count = 0
         self._topology_adjacency: dict[int, list[tuple[int, float]]] = {}
         self._topology_segment_edges: dict[tuple[int, int], str] = {}
+        self._topology_node_ids: list[str] = []
         self._build_grid(self._full_mask, annotation_mask=mask)
         if config.topology_graph_file:
             self._load_topology_graph()
@@ -867,6 +910,7 @@ class FloorplanConstraintEngine:
         authored_points = np.asarray([
             [float(node["x"]), float(node["y"])] for node in enabled_nodes
         ], dtype=np.float64)
+        node_ids = [str(node["id"]) for node in enabled_nodes]
         points = authored_points.tolist()
         adjacency: dict[int, list[tuple[int, float]]] = {
             index: [] for index in range(len(authored_points))
@@ -895,6 +939,9 @@ class FloorplanConstraintEngine:
                 ratio = sample_index / segment_count
                 point_index = len(points)
                 points.append(((1.0 - ratio) * start + ratio * end).tolist())
+                node_ids.append(
+                    f"{edge.get('id') or 'edge'}__sample_{sample_index:03d}"
+                )
                 adjacency[point_index] = []
                 chain.append(point_index)
             chain.append(right)
@@ -913,6 +960,7 @@ class FloorplanConstraintEngine:
         self._topology_authored_node_count = len(authored_points)
         self._topology_adjacency = adjacency
         self._topology_segment_edges = segment_edges
+        self._topology_node_ids = node_ids
         self._corridor_nodes = np.rint(
             self._topology_node_points
             / max(self.config.grid_cell_pixels, 1)
@@ -969,6 +1017,147 @@ class FloorplanConstraintEngine:
             if edge_id and (not sequence or sequence[-1] != edge_id):
                 sequence.append(edge_id)
         return sequence
+
+    def _topology_node_id(self, index: int) -> str:
+        if 0 <= int(index) < len(self._topology_node_ids):
+            return self._topology_node_ids[int(index)]
+        return f"topology_node_{int(index)}"
+
+    @staticmethod
+    def _polyline_arc_fractions(points: np.ndarray) -> np.ndarray:
+        if len(points) < 2:
+            return np.zeros(len(points), dtype=np.float64)
+        distances = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        cumulative = np.concatenate(([0.0], np.cumsum(distances)))
+        total = float(cumulative[-1])
+        if total <= 1e-12:
+            return np.zeros(len(points), dtype=np.float64)
+        return cumulative / total
+
+    def _turn_inversion_diagnostics(
+        self,
+        source: np.ndarray,
+        route: np.ndarray,
+    ) -> Optional[dict[str, Any]]:
+        """Return the first opposite signed turn with graph context."""
+        if len(source) < 3 or len(route) < 3:
+            return None
+        source_events = _turn_events(
+            _resample_polyline(source, np.linspace(0.0, 1.0, 128)),
+            samples=128,
+            min_turn_degrees=TURN_TOPOLOGY_MIN_DEGREES,
+        )
+        route_events = _turn_events(
+            _resample_polyline(route, np.linspace(0.0, 1.0, 128)),
+            samples=128,
+            min_turn_degrees=TURN_TOPOLOGY_MIN_DEGREES,
+        )
+        if not source_events or not route_events:
+            return None
+        route_indices = [
+            int(np.argmin(np.linalg.norm(
+                self._topology_node_points - point[None, :], axis=1
+            )))
+            for point in route
+        ]
+        route_fractions = self._polyline_arc_fractions(route)
+
+        cursor = 0
+        for source_index, (source_fraction, source_angle) in enumerate(source_events):
+            candidates = [
+                (candidate_index, event)
+                for candidate_index, event in enumerate(
+                    route_events[cursor:],
+                    start=cursor,
+                )
+                if abs(event[0] - source_fraction) <= 0.12
+            ]
+            if not candidates:
+                continue
+            best_index, (route_fraction, route_angle) = min(
+                candidates,
+                key=lambda item: (
+                    (2.0 if np.sign(item[1][1]) != np.sign(source_angle) else 0.0)
+                    + abs(item[1][0] - source_fraction)
+                    + abs(abs(item[1][1]) - abs(source_angle)) / 180.0
+                ),
+            )
+            cursor = best_index + 1
+            if np.sign(route_angle) == np.sign(source_angle):
+                continue
+
+            authored_vertices = [
+                index for index, node_index in enumerate(route_indices)
+                if node_index < self._topology_authored_node_count
+            ]
+            if authored_vertices:
+                route_vertex = min(
+                    authored_vertices,
+                    key=lambda index: abs(float(
+                        route_fractions[index] - route_fraction
+                    )),
+                )
+            else:
+                route_vertex = int(np.argmin(np.abs(route_fractions - route_fraction)))
+            graph_node = route_indices[route_vertex]
+            previous_node = route_indices[route_vertex - 1] if route_vertex > 0 else None
+            next_node = (
+                route_indices[route_vertex + 1]
+                if route_vertex + 1 < len(route_indices) else None
+            )
+            incoming_edge = (
+                self._topology_segment_edges.get((previous_node, graph_node))
+                if previous_node is not None else None
+            )
+            outgoing_edge = (
+                self._topology_segment_edges.get((graph_node, next_node))
+                if next_node is not None else None
+            )
+            alternatives = []
+            for neighbour, edge_length in self._topology_adjacency.get(graph_node, []):
+                neighbour = int(neighbour)
+                if previous_node is not None and neighbour == previous_node:
+                    continue
+                edge_id = self._topology_segment_edges.get((graph_node, neighbour))
+                endpoint = self._topology_node_points[neighbour]
+                current = self._topology_node_points[graph_node]
+                heading = math.degrees(math.atan2(
+                    float(endpoint[1] - current[1]),
+                    float(endpoint[0] - current[0]),
+                ))
+                alternatives.append({
+                    "edge_id": edge_id,
+                    "to_node_id": self._topology_node_id(neighbour),
+                    "to_node_index": neighbour,
+                    "length_meters": round(
+                        float(edge_length) * self.config.meters_per_pixel,
+                        3,
+                    ),
+                    "heading_degrees": round(float(heading), 3),
+                    "selected": bool(neighbour == next_node),
+                })
+
+            return {
+                "inverted_turn_index": source_index,
+                "source_event_fraction": round(float(source_fraction), 6),
+                "route_event_fraction": round(float(route_fraction), 6),
+                "source_signed_angle_degrees": round(float(source_angle), 3),
+                "route_signed_angle_degrees": round(float(route_angle), 3),
+                "graph_node_id": self._topology_node_id(graph_node),
+                "graph_node_index": graph_node,
+                "incoming_node_id": (
+                    self._topology_node_id(previous_node)
+                    if previous_node is not None else None
+                ),
+                "outgoing_node_id": (
+                    self._topology_node_id(next_node)
+                    if next_node is not None else None
+                ),
+                "incoming_edge_id": incoming_edge,
+                "outgoing_edge_id": outgoing_edge,
+                "candidate_next_edges": alternatives,
+            }
+        return None
 
     def _directed_edge_event_match(
         self,
@@ -1200,6 +1389,7 @@ class FloorplanConstraintEngine:
         terminals.sort(key=lambda item: item[0])
         best_terminal_topology: Optional[dict[str, Any]] = None
         best_terminal_route: Optional[np.ndarray] = None
+        best_terminal_inversion: Optional[dict[str, Any]] = None
         for objective, path, travelled, matched_events in terminals:
             route = self._topology_node_points[
                 np.asarray(path, dtype=int)
@@ -1222,8 +1412,12 @@ class FloorplanConstraintEngine:
             ):
                 best_terminal_topology = topology
                 best_terminal_route = route
+                best_terminal_inversion = self._turn_inversion_diagnostics(
+                    points, route
+                )
             if not bool(topology["event_sequence_preserved"]):
                 continue
+            inversion = self._turn_inversion_diagnostics(points, route)
             return route, {
                 "reason": None,
                 "method": "directed_edge_event_beam_v1",
@@ -1233,6 +1427,7 @@ class FloorplanConstraintEngine:
                 "expected_turn_events": len(expected),
                 "edge_ids": self._topology_edge_sequence(route),
                 "selected_reconstructed_turn_topology": topology,
+                "turn_inversion": inversion,
                 "states_evaluated": len(best),
                 "branch_commitment": "connected_edges_only",
             }
@@ -1242,6 +1437,7 @@ class FloorplanConstraintEngine:
             "terminal_candidates": len(terminals),
             "states_evaluated": len(best),
             "best_terminal_turn_topology": best_terminal_topology,
+            "turn_inversion": best_terminal_inversion,
             "best_terminal_trajectory": (
                 [
                     [round(float(point[0]), 3), round(float(point[1]), 3)]

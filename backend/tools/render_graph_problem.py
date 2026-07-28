@@ -17,7 +17,7 @@ GRAPH = (
 )
 OUTPUT = (
     ROOT
-    / "artifacts/golden5-branch-lock-v33-20260728/problem-node-0014.png"
+    / "artifacts/golden5-directed-edge-debug-20260728/problem-node-0014.png"
 )
 
 CROP = (520, 500, 1180, 900)
@@ -42,6 +42,13 @@ def main() -> None:
     graph = json.loads(GRAPH.read_text(encoding="utf-8"))
     edges = {edge["id"]: edge for edge in graph["edges"]}
     nodes = {node["id"]: node for node in graph["nodes"]}
+    problem_node_id = "node_0014"
+    dead_end_node_id = "node_0084"
+    incident_edges = [
+        edge for edge in graph["edges"]
+        if edge.get("enabled", True)
+        and problem_node_id in {edge.get("from"), edge.get("to")}
+    ]
     plan = Image.open(PLAN).convert("RGB").crop(CROP)
     plan = plan.resize(
         (plan.width * SCALE, plan.height * SCALE),
@@ -57,34 +64,44 @@ def main() -> None:
             (float(value[1]) - CROP[1]) * SCALE + HEADER,
         )
 
-    route_styles = {
-        "edge_00015": ("#2563eb", 13),
-        "edge_00007": ("#2563eb", 13),
-        "edge_00006": ("#2563eb", 13),
-        "edge_00023": ("#ef4444", 18),
-        "edge_00024": ("#22c55e", 18),
-        "edge_00025": ("#f59e0b", 12),
-    }
-    for edge_id, (colour, width) in route_styles.items():
-        edge = edges[edge_id]
+    def other_node(edge: dict) -> str:
+        return edge["to"] if edge["from"] == problem_node_id else edge["from"]
+
+    for edge in incident_edges:
+        edge_id = edge["id"]
+        neighbour = other_node(edge)
+        if neighbour == dead_end_node_id:
+            colour, width = "#ef4444", 18
+        elif nodes.get(neighbour, {}).get("kind") == "endpoint":
+            colour, width = "#f59e0b", 13
+        else:
+            colour, width = "#2563eb", 13
         draw.line(
             [point(item) for item in edge["points"]],
             fill=colour,
             width=width,
             joint="curve",
         )
+        midpoint = edge["points"][len(edge["points"]) // 2]
+        draw.text(
+            point(midpoint),
+            edge_id,
+            fill=colour,
+            font=font(19, bold=True),
+            stroke_width=4,
+            stroke_fill="white",
+        )
 
-    for node_id in (
-        "node_0004",
-        "node_0014",
-        "node_0015",
-        "node_0084",
-        "node_0023",
-    ):
+    node_ids = {problem_node_id, dead_end_node_id}
+    for edge in incident_edges:
+        node_ids.add(edge["from"])
+        node_ids.add(edge["to"])
+
+    for node_id in sorted(node_ids):
         node = nodes[node_id]
         x, y = point((node["x"], node["y"]))
-        radius = 18 if node_id == "node_0014" else 12
-        fill = "#dc2626" if node_id == "node_0014" else "#0f172a"
+        radius = 18 if node_id == problem_node_id else 12
+        fill = "#dc2626" if node_id == problem_node_id else "#0f172a"
         draw.ellipse(
             (x - radius, y - radius, x + radius, y + radius),
             fill=fill,
@@ -102,25 +119,26 @@ def main() -> None:
 
     draw.text(
         (28, 18),
-        "Problem junction: node_0014",
+        f"Problem junction: {problem_node_id}",
         fill="#0f172a",
         font=font(36, bold=True),
     )
     draw.text(
         (28, 70),
-        "Blue: incoming matched route   Red: selected wrong turn (edge_00023)",
+        "Blue: connected alternatives   Red: current sign-compatible dead-end",
         fill="#334155",
         font=font(23),
     )
     draw.text(
         (28, 108),
-        "Green: sign-compatible branch, but it ends at node_0084 after 3.6 m",
+        "Current graph around node_0014: "
+        + ", ".join(edge["id"] for edge in incident_edges),
         fill="#166534",
         font=font(23, bold=True),
     )
     draw.text(
         (28, 146),
-        "Required fix: extend the real corridor after node_0084 or correct false links",
+        "Required decision: extend/connect node_0084 branch or correct node_0014 links",
         fill="#7c2d12",
         font=font(23, bold=True),
     )

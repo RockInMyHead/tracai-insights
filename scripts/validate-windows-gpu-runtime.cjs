@@ -1,7 +1,17 @@
 const fs = require('fs');
 const path = require('path');
 const root = path.resolve(__dirname, '..', 'windows-runtime', 'dist');
-const required = ['runtime-manifest.json', 'worker.py', 'python/python.exe', 'python/Lib/site-packages/torch/__init__.py', 'R3/infer.py', 'R3/ckpt/r3_long.safetensors', 'backend/r3_worker_wrapper.py', 'backend/floorplan_constraints.py'];
+const required = [
+  'runtime-manifest.json',
+  'worker.py',
+  'python/python.exe',
+  'python/Lib/site-packages/torch/__init__.py',
+  'R3/infer.py',
+  'R3/ckpt/r3_long.safetensors',
+  'backend/r3_worker_wrapper.py',
+  'backend/floorplan_constraints.py',
+  'prerequisites/vc_redist.x64.exe',
+];
 const missing = required.filter((relative) => !fs.existsSync(path.join(root, relative)));
 if (missing.length) {
   console.error('Windows GPU runtime is incomplete. Run scripts/build-windows-gpu-runtime.ps1 first.');

@@ -124,10 +124,13 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "perMachine": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "differentialPackage": false,
       "useZip": true,
+      "include": "installer/windows-prerequisites.nsh",
       "artifactName": "TrackAI-Setup-${version}.${ext}"
     },
     "mac": {
