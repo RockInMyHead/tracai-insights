@@ -52,7 +52,7 @@ jobs:
         run: npm ci
 
       - name: Test desktop video upload
-        run: node --test electron/*.test.cjs
+        run: node --test electron/desktopLogs.test.cjs electron/uploadFromPath.test.cjs
 
       - name: Assemble bundled Windows GPU runtime
         shell: pwsh
