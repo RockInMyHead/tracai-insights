@@ -64,6 +64,23 @@ jobs:
       - name: Verify installer
         shell: pwsh
         run: |
+          $bundledWeight = "release\win-unpacked\resources\local-gpu\R3\ckpt\r3_long.safetensors"
+          if (-not (Test-Path $bundledWeight)) {
+            throw "Bundled R3 model is missing from the packaged application"
+          }
+          $expectedWeightHash = "a5e14c7aa751450f8a9e2e78f1ac5e980060230af6dd0b6af86f1e6dd0859f7e"
+          $weightHash = (Get-FileHash $bundledWeight -Algorithm SHA256).Hash.ToLower()
+          $weightBytes = (Get-Item $bundledWeight).Length
+          if ($weightHash -ne $expectedWeightHash -or $weightBytes -lt 1400000000) {
+            throw "Bundled R3 model validation failed: bytes=$weightBytes sha256=$weightHash"
+          }
+          $runtimeBytes = (
+            Get-ChildItem "release\win-unpacked\resources\local-gpu" -Recurse -File |
+            Measure-Object Length -Sum
+          ).Sum
+          if ($runtimeBytes -lt 3500000000) {
+            throw "Bundled GPU runtime is unexpectedly small: $runtimeBytes bytes"
+          }
           $installer = Get-ChildItem release -Filter "TrackAI-Setup-*.exe" |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
@@ -76,6 +93,9 @@ jobs:
             bytes = $installer.Length
             sha256 = $hash
             commit = "${{ github.sha }}"
+            bundled_weight_bytes = $weightBytes
+            bundled_weight_sha256 = $weightHash
+            bundled_runtime_bytes = $runtimeBytes
           } | ConvertTo-Json | Set-Content "release\windows-build.json" -Encoding UTF8
           Get-Content "release\windows-build.json"
 
