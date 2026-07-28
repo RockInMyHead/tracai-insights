@@ -1,0 +1,86 @@
+name: Build full Windows desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout TrackAI
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Show available disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+
+      - name: Download R3 source
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/KevinXu02/R3.git "$env:RUNNER_TEMP\R3"
+
+      - name: Download official R3 long-video model
+        shell: pwsh
+        run: |
+          $weight = "$env:RUNNER_TEMP\r3_long.safetensors"
+          curl.exe -L --fail --retry 5 --retry-delay 10 `
+            "https://huggingface.co/KevinXu02/R3/resolve/main/r3_long.safetensors?download=true" `
+            -o $weight
+          $expected = "a5e14c7aa751450f8a9e2e78f1ac5e980060230af6dd0b6af86f1e6dd0859f7e"
+          $actual = (Get-FileHash $weight -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            throw "R3 model checksum mismatch: $actual"
+          }
+
+      - name: Install desktop dependencies
+        run: npm ci
+
+      - name: Assemble bundled Windows GPU runtime
+        shell: pwsh
+        run: |
+          ./scripts/build-windows-gpu-runtime.ps1 `
+            -R3Source "$env:RUNNER_TEMP\R3" `
+            -R3LongWeight "$env:RUNNER_TEMP\r3_long.safetensors"
+
+      - name: Build Windows installer
+        run: npm run build:desktop:win
+
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release -Filter "TrackAI-Setup-*.exe" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows installer was not created"
+          }
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLower()
+          @{
+            file = $installer.Name
+            bytes = $installer.Length
+            sha256 = $hash
+            commit = "${{ github.sha }}"
+          } | ConvertTo-Json | Set-Content "release\windows-build.json" -Encoding UTF8
+          Get-Content "release\windows-build.json"
+
+      - name: Upload full Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrackAI-Windows-full-${{ github.run_number }}
+          path: |
+            release/TrackAI-Setup-*.exe
+            release/windows-build.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
