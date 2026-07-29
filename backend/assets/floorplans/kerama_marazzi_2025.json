@@ -43,7 +43,7 @@
   "support_mask_file": "kerama_marazzi_2025_support.png",
   "support_mask_sha256": "cb8f0e32afa6b7f02a9582d8b2a754427c47fb787489afbd3f2f0a499389e564",
   "topology_graph_file": "kerama_marazzi_2025.topology-graph.v1.json",
-  "topology_graph_sha256": "e41097a1243f0ed8030994fc9bc76d42561cab0e0948118d64786581c8db252f",
+  "topology_graph_sha256": "8e4311784860ce342acbf4604aad5242b5bac5616b4ef1068c72d099084c5489",
   "support_mask_generation": {
     "method": "positive_green_corridors_only",
     "ink_threshold": 242,
