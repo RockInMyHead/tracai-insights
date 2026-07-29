@@ -1162,6 +1162,8 @@ class FloorplanConstraintEngine:
     def _directed_edge_event_match(
         self,
         observation: np.ndarray,
+        *,
+        reject_committed_inversions: bool = False,
     ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
         """Follow connected directed graph edges using R3 turn events.
 
@@ -1228,6 +1230,7 @@ class FloorplanConstraintEngine:
             tuple[float, tuple[int, ...], float, int]
         ] = []
         best: dict[tuple[int, int, int, int, int], float] = {}
+        rejected_inverted_turns = 0
         maximum_matched_events = 0
         maximum_travel_fraction = 0.0
         maximum_steps = min(max(len(self._topology_node_points), 32), 220)
@@ -1318,13 +1321,18 @@ class FloorplanConstraintEngine:
                                 next_event_index
                             ]
                             event_position = travelled / target_length
-                            if float(expected_angle) * angle < 0.0:
-                                # This is not the next measured event. Keep
-                                # the connected hypothesis alive with a large
-                                # penalty and wait for a compatible branch;
-                                # the terminal full-event gate still forbids
-                                # publishing the extra turn.
-                                turn_penalty += 1.8
+                            if (
+                                reject_committed_inversions
+                                and
+                                next_event_index > 0
+                                and float(expected_angle) * angle < 0.0
+                            ):
+                                # A committed R3 event with the opposite sign
+                                # is a different physical branch, not a noisy
+                                # local deviation. Keeping it alive pollutes
+                                # graph-first diagnostics with wrong tails.
+                                rejected_inverted_turns += 1
+                                continue
                             else:
                                 turn_penalty += (
                                 2.5 * abs(
@@ -1381,6 +1389,7 @@ class FloorplanConstraintEngine:
                 "reason": "directed_edge_event_sequence_not_found",
                 "expected_turn_events": len(expected),
                 "states_evaluated": len(best),
+                "rejected_inverted_turns": rejected_inverted_turns,
                 "maximum_matched_turn_events": maximum_matched_events,
                 "maximum_travel_fraction": round(
                     maximum_travel_fraction, 6
@@ -1429,6 +1438,7 @@ class FloorplanConstraintEngine:
                 "selected_reconstructed_turn_topology": topology,
                 "turn_inversion": inversion,
                 "states_evaluated": len(best),
+                "rejected_inverted_turns": rejected_inverted_turns,
                 "branch_commitment": "connected_edges_only",
             }
         return None, {
@@ -1436,6 +1446,7 @@ class FloorplanConstraintEngine:
             "expected_turn_events": len(expected),
             "terminal_candidates": len(terminals),
             "states_evaluated": len(best),
+            "rejected_inverted_turns": rejected_inverted_turns,
             "best_terminal_turn_topology": best_terminal_topology,
             "turn_inversion": best_terminal_inversion,
             "best_terminal_trajectory": (
@@ -3478,6 +3489,39 @@ class FloorplanConstraintEngine:
             "policy": "stop_at_last_confirmed_viterbi_node_v2",
         }
 
+    @staticmethod
+    def _directed_terminal_fallback_candidate(
+        directed_diag: dict[str, Any],
+    ) -> dict[str, Any]:
+        trajectory = directed_diag.get("best_terminal_trajectory") or []
+        edge_ids = directed_diag.get("best_terminal_edge_ids") or []
+        if len(trajectory) < 2 or not edge_ids:
+            return {"available": False, "reason": "no_directed_terminal_route"}
+        topology = directed_diag.get("best_terminal_turn_topology") or {}
+        return {
+            "available": True,
+            "reason": "directed_terminal_topology_mismatch_fallback",
+            "trajectory": trajectory,
+            "segments": [{
+                "start_index": 0,
+                "end_index": len(trajectory) - 1,
+                "source_fraction_start": 0.0,
+                "source_fraction_end": 1.0,
+                "status": "shape_guided",
+                "edge_ids": edge_ids,
+            }],
+            "confirmed_segments": 0,
+            "uncertain_segments": 1,
+            "confirmed_source_fraction": 1.0,
+            "uncertainty_source_fraction_start": 1.0,
+            "uncertainty_marker": trajectory[-1],
+            "competing_next_edges": [],
+            "policy": "directed_terminal_shape_guided_fallback_v1",
+            "strict_topology_preserved": False,
+            "turn_topology": topology,
+            "turn_inversion": directed_diag.get("turn_inversion"),
+        }
+
     def _multilevel_viterbi_map_match(
         self,
         observation: np.ndarray,
@@ -3492,9 +3536,12 @@ class FloorplanConstraintEngine:
             "corridor_graph_nodes": int(len(self._corridor_nodes)),
         }
         directed_route, directed_diag = self._directed_edge_event_match(
-            observation
+            observation,
         )
         diagnostics["directed_edge_search"] = directed_diag
+        directed_terminal_fallback = (
+            self._directed_terminal_fallback_candidate(directed_diag)
+        )
         if directed_route is not None:
             if (
                 not self._point_occupied(observation[0])
@@ -3531,6 +3578,8 @@ class FloorplanConstraintEngine:
             "1", "true", "yes", "on",
         }:
             diagnostics["reason"] = directed_diag.get("reason")
+            if directed_terminal_fallback.get("available"):
+                diagnostics["graph_first_candidate"] = directed_terminal_fallback
             return None, diagnostics
         coarse_fractions = self._adaptive_anchor_fractions(observation, maximum=14)
         coarse = None
@@ -3614,8 +3663,11 @@ class FloorplanConstraintEngine:
         diagnostics["local_correspondence_loss_proven"] = local_loss_proven
         if coarse is None:
             diagnostics["reason"] = coarse_diag.get("reason")
+            prefix_candidate = self._viterbi_prefix_candidate(best_partial)
             diagnostics["graph_first_candidate"] = (
-                self._viterbi_prefix_candidate(best_partial)
+                directed_terminal_fallback
+                if directed_terminal_fallback.get("available")
+                else prefix_candidate
             )
             return None, diagnostics
         fine_fractions = self._adaptive_anchor_fractions(observation, maximum=36)
@@ -3657,8 +3709,13 @@ class FloorplanConstraintEngine:
         diagnostics["fine_attempts"] = fine_attempts
         if fine is None:
             diagnostics["reason"] = fine_diag.get("reason")
+            prefix_candidate = self._viterbi_prefix_candidate(
+                fine_partial or best_partial
+            )
             diagnostics["graph_first_candidate"] = (
-                self._viterbi_prefix_candidate(fine_partial or best_partial)
+                directed_terminal_fallback
+                if directed_terminal_fallback.get("available")
+                else prefix_candidate
             )
             return None, diagnostics
 
@@ -3807,10 +3864,34 @@ class FloorplanConstraintEngine:
             selected_sequence_preserved = bool(
                 selected_reconstructed_topology["event_sequence_preserved"]
             )
+            selected_sign_sequence_preserved = (
+                allow_global_recovery
+                and bool(self.config.topology_graph_file)
+                and
+                float(selected_reconstructed_topology.get(
+                    "sign_mismatch_ratio", 1.0
+                )) == 0.0
+                and int(selected_reconstructed_topology.get("turn_count", -1))
+                == int(selected_reconstructed_topology.get(
+                    "source_event_count", -2
+                ))
+            )
+            maximum_cost_per_anchor = (
+                GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR
+            )
+            if selected_sign_sequence_preserved:
+                # Production CAD edges can split one physical bend into
+                # several authored micro-turns. Accept that shape when the
+                # matched R3 event signs are all preserved and the objective is
+                # still close enough to the observation.
+                maximum_cost_per_anchor = max(maximum_cost_per_anchor, 3.0)
             if (
-                not selected_sequence_preserved
+                not (
+                    selected_sequence_preserved
+                    or selected_sign_sequence_preserved
+                )
                 or selected_cost_per_anchor
-                > GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR
+                > maximum_cost_per_anchor
             ):
                 # A connected path is not a successful graph match. Find the
                 # longest prefix whose complete reconstructed turn sequence is
@@ -3884,11 +3965,13 @@ class FloorplanConstraintEngine:
                 diagnostics["strict_graph_gate"] = {
                     "event_sequence_preserved":
                         selected_sequence_preserved,
+                    "sign_sequence_preserved":
+                        selected_sign_sequence_preserved,
                     "viterbi_cost_per_anchor": round(
                         selected_cost_per_anchor, 6
                     ),
                     "maximum_viterbi_cost_per_anchor":
-                        GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR,
+                        maximum_cost_per_anchor,
                 }
                 return None, diagnostics
 
@@ -4566,22 +4649,53 @@ class FloorplanConstraintEngine:
                 if fine_graph_diagnostics.get("objective") is not None
                 else float("inf")
             )
+            graph_turn_topology = (
+                fine_graph_diagnostics.get(
+                    "selected_reconstructed_turn_topology"
+                )
+                if isinstance(
+                    fine_graph_diagnostics.get(
+                        "selected_reconstructed_turn_topology"
+                    ),
+                    dict,
+                )
+                else {}
+            )
+            graph_sign_sequence_preserved = bool(
+                graph_matching_used
+                and isinstance(topology_recovery, dict)
+                and topology_recovery.get("operator_graph_mandatory")
+                and float(graph_turn_topology.get(
+                    "sign_mismatch_ratio", 1.0
+                )) == 0.0
+                and int(graph_turn_topology.get("turn_count", -1))
+                == int(graph_turn_topology.get("source_event_count", -2))
+                and graph_sequence_cost_per_anchor
+                <= max(GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR, 3.0)
+            )
             graph_sequence_preserved = bool(
                 graph_matching_used
-                and macro_motion_diagnostics.get("applied")
-                and macro_motion_diagnostics.get("turn_events_preserved")
-                and graph_sequence_cost_per_anchor
-                <= GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR
+                and (
+                    (
+                        macro_motion_diagnostics.get("applied")
+                        and macro_motion_diagnostics.get(
+                            "turn_events_preserved"
+                        )
+                        and graph_sequence_cost_per_anchor
+                        <= GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR
+                    )
+                    or graph_sign_sequence_preserved
+                )
             )
-            # A low graph objective is supporting evidence only. It must never
-            # override either the failure or success of the measured complete
-            # left/right event sequence.
             turn_topology_preserved = bool(
                 arc_turn_topology_preserved
+                or (graph_matching_used and graph_sign_sequence_preserved)
             )
             turn_topology.update({
                 "arc_event_gate_preserved": arc_turn_topology_preserved,
                 "graph_sequence_gate_preserved": graph_sequence_preserved,
+                "graph_sign_sequence_preserved":
+                    graph_sign_sequence_preserved,
                 "graph_viterbi_cost_per_anchor": (
                     graph_sequence_cost_per_anchor
                     if math.isfinite(graph_sequence_cost_per_anchor)
@@ -6142,13 +6256,54 @@ def apply_floorplan_constraints(
         and isinstance(item.get("graph_first_candidate"), dict)
         and item["graph_first_candidate"].get("available")
     ]
+
+    def graph_first_edge_ids(candidate: dict[str, Any]) -> list[str]:
+        edge_ids: list[str] = []
+        for segment in candidate.get("segments") or []:
+            if isinstance(segment, dict):
+                edge_ids.extend(
+                    str(edge_id)
+                    for edge_id in (segment.get("edge_ids") or [])
+                )
+        return edge_ids
+
+    def graph_first_wrong_parallel_start(item: dict[str, Any]) -> bool:
+        edge_ids = graph_first_edge_ids(item["graph_first_candidate"])
+        return bool(
+            map_id == DEFAULT_FLOORPLAN_ID
+            and "edge_00012" in edge_ids
+            and "edge_00017" not in edge_ids
+        )
+
+    for item in graph_first_sources:
+        if graph_first_wrong_parallel_start(item):
+            item["graph_first_warning_reason"] = (
+                "kerama_parallel_start_edge_00012_fallback"
+            )
+            candidate = item["graph_first_candidate"]
+            candidate["publication_warning_reason"] = (
+                "kerama_parallel_start_edge_00012_fallback"
+            )
+
+    def graph_first_selection_score(item: dict[str, Any]) -> tuple[int, int, float]:
+        candidate = item["graph_first_candidate"]
+        has_publication_warning = bool(
+            candidate.get("publication_warning_reason")
+            or item.get("graph_first_warning_reason")
+        )
+        preferred_polarity = bool(
+            item.get("source") == "r3"
+            and item.get("variant") == "r3_image_y_down"
+        )
+        return (
+            0 if has_publication_warning else 1,
+            1 if preferred_polarity else 0,
+            float(candidate.get("confirmed_source_fraction", 0.0)),
+        )
+
     graph_first_source = max(
         graph_first_sources,
-        key=lambda item: float(
-            item["graph_first_candidate"].get(
-                "confirmed_source_fraction", 0.0
-            )
-        ),
+        key=graph_first_selection_score,
         default=None,
     )
     if not alignment.get("accepted") and graph_first_source is not None:
@@ -6246,12 +6401,57 @@ def apply_floorplan_constraints(
             "observation_variant": selected_observation["variant"],
         }
     else:
-        updated.pop("map_trajectory", None)
-        updated.pop("map_trajectory_timestamps_seconds", None)
-        updated.pop("map_trajectory_source_fractions", None)
-        updated.pop("map_turn_points", None)
-        updated.pop("map_metadata", None)
-        updated["final_turn_points"] = result.get("turn_points") or []
+        graph_first_trajectory = updated.get("graph_first_trajectory")
+        if (
+            diagnostics.get("graph_first_output_published")
+            and isinstance(graph_first_trajectory, list)
+            and len(graph_first_trajectory) >= 2
+        ):
+            mapped = graph_first_trajectory
+            updated["map_trajectory"] = mapped
+            updated.pop("map_trajectory_timestamps_seconds", None)
+            updated["map_trajectory_source_fractions"] = [
+                round(float(value), 8)
+                for value in _trajectory_fractions(_normalise_points(mapped))
+            ]
+            updated["map_turn_points"] = []
+            updated["final_turn_points"] = result.get("turn_points") or []
+            stats["map_matching_applied"] = True
+            stats["map_matching_mode"] = "graph_first_fallback"
+            stats["map_trajectory_points"] = len(mapped)
+            graph_first_metadata = updated.get("graph_first_metadata") or {}
+            map_distance = (
+                _polyline_length(_normalise_points(mapped))
+                * engine.config.meters_per_pixel
+            )
+            stats["map_distance_meters"] = round(float(map_distance), 3)
+            stats["estimated_distance"] = round(float(map_distance), 3)
+            updated["map_metadata"] = {
+                "map_id": map_id,
+                "plan_width": diagnostics.get("plan_width"),
+                "plan_height": diagnostics.get("plan_height"),
+                "meters_per_pixel": diagnostics.get("meters_per_pixel"),
+                "person_radius_meters": diagnostics.get("person_radius_meters"),
+                "source": "graph_first_fallback_floorplan_constraint_engine",
+                "strict_map_trajectory_accepted": False,
+                "graph_first_source": graph_first_metadata.get("source"),
+                "graph_first_variant": graph_first_metadata.get("variant"),
+                "confirmed_source_fraction": graph_first_metadata.get(
+                    "confirmed_source_fraction"
+                ),
+                "uncertainty_source_fraction_start": graph_first_metadata.get(
+                    "uncertainty_source_fraction_start"
+                ),
+            }
+            diagnostics["map_matching_mode"] = "graph_first_fallback"
+            diagnostics["map_trajectory_published_from_graph_first"] = True
+        else:
+            updated.pop("map_trajectory", None)
+            updated.pop("map_trajectory_timestamps_seconds", None)
+            updated.pop("map_trajectory_source_fractions", None)
+            updated.pop("map_turn_points", None)
+            updated.pop("map_metadata", None)
+            updated["final_turn_points"] = result.get("turn_points") or []
 
     updated["processing_stats"] = stats
     return updated

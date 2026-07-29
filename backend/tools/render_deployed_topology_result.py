@@ -33,6 +33,17 @@ def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 def anchored_r3(payload: dict, graph: dict) -> np.ndarray:
     points = np.asarray(payload["trajectory"], dtype=np.float64)[:, :2]
     points -= points[0]
+    method = str(payload.get("method") or "").lower()
+    quality = payload.get("trajectory_quality") or {}
+    projection = quality.get("projection") if isinstance(quality, dict) else {}
+    convention = (
+        str(projection.get("plan_coordinate_convention"))
+        if isinstance(projection, dict)
+        and projection.get("plan_coordinate_convention")
+        else ("x_forward_y_left_z_up" if method.startswith("r3") else "x_right_y_down")
+    )
+    if convention == "x_forward_y_left_z_up":
+        points[:, 1] *= -1.0
     # Robust early heading: the first metre is noisy, so use the first point
     # whose displacement reaches 5% of the total span.
     displacement = np.linalg.norm(points, axis=1)

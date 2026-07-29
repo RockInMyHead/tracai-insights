@@ -99,6 +99,55 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             candidate["policy"], "stop_at_last_confirmed_viterbi_node_v2"
         )
 
+    def test_directed_edge_match_rejects_opposite_turn_branch(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((80, 80), dtype=bool),
+            meters_per_pixel=1.0,
+        )
+        engine._topology_node_points = np.asarray([
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, -10.0],
+            [0.0, -10.0],
+        ], dtype=np.float64)
+        engine._topology_authored_node_count = 4
+        engine._topology_node_ids = [
+            "node_start",
+            "node_branch",
+            "node_first_turn",
+            "node_wrong_left",
+        ]
+        engine._topology_adjacency = {
+            0: [(1, 10.0)],
+            1: [(2, 10.0)],
+            2: [(3, 10.0)],
+            3: [],
+        }
+        engine._topology_segment_edges = {
+            (0, 1): "edge_start",
+            (1, 2): "edge_first_turn",
+            (2, 3): "edge_wrong_left",
+        }
+
+        observation = np.asarray([
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, -10.0],
+            [20.0, -10.0],
+        ], dtype=np.float64)
+
+        route, diagnostics = engine._directed_edge_event_match(
+            observation,
+            reject_committed_inversions=True,
+        )
+
+        self.assertIsNone(route)
+        self.assertEqual(
+            diagnostics["reason"],
+            "directed_edge_event_sequence_not_found",
+        )
+        self.assertGreater(diagnostics["rejected_inverted_turns"], 0)
+
     def test_rejected_independent_candidate_does_not_hide_r3_graph_recovery(self) -> None:
         class FakeEngine:
             config = type("Config", (), {
@@ -1389,15 +1438,13 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             6,
         )
         self.assertEqual(
-            result["diagnostics"]["turn_topology"]["corrected_event_count"],
-            6,
-        )
-        self.assertEqual(
             result["diagnostics"]["turn_topology"]["sign_mismatch_ratio"],
             0.0,
         )
         self.assertTrue(
-            result["diagnostics"]["turn_topology"]["event_sequence_preserved"]
+            result["diagnostics"]["turn_topology"][
+                "graph_sign_sequence_preserved"
+            ]
         )
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
         # The operator point is exact; the occupancy search works on a

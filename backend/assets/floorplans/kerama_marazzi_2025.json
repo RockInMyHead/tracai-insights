@@ -5,7 +5,7 @@
   "meters_per_pixel": 0.049629166698546515,
   "scale_calibration": {
     "source": "office_area",
-    "office_area_m2": 10.0,
+    "office_area_m2": 10,
     "office_interior_bbox_pixels": [
       2190,
       662,
@@ -43,7 +43,7 @@
   "support_mask_file": "kerama_marazzi_2025_support.png",
   "support_mask_sha256": "cb8f0e32afa6b7f02a9582d8b2a754427c47fb787489afbd3f2f0a499389e564",
   "topology_graph_file": "kerama_marazzi_2025.topology-graph.v1.json",
-  "topology_graph_sha256": "54780a86de3cf3e97aeeb1ab5366fc1048bab5fdda7b3c079ea28b3e86e2d23b",
+  "topology_graph_sha256": "e41097a1243f0ed8030994fc9bc76d42561cab0e0948118d64786581c8db252f",
   "support_mask_generation": {
     "method": "positive_green_corridors_only",
     "ink_threshold": 242,
