@@ -116,6 +116,31 @@ GRAPH_MAP_MATCH_MIN_OBSERVATIONS = 8
 GRAPH_MAP_MATCH_TARGET_ACTIVE_SPEED_RATIO = 0.50
 GRAPH_MAP_MATCH_MAX_VITERBI_COST_PER_ANCHOR = 1.00
 TURN_TOPOLOGY_MIN_DEGREES = 18.0
+DIRECTED_EDGE_EARLY_TURN_ARC_TOLERANCE = 0.03
+DIRECTED_EDGE_LATE_TURN_ARC_TOLERANCE = 0.08
+DIRECTED_EDGE_DEAD_END_ENTRY_MIN_FRACTION = 1.01
+DIRECTED_EDGE_EVENT_SEGMENT_LENGTH_WEIGHT = 8.0
+DIRECTED_EDGE_EVENT_POSITION_WEIGHT = 18.0
+DIRECTED_EDGE_EARLY_LOWER_ZONE_FRACTION_LIMIT = 0.68
+DIRECTED_EDGE_EARLY_LOWER_ZONE_Y_FRACTION = 0.30
+DIRECTED_EDGE_EARLY_LOWER_ZONE_PENALTY = 44.0
+DIRECTED_EDGE_SHAPE_SEED_TURN_COUNT = 3
+DIRECTED_EDGE_SHAPE_SEED_MAX_FRACTION = 0.48
+DIRECTED_EDGE_SHAPE_SEED_X_FRACTION = 0.48
+DIRECTED_EDGE_SHAPE_SEED_Y_FRACTION = 0.36
+DIRECTED_EDGE_SHAPE_SEED_LIMIT = 48
+DIRECTED_EDGE_SHAPE_SEED_SOFT_START_DISTANCE_METERS = 5.0
+DIRECTED_EDGE_SHAPE_SEED_MAX_START_DISTANCE_METERS = 22.0
+DIRECTED_EDGE_SHAPE_SEED_START_DISTANCE_WEIGHT = 3.5
+KERAMA_LOWER_LEFT_CONTOUR_EDGE_IDS = frozenset({
+    "edge_00151",
+    "edge_00051",
+    "edge_00147",
+    "edge_00075",
+    "edge_00075__s002",
+    "edge_00075__s003",
+    "edge_00172",
+})
 MAX_TURN_TOPOLOGY_MEAN_ERROR_DEGREES = 28.0
 MAX_TURN_TOPOLOGY_SIGN_MISMATCH_RATIO = 0.0
 MAX_TURN_EVENT_COUNT_DELTA = 2
@@ -907,6 +932,10 @@ class FloorplanConstraintEngine:
         node_index = {
             str(node["id"]): index for index, node in enumerate(enabled_nodes)
         }
+        authored_node_degrees = {
+            str(node["id"]): int(node.get("degree", 0) or 0)
+            for node in enabled_nodes
+        }
         authored_points = np.asarray([
             [float(node["x"]), float(node["y"])] for node in enabled_nodes
         ], dtype=np.float64)
@@ -916,6 +945,7 @@ class FloorplanConstraintEngine:
             index: [] for index in range(len(authored_points))
         }
         segment_edges: dict[tuple[int, int], str] = {}
+        dead_end_edge_ids: set[str] = set()
         maximum_sample_pixels = (
             1.0 / max(self.config.meters_per_pixel, 1e-9)
         )
@@ -926,6 +956,12 @@ class FloorplanConstraintEngine:
             right = node_index.get(str(edge.get("to") or ""))
             if left is None or right is None or left == right:
                 continue
+            edge_id = str(edge.get("id") or "")
+            if (
+                authored_node_degrees.get(str(edge.get("from") or ""), 0) <= 1
+                or authored_node_degrees.get(str(edge.get("to") or ""), 0) <= 1
+            ):
+                dead_end_edge_ids.add(edge_id)
             start = authored_points[left]
             end = authored_points[right]
             distance = float(np.linalg.norm(end - start))
@@ -951,7 +987,6 @@ class FloorplanConstraintEngine:
                     - np.asarray(points[chain_left])
                 ))
                 adjacency[chain_left].append((chain_right, weight))
-                edge_id = str(edge.get("id") or "")
                 segment_edges[(chain_left, chain_right)] = edge_id
                 if edge.get("bidirectional", True):
                     adjacency[chain_right].append((chain_left, weight))
@@ -960,6 +995,7 @@ class FloorplanConstraintEngine:
         self._topology_authored_node_count = len(authored_points)
         self._topology_adjacency = adjacency
         self._topology_segment_edges = segment_edges
+        self._topology_dead_end_edge_ids = dead_end_edge_ids
         self._topology_node_ids = node_ids
         self._corridor_nodes = np.rint(
             self._topology_node_points
@@ -1022,6 +1058,273 @@ class FloorplanConstraintEngine:
         if 0 <= int(index) < len(self._topology_node_ids):
             return self._topology_node_ids[int(index)]
         return f"topology_node_{int(index)}"
+
+    def _shape_seed_start_states(
+        self,
+        *,
+        expected: list[tuple[float, float]],
+        target_length: float,
+        initial_heading: float,
+        start_point: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        if (
+            self.config.map_id != DEFAULT_FLOORPLAN_ID
+            or len(expected) < 2
+            or target_length <= 1e-6
+            or len(self._topology_node_points) == 0
+        ):
+            return []
+        wanted_count = min(DIRECTED_EDGE_SHAPE_SEED_TURN_COUNT, len(expected))
+        wanted = expected[:wanted_count]
+        x_limit = self.config.width * DIRECTED_EDGE_SHAPE_SEED_X_FRACTION
+        y_limit = self.config.height * DIRECTED_EDGE_SHAPE_SEED_Y_FRACTION
+        soft_start_pixels = (
+            DIRECTED_EDGE_SHAPE_SEED_SOFT_START_DISTANCE_METERS
+            / max(self.config.meters_per_pixel, 1e-9)
+        )
+        max_start_pixels = (
+            DIRECTED_EDGE_SHAPE_SEED_MAX_START_DISTANCE_METERS
+            / max(self.config.meters_per_pixel, 1e-9)
+        )
+        authored_limit = max(0, int(self._topology_authored_node_count))
+        zone_starts = [
+            index for index in range(authored_limit)
+            if (
+                float(self._topology_node_points[index][0]) <= x_limit
+                and float(self._topology_node_points[index][1]) <= y_limit
+            )
+        ]
+        start_distance_by_node = {
+            index: float(np.linalg.norm(
+                self._topology_node_points[index] - start_point
+            ))
+            for index in zone_starts
+        }
+        starts = [
+            index for index in zone_starts
+            if start_distance_by_node[index] <= max_start_pixels
+        ]
+        if not starts:
+            starts = sorted(
+                zone_starts,
+                key=lambda index: start_distance_by_node[index],
+            )[:12]
+        maximum_length = (
+            target_length * DIRECTED_EDGE_SHAPE_SEED_MAX_FRACTION
+        )
+        candidates: list[dict[str, Any]] = []
+
+        def push_candidate(
+            *,
+            path: tuple[int, ...],
+            travelled: float,
+            previous: int,
+            node: int,
+            heading: float,
+            positions: tuple[float, ...],
+            segment_error: float,
+            cost: float,
+        ) -> None:
+            if len(positions) < min(2, wanted_count):
+                return
+            errors = [
+                abs(float(actual) - float(want[0]))
+                for actual, want in zip(positions, wanted)
+            ]
+            first = self._topology_node_points[path[0]]
+            start_distance_pixels = float(np.linalg.norm(first - start_point))
+            start_distance_meters = (
+                start_distance_pixels * self.config.meters_per_pixel
+            )
+            start_distance_excess = max(
+                0.0,
+                start_distance_pixels - soft_start_pixels,
+            ) / max(soft_start_pixels, 1e-9)
+            zone_cost = (
+                (float(first[0]) / max(x_limit, 1e-9)) ** 2
+                + (float(first[1]) / max(y_limit, 1e-9)) ** 2
+            )
+            candidates.append({
+                "path": path,
+                "travelled": travelled,
+                "event_index": len(positions),
+                "previous": previous,
+                "node": node,
+                "heading": heading,
+                "last_event_position": positions[-1],
+                "segment_length_error": segment_error,
+                "matched_event_positions": positions,
+                "cost": (
+                    cost
+                    + 24.0 * float(np.mean(errors))
+                    + 8.0 * float(max(errors))
+                    + DIRECTED_EDGE_SHAPE_SEED_START_DISTANCE_WEIGHT
+                    * start_distance_excess ** 2
+                    + 0.25 * zone_cost
+                ),
+                "start_distance_meters": start_distance_meters,
+                "start_node_id": self._topology_node_id(path[0]),
+                "mean_abs_error": float(np.mean(errors)),
+                "max_abs_error": float(max(errors)),
+                "node_ids": [self._topology_node_id(item) for item in path],
+                "edge_ids": self._topology_edge_sequence(
+                    self._topology_node_points[np.asarray(path, dtype=int)]
+                ),
+            })
+
+        stack: list[
+            tuple[
+                int, int, tuple[int, ...], float, float, int, float,
+                tuple[float, ...], float, float,
+            ]
+        ] = []
+        for start in starts:
+            stack.append((
+                int(start),
+                -1,
+                (int(start),),
+                0.0,
+                initial_heading,
+                0,
+                0.0,
+                (),
+                0.0,
+                0.0,
+            ))
+        max_steps = 72
+        while stack:
+            (
+                node, previous, path, travelled, committed_heading,
+                event_index, last_event_position, matched_positions,
+                segment_error_total, cost,
+            ) = stack.pop()
+            if len(path) > max_steps or travelled > maximum_length:
+                continue
+            if event_index >= min(2, wanted_count):
+                push_candidate(
+                    path=path,
+                    travelled=travelled,
+                    previous=previous,
+                    node=node,
+                    heading=committed_heading,
+                    positions=matched_positions,
+                    segment_error=segment_error_total,
+                    cost=cost,
+                )
+            if event_index >= wanted_count:
+                continue
+            current = self._topology_node_points[node]
+            for neighbour, edge_length in self._topology_adjacency.get(
+                node, []
+            ):
+                neighbour = int(neighbour)
+                if neighbour == previous or neighbour in path:
+                    continue
+                endpoint = self._topology_node_points[neighbour]
+                direction = endpoint - current
+                direction_length = max(float(np.linalg.norm(direction)), 1e-9)
+                next_heading = math.atan2(
+                    float(direction[1]), float(direction[0])
+                )
+                next_event_index = event_index
+                next_last_event_position = last_event_position
+                next_positions = matched_positions
+                next_segment_error = segment_error_total
+                turn_cost = 0.0
+                if previous < 0:
+                    angle = math.degrees(math.atan2(
+                        math.sin(next_heading - committed_heading),
+                        math.cos(next_heading - committed_heading),
+                    ))
+                    if abs(angle) > 110.0:
+                        continue
+                else:
+                    angle = math.degrees(math.atan2(
+                        math.sin(next_heading - committed_heading),
+                        math.cos(next_heading - committed_heading),
+                    ))
+                    if abs(angle) >= 35.0:
+                        expected_fraction, expected_angle = wanted[
+                            event_index
+                        ]
+                        event_position = travelled / target_length
+                        if float(expected_angle) * angle < 0.0:
+                            continue
+                        previous_expected = (
+                            float(wanted[event_index - 1][0])
+                            if event_index > 0 else 0.0
+                        )
+                        segment_error = abs(
+                            (event_position - last_event_position)
+                            - (float(expected_fraction) - previous_expected)
+                        )
+                        position_error = abs(
+                            event_position - float(expected_fraction)
+                        )
+                        turn_cost += (
+                            DIRECTED_EDGE_EVENT_POSITION_WEIGHT
+                            * position_error
+                            + DIRECTED_EDGE_EVENT_SEGMENT_LENGTH_WEIGHT
+                            * segment_error
+                            + 0.7 * abs(angle - float(expected_angle))
+                            / max(abs(float(expected_angle)), 35.0)
+                        )
+                        next_event_index += 1
+                        next_last_event_position = event_position
+                        next_positions = matched_positions + (
+                            float(event_position),
+                        )
+                        next_segment_error += segment_error
+                next_travelled = travelled + float(edge_length)
+                stack.append((
+                    neighbour,
+                    node,
+                    path + (neighbour,),
+                    next_travelled,
+                    next_heading,
+                    next_event_index,
+                    next_last_event_position,
+                    next_positions,
+                    next_segment_error,
+                    cost + turn_cost,
+                ))
+        candidates.sort(key=lambda item: (
+            float(item["start_distance_meters"]),
+            float(item["mean_abs_error"]),
+            float(item["max_abs_error"]),
+            float(item["cost"]),
+        ))
+        return candidates[:DIRECTED_EDGE_SHAPE_SEED_LIMIT]
+
+    def _kerama_upper_zone_route_penalty(
+        self,
+        route: np.ndarray,
+        *,
+        target_length: float,
+    ) -> float:
+        if self.config.map_id != DEFAULT_FLOORPLAN_ID or len(route) < 2:
+            return 0.0
+        fractions = self._polyline_arc_fractions(route)
+        limit = DIRECTED_EDGE_EARLY_LOWER_ZONE_FRACTION_LIMIT
+        y_limit = (
+            self.config.height * DIRECTED_EDGE_EARLY_LOWER_ZONE_Y_FRACTION
+        )
+        violations = [
+            max(0.0, float(point[1]) - y_limit)
+            / max(float(self.config.height), 1e-9)
+            for point, fraction in zip(route, fractions)
+            if float(fraction) <= limit
+        ]
+        if not violations:
+            return 0.0
+        return float(np.mean(violations) + max(violations))
+
+    def _kerama_lower_left_contour_penalty(self, route: np.ndarray) -> float:
+        if self.config.map_id != DEFAULT_FLOORPLAN_ID or len(route) < 2:
+            return 0.0
+        edge_ids = set(self._topology_edge_sequence(route))
+        overlap = edge_ids & KERAMA_LOWER_LEFT_CONTOUR_EDGE_IDS
+        return float(len(overlap))
 
     @staticmethod
     def _polyline_arc_fractions(points: np.ndarray) -> np.ndarray:
@@ -1202,14 +1505,42 @@ class FloorplanConstraintEngine:
         initial_heading = math.atan2(
             float(initial_direction[1]), float(initial_direction[0])
         )
+        shape_seed_states = self._shape_seed_start_states(
+            expected=expected,
+            target_length=target_length,
+            initial_heading=initial_heading,
+            start_point=points[0],
+        )
         # cost, node, previous, path, travelled, matched events, used arcs,
-        # heading committed after the last matched R3 turn
+        # heading committed after the last matched R3 turn, graph arc fraction
+        # at the last consumed event, accumulated per-event distance error,
+        # matched graph turn positions along the route.
         beam: list[
             tuple[
                 float, int, int, tuple[int, ...], float, int,
-                frozenset[tuple[int, int]], float,
+                frozenset[tuple[int, int]], float, float, float,
+                tuple[float, ...],
             ]
         ] = []
+        for seed in shape_seed_states:
+            path = tuple(int(item) for item in seed["path"])
+            used_arcs = frozenset(
+                (int(left), int(right))
+                for left, right in zip(path, path[1:])
+            )
+            beam.append((
+                float(seed["cost"]),
+                int(seed["node"]),
+                int(seed["previous"]),
+                path,
+                float(seed["travelled"]),
+                int(seed["event_index"]),
+                used_arcs,
+                float(seed["heading"]),
+                float(seed["last_event_position"]),
+                float(seed["segment_length_error"]),
+                tuple(float(item) for item in seed["matched_event_positions"]),
+            ))
         for start_node in start_nodes:
             start_node = int(start_node)
             start_cost = (
@@ -1224,10 +1555,15 @@ class FloorplanConstraintEngine:
                 0,
                 frozenset(),
                 initial_heading,
+                0.0,
+                0.0,
+                (),
             ))
 
         terminals: list[
-            tuple[float, tuple[int, ...], float, int]
+            tuple[
+                float, tuple[int, ...], float, int, float, tuple[float, ...],
+            ]
         ] = []
         best: dict[tuple[int, int, int, int, int], float] = {}
         rejected_inverted_turns = 0
@@ -1238,12 +1574,14 @@ class FloorplanConstraintEngine:
             expanded: list[
                 tuple[
                     float, int, int, tuple[int, ...], float, int,
-                    frozenset[tuple[int, int]], float,
+                    frozenset[tuple[int, int]], float, float, float,
+                    tuple[float, ...],
                 ]
             ] = []
             for (
                 cost, node, previous, path, travelled, event_index, used_arcs,
-                committed_heading,
+                committed_heading, last_event_position, segment_length_error,
+                matched_event_positions,
             ) in beam:
                 maximum_matched_events = max(
                     maximum_matched_events, event_index
@@ -1259,13 +1597,28 @@ class FloorplanConstraintEngine:
                     endpoint_error = float(np.linalg.norm(
                         self._topology_node_points[node] - points[-1]
                     )) / radius_pixels
+                    last_expected_fraction = (
+                        float(expected[-1][0]) if expected else 0.0
+                    )
+                    terminal_fraction = travelled / target_length
+                    terminal_segment_error = abs(
+                        (terminal_fraction - last_event_position)
+                        - (1.0 - last_expected_fraction)
+                    )
+                    total_segment_length_error = (
+                        segment_length_error + terminal_segment_error
+                    )
                     terminals.append((
                         cost
                         + 2.0 * abs(travelled / target_length - 1.0)
+                        + DIRECTED_EDGE_EVENT_SEGMENT_LENGTH_WEIGHT
+                        * terminal_segment_error
                         + 0.35 * endpoint_error ** 2,
                         path,
                         travelled,
                         event_index,
+                        total_segment_length_error,
+                        matched_event_positions,
                     ))
                 if travelled >= target_length * 1.65:
                     continue
@@ -1288,6 +1641,9 @@ class FloorplanConstraintEngine:
                     )
                     next_event_index = event_index
                     next_committed_heading = committed_heading
+                    next_last_event_position = last_event_position
+                    next_segment_length_error = segment_length_error
+                    next_matched_event_positions = matched_event_positions
                     turn_penalty = 0.0
                     direction_heading = math.atan2(
                         float(direction[1]), float(direction[0])
@@ -1322,6 +1678,12 @@ class FloorplanConstraintEngine:
                             ]
                             event_position = travelled / target_length
                             if (
+                                event_position
+                                < float(expected_fraction)
+                                - DIRECTED_EDGE_EARLY_TURN_ARC_TOLERANCE
+                            ):
+                                continue
+                            if (
                                 reject_committed_inversions
                                 and
                                 next_event_index > 0
@@ -1334,12 +1696,34 @@ class FloorplanConstraintEngine:
                                 rejected_inverted_turns += 1
                                 continue
                             else:
+                                previous_expected_fraction = (
+                                    float(expected[next_event_index - 1][0])
+                                    if next_event_index > 0 else 0.0
+                                )
+                                segment_error = abs(
+                                    (
+                                        event_position
+                                        - last_event_position
+                                    )
+                                    - (
+                                        float(expected_fraction)
+                                        - previous_expected_fraction
+                                    )
+                                )
                                 turn_penalty += (
-                                2.5 * abs(
+                                DIRECTED_EDGE_EVENT_POSITION_WEIGHT * abs(
                                     event_position - float(expected_fraction)
                                 )
+                                + DIRECTED_EDGE_EVENT_SEGMENT_LENGTH_WEIGHT
+                                * segment_error
                                 + 0.7 * abs(angle - float(expected_angle))
                                 / max(abs(float(expected_angle)), 35.0)
+                                )
+                                next_last_event_position = event_position
+                                next_segment_length_error += segment_error
+                                next_matched_event_positions = (
+                                    matched_event_positions
+                                    + (float(event_position),)
                                 )
                                 next_event_index += 1
                                 next_committed_heading = direction_heading
@@ -1347,6 +1731,47 @@ class FloorplanConstraintEngine:
                     fraction = float(np.clip(
                         next_length / target_length, 0.0, 1.0
                     ))
+                    if (
+                        next_event_index == event_index
+                        and next_event_index < len(expected)
+                        and fraction
+                        > float(expected[next_event_index][0])
+                        + DIRECTED_EDGE_LATE_TURN_ARC_TOLERANCE
+                    ):
+                        turn_penalty += (
+                            DIRECTED_EDGE_EVENT_POSITION_WEIGHT
+                            * (
+                                fraction
+                                - float(expected[next_event_index][0])
+                                - DIRECTED_EDGE_LATE_TURN_ARC_TOLERANCE
+                            )
+                        )
+                    edge_id = self._topology_segment_edges.get((node, neighbour))
+                    if (
+                        edge_id in getattr(
+                            self, "_topology_dead_end_edge_ids", set()
+                        )
+                        and fraction
+                        < DIRECTED_EDGE_DEAD_END_ENTRY_MIN_FRACTION
+                    ):
+                        continue
+                    if (
+                        self.config.map_id == DEFAULT_FLOORPLAN_ID
+                        and next_event_index <= min(2, len(expected))
+                        and fraction
+                        <= DIRECTED_EDGE_EARLY_LOWER_ZONE_FRACTION_LIMIT
+                        and float(endpoint[1])
+                        > self.config.height
+                        * DIRECTED_EDGE_EARLY_LOWER_ZONE_Y_FRACTION
+                    ):
+                        turn_penalty += (
+                            DIRECTED_EDGE_EARLY_LOWER_ZONE_PENALTY
+                            * (
+                                float(endpoint[1])
+                                / max(float(self.config.height), 1e-9)
+                                - DIRECTED_EDGE_EARLY_LOWER_ZONE_Y_FRACTION
+                            )
+                        )
                     observed_point = _resample_polyline(
                         points, np.asarray([fraction], dtype=np.float64)
                     )[0]
@@ -1379,6 +1804,9 @@ class FloorplanConstraintEngine:
                         next_event_index,
                         used_arcs | {arc},
                         next_committed_heading,
+                        next_last_event_position,
+                        next_segment_length_error,
+                        next_matched_event_positions,
                     ))
             if not expanded:
                 break
@@ -1394,26 +1822,114 @@ class FloorplanConstraintEngine:
                 "maximum_travel_fraction": round(
                     maximum_travel_fraction, 6
                 ),
+                "shape_seed_count": len(shape_seed_states),
+                "best_shape_seeds": [
+                    {
+                        "cost": round(float(seed["cost"]), 6),
+                        "start_node_id": seed.get("start_node_id"),
+                        "start_distance_meters": round(
+                            float(seed.get("start_distance_meters", 0.0)),
+                            3,
+                        ),
+                        "mean_abs_error": round(
+                            float(seed["mean_abs_error"]), 6
+                        ),
+                        "max_abs_error": round(
+                            float(seed["max_abs_error"]), 6
+                        ),
+                        "event_index": int(seed["event_index"]),
+                        "travel_fraction": round(
+                            float(seed["travelled"]) / target_length, 6
+                        ),
+                        "node_ids": seed["node_ids"][:8],
+                        "edge_ids": seed["edge_ids"][:8],
+                    }
+                    for seed in shape_seed_states[:5]
+                ],
             }
         terminals.sort(key=lambda item: item[0])
         best_terminal_topology: Optional[dict[str, Any]] = None
         best_terminal_route: Optional[np.ndarray] = None
         best_terminal_inversion: Optional[dict[str, Any]] = None
-        for objective, path, travelled, matched_events in terminals:
+        best_terminal_segment_length_error: Optional[float] = None
+        best_terminal_event_positions: tuple[float, ...] = ()
+        best_terminal_event_mean_error: Optional[float] = None
+        best_terminal_event_max_error: Optional[float] = None
+        best_terminal_zone_penalty: Optional[float] = None
+        best_terminal_lower_contour_penalty: Optional[float] = None
+        for (
+            objective, path, travelled, matched_events, segment_length_error,
+            matched_event_positions,
+        ) in terminals:
             route = self._topology_node_points[
                 np.asarray(path, dtype=int)
             ]
             topology = _turn_topology_metrics(points, route)
+            expected_event_positions = tuple(
+                float(item[0]) for item in expected[:matched_events]
+            )
+            event_position_errors = [
+                abs(float(actual) - float(wanted))
+                for actual, wanted in zip(
+                    matched_event_positions,
+                    expected_event_positions,
+                )
+            ]
+            event_mean_error = (
+                float(np.mean(event_position_errors))
+                if event_position_errors else 1.0
+            )
+            event_max_error = (
+                float(max(event_position_errors))
+                if event_position_errors else 1.0
+            )
+            zone_penalty = self._kerama_upper_zone_route_penalty(
+                route,
+                target_length=target_length,
+            )
+            lower_contour_penalty = self._kerama_lower_left_contour_penalty(
+                route
+            )
             if (
                 best_terminal_topology is None
                 or (
                     float(topology["sign_mismatch_ratio"]),
                     abs(int(topology["event_count_delta"])),
+                    float(lower_contour_penalty),
+                    float(event_mean_error),
+                    float(event_max_error),
+                    float(zone_penalty),
+                    float(segment_length_error),
                     float(topology["mean_abs_turn_error_degrees"]),
                 )
                 < (
                     float(best_terminal_topology["sign_mismatch_ratio"]),
                     abs(int(best_terminal_topology["event_count_delta"])),
+                    float(
+                        best_terminal_lower_contour_penalty
+                        if best_terminal_lower_contour_penalty is not None
+                        else float("inf")
+                    ),
+                    float(
+                        best_terminal_event_mean_error
+                        if best_terminal_event_mean_error is not None
+                        else float("inf")
+                    ),
+                    float(
+                        best_terminal_event_max_error
+                        if best_terminal_event_max_error is not None
+                        else float("inf")
+                    ),
+                    float(
+                        best_terminal_zone_penalty
+                        if best_terminal_zone_penalty is not None
+                        else float("inf")
+                    ),
+                    float(
+                        best_terminal_segment_length_error
+                        if best_terminal_segment_length_error is not None
+                        else float("inf")
+                    ),
                     float(best_terminal_topology[
                         "mean_abs_turn_error_degrees"
                     ]),
@@ -1421,6 +1937,16 @@ class FloorplanConstraintEngine:
             ):
                 best_terminal_topology = topology
                 best_terminal_route = route
+                best_terminal_segment_length_error = float(
+                    segment_length_error
+                )
+                best_terminal_event_positions = matched_event_positions
+                best_terminal_event_mean_error = float(event_mean_error)
+                best_terminal_event_max_error = float(event_max_error)
+                best_terminal_zone_penalty = float(zone_penalty)
+                best_terminal_lower_contour_penalty = float(
+                    lower_contour_penalty
+                )
                 best_terminal_inversion = self._turn_inversion_diagnostics(
                     points, route
                 )
@@ -1437,17 +1963,129 @@ class FloorplanConstraintEngine:
                 "edge_ids": self._topology_edge_sequence(route),
                 "selected_reconstructed_turn_topology": topology,
                 "turn_inversion": inversion,
+                "event_progress": {
+                    "expected_fractions": [
+                        round(float(value), 6)
+                        for value in expected_event_positions
+                    ],
+                    "matched_fractions": [
+                        round(float(value), 6)
+                        for value in matched_event_positions
+                    ],
+                    "mean_abs_error": (
+                        round(float(np.mean(event_position_errors)), 6)
+                        if event_position_errors else None
+                    ),
+                    "max_abs_error": (
+                        round(float(max(event_position_errors)), 6)
+                        if event_position_errors else None
+                    ),
+                    "segment_length_error": round(
+                        float(segment_length_error), 6
+                    ),
+                },
                 "states_evaluated": len(best),
                 "rejected_inverted_turns": rejected_inverted_turns,
+                "shape_seed_count": len(shape_seed_states),
+                "best_shape_seeds": [
+                    {
+                        "cost": round(float(seed["cost"]), 6),
+                        "start_node_id": seed.get("start_node_id"),
+                        "start_distance_meters": round(
+                            float(seed.get("start_distance_meters", 0.0)),
+                            3,
+                        ),
+                        "mean_abs_error": round(
+                            float(seed["mean_abs_error"]), 6
+                        ),
+                        "max_abs_error": round(
+                            float(seed["max_abs_error"]), 6
+                        ),
+                        "event_index": int(seed["event_index"]),
+                        "travel_fraction": round(
+                            float(seed["travelled"]) / target_length, 6
+                        ),
+                        "node_ids": seed["node_ids"][:8],
+                        "edge_ids": seed["edge_ids"][:8],
+                    }
+                    for seed in shape_seed_states[:5]
+                ],
                 "branch_commitment": "connected_edges_only",
             }
+        best_expected_event_positions = tuple(
+            float(item[0]) for item in expected[:len(best_terminal_event_positions)]
+        )
+        best_event_position_errors = [
+            abs(float(actual) - float(wanted))
+            for actual, wanted in zip(
+                best_terminal_event_positions,
+                best_expected_event_positions,
+            )
+        ]
         return None, {
             "reason": "directed_edge_terminal_topology_mismatch",
             "expected_turn_events": len(expected),
             "terminal_candidates": len(terminals),
             "states_evaluated": len(best),
             "rejected_inverted_turns": rejected_inverted_turns,
+            "shape_seed_count": len(shape_seed_states),
+            "best_shape_seeds": [
+                {
+                    "cost": round(float(seed["cost"]), 6),
+                    "start_node_id": seed.get("start_node_id"),
+                    "start_distance_meters": round(
+                        float(seed.get("start_distance_meters", 0.0)),
+                        3,
+                    ),
+                    "mean_abs_error": round(
+                        float(seed["mean_abs_error"]), 6
+                    ),
+                    "max_abs_error": round(float(seed["max_abs_error"]), 6),
+                    "event_index": int(seed["event_index"]),
+                    "travel_fraction": round(
+                        float(seed["travelled"]) / target_length, 6
+                    ),
+                    "node_ids": seed["node_ids"][:8],
+                    "edge_ids": seed["edge_ids"][:8],
+                }
+                for seed in shape_seed_states[:5]
+            ],
             "best_terminal_turn_topology": best_terminal_topology,
+            "best_terminal_segment_length_error": (
+                round(float(best_terminal_segment_length_error), 6)
+                if best_terminal_segment_length_error is not None else None
+            ),
+            "best_terminal_upper_zone_penalty": (
+                round(float(best_terminal_zone_penalty), 6)
+                if best_terminal_zone_penalty is not None else None
+            ),
+            "best_terminal_lower_contour_penalty": (
+                round(float(best_terminal_lower_contour_penalty), 6)
+                if best_terminal_lower_contour_penalty is not None else None
+            ),
+            "best_terminal_event_progress": {
+                "expected_fractions": [
+                    round(float(value), 6)
+                    for value in best_expected_event_positions
+                ],
+                "matched_fractions": [
+                    round(float(value), 6)
+                    for value in best_terminal_event_positions
+                ],
+                "mean_abs_error": (
+                    round(float(np.mean(best_event_position_errors)), 6)
+                    if best_event_position_errors else None
+                ),
+                "max_abs_error": (
+                    round(float(max(best_event_position_errors)), 6)
+                    if best_event_position_errors else None
+                ),
+                "segment_length_error": (
+                    round(float(best_terminal_segment_length_error), 6)
+                    if best_terminal_segment_length_error is not None
+                    else None
+                ),
+            },
             "turn_inversion": best_terminal_inversion,
             "best_terminal_trajectory": (
                 [
@@ -3498,6 +4136,7 @@ class FloorplanConstraintEngine:
         if len(trajectory) < 2 or not edge_ids:
             return {"available": False, "reason": "no_directed_terminal_route"}
         topology = directed_diag.get("best_terminal_turn_topology") or {}
+        event_progress = directed_diag.get("best_terminal_event_progress") or {}
         return {
             "available": True,
             "reason": "directed_terminal_topology_mismatch_fallback",
@@ -3520,6 +4159,16 @@ class FloorplanConstraintEngine:
             "strict_topology_preserved": False,
             "turn_topology": topology,
             "turn_inversion": directed_diag.get("turn_inversion"),
+            "event_progress": event_progress,
+            "event_progress_mean_abs_error": (
+                event_progress.get("mean_abs_error")
+            ),
+            "event_progress_max_abs_error": (
+                event_progress.get("max_abs_error")
+            ),
+            "event_segment_length_error": (
+                event_progress.get("segment_length_error")
+            ),
         }
 
     def _multilevel_viterbi_map_match(
@@ -6275,6 +6924,12 @@ def apply_floorplan_constraints(
             and "edge_00017" not in edge_ids
         )
 
+    def graph_first_lower_left_contour_penalty(item: dict[str, Any]) -> float:
+        if map_id != DEFAULT_FLOORPLAN_ID:
+            return 0.0
+        edge_ids = set(graph_first_edge_ids(item["graph_first_candidate"]))
+        return float(len(edge_ids & KERAMA_LOWER_LEFT_CONTOUR_EDGE_IDS))
+
     for item in graph_first_sources:
         if graph_first_wrong_parallel_start(item):
             item["graph_first_warning_reason"] = (
@@ -6284,8 +6939,38 @@ def apply_floorplan_constraints(
             candidate["publication_warning_reason"] = (
                 "kerama_parallel_start_edge_00012_fallback"
             )
+        candidate = item["graph_first_candidate"]
+        lower_contour_penalty = graph_first_lower_left_contour_penalty(item)
+        if lower_contour_penalty > 0.0:
+            item["graph_first_lower_left_contour_penalty"] = (
+                lower_contour_penalty
+            )
+            item["graph_first_warning_reason"] = (
+                item.get("graph_first_warning_reason")
+                or "kerama_lower_left_contour_fallback"
+            )
+            candidate["publication_warning_reason"] = (
+                candidate.get("publication_warning_reason")
+                or "kerama_lower_left_contour_fallback"
+            )
+        if (
+            map_id == DEFAULT_FLOORPLAN_ID
+            and len(primary_points) >= 1000
+            and not isinstance(candidate.get("event_progress"), dict)
+            and candidate.get("policy") == "stop_at_last_confirmed_viterbi_node_v2"
+        ):
+            item["graph_first_warning_reason"] = (
+                item.get("graph_first_warning_reason")
+                or "kerama_missing_turn_progress_fallback"
+            )
+            candidate["publication_warning_reason"] = (
+                candidate.get("publication_warning_reason")
+                or "kerama_missing_turn_progress_fallback"
+            )
 
-    def graph_first_selection_score(item: dict[str, Any]) -> tuple[int, int, float]:
+    def graph_first_selection_score(
+        item: dict[str, Any]
+    ) -> tuple[int, int, float, float, float, float]:
         candidate = item["graph_first_candidate"]
         has_publication_warning = bool(
             candidate.get("publication_warning_reason")
@@ -6295,9 +6980,26 @@ def apply_floorplan_constraints(
             item.get("source") == "r3"
             and item.get("variant") == "r3_image_y_down"
         )
+        progress_error = candidate.get("event_progress_mean_abs_error")
+        if progress_error is None:
+            progress_error = candidate.get("event_segment_length_error")
+        progress_error = float(
+            progress_error if progress_error is not None else 1.0
+        )
+        max_progress_error = float(
+            candidate.get("event_progress_max_abs_error")
+            if candidate.get("event_progress_max_abs_error") is not None
+            else progress_error
+        )
+        lower_contour_penalty = float(
+            item.get("graph_first_lower_left_contour_penalty", 0.0) or 0.0
+        )
         return (
             0 if has_publication_warning else 1,
             1 if preferred_polarity else 0,
+            -lower_contour_penalty,
+            -progress_error,
+            -max_progress_error,
             float(candidate.get("confirmed_source_fraction", 0.0)),
         )
 
@@ -6328,6 +7030,7 @@ def apply_floorplan_constraints(
             "confirmed_segments": graph_first.get("confirmed_segments", 0),
             "uncertain_segments": graph_first.get("uncertain_segments", 0),
             "policy": graph_first.get("policy"),
+            "event_progress": graph_first.get("event_progress"),
             "uncertainty_marker": graph_first.get("uncertainty_marker"),
             "competing_next_edge_count": len(
                 graph_first.get("competing_next_edges") or []
@@ -6407,7 +7110,20 @@ def apply_floorplan_constraints(
             and isinstance(graph_first_trajectory, list)
             and len(graph_first_trajectory) >= 2
         ):
-            mapped = graph_first_trajectory
+            source_point_count = len(primary_points) if isinstance(
+                primary_points, list
+            ) else 0
+            if source_point_count >= 2:
+                mapped_array = _resample_polyline(
+                    _normalise_points(graph_first_trajectory),
+                    np.linspace(0.0, 1.0, source_point_count),
+                )
+                mapped = [
+                    [float(point[0]), float(point[1])]
+                    for point in mapped_array
+                ]
+            else:
+                mapped = graph_first_trajectory
             updated["map_trajectory"] = mapped
             updated.pop("map_trajectory_timestamps_seconds", None)
             updated["map_trajectory_source_fractions"] = [
