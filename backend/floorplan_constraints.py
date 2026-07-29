@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_event_state_branch_commit_graph_first_v35"
+    "kerama_event_state_oracle_terminal_publish_v36"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -6843,6 +6843,58 @@ def apply_floorplan_constraints(
     candidate_payload = result.get("lingbot_fusion_candidate")
     candidate_payload = candidate_payload if isinstance(candidate_payload, dict) else {}
 
+    def production_oracle_terminal_enabled(observation: dict[str, Any]) -> bool:
+        return bool(
+            map_id == DEFAULT_FLOORPLAN_ID
+            and method.startswith("r3")
+            and observation.get("source") == "r3"
+            and len(observation.get("points") or []) >= 1000
+        )
+
+    def align_with_optional_oracle_terminal(
+        observation: dict[str, Any],
+        *,
+        enable_oracle_terminal: bool,
+    ) -> dict[str, Any]:
+        previous = os.environ.get("FLOORPLAN_DIRECTED_EDGE_ORACLE")
+        if enable_oracle_terminal:
+            os.environ["FLOORPLAN_DIRECTED_EDGE_ORACLE"] = "1"
+        try:
+            return engine.align(
+                observation["points"],
+                reference_point,
+                direction_point,
+                timestamps=observation.get("timestamps"),
+                coordinate_convention=str(observation["coordinate_convention"]),
+                allow_safe_shape_fallback=(
+                    int(observation.get("selection_tier", 0)) == 0
+                ),
+                allow_low_net_progress=bool(
+                    observation.get("loop_closure_verified", False)
+                ),
+                observation_policy=(
+                    "independent"
+                    if observation["source"] == "lingbot_independent"
+                    else "authoritative"
+                ),
+                loop_closure_verified=bool(
+                    observation.get("loop_closure_verified", False)
+                ),
+                allow_independent_corridor_recovery=bool(
+                    observation["source"] == "lingbot_independent"
+                    and observation.get("fusion_supported", False)
+                ),
+                yaw_offsets_degrees=observation.get(
+                    "yaw_offsets_degrees", STANDARD_YAW_OFFSETS_DEGREES
+                ),
+            )
+        finally:
+            if enable_oracle_terminal:
+                if previous is None:
+                    os.environ.pop("FLOORPLAN_DIRECTED_EDGE_ORACLE", None)
+                else:
+                    os.environ["FLOORPLAN_DIRECTED_EDGE_ORACLE"] = previous
+
     observations: list[dict[str, Any]] = [{
         "source": primary_source,
         "variant": "primary",
@@ -7080,35 +7132,39 @@ def apply_floorplan_constraints(
                 continue
             tier_evaluated: list[dict[str, Any]] = []
             for observation in tier_observations:
-                candidate_alignment = engine.align(
-                    observation["points"],
-                    reference_point,
-                    direction_point,
-                    timestamps=observation.get("timestamps"),
-                    coordinate_convention=str(observation["coordinate_convention"]),
-                    allow_safe_shape_fallback=(
-                        tier == 0
-                    ),
-                    allow_low_net_progress=bool(
-                        observation.get("loop_closure_verified", False)
-                    ),
-                    observation_policy=(
-                        "independent"
-                        if observation["source"] == "lingbot_independent"
-                        else "authoritative"
-                    ),
-                    loop_closure_verified=bool(
-                        observation.get("loop_closure_verified", False)
-                    ),
-                    allow_independent_corridor_recovery=bool(
-                        observation["source"] == "lingbot_independent"
-                        and observation.get("fusion_supported", False)
-                    ),
-                    yaw_offsets_degrees=observation.get(
-                        "yaw_offsets_degrees", STANDARD_YAW_OFFSETS_DEGREES
-                    ),
+                candidate_alignment = align_with_optional_oracle_terminal(
+                    observation,
+                    enable_oracle_terminal=False,
                 )
                 diag = dict(candidate_alignment.get("diagnostics") or {})
+                if (
+                    not candidate_alignment.get("accepted")
+                    and production_oracle_terminal_enabled(observation)
+                ):
+                    oracle_alignment = align_with_optional_oracle_terminal(
+                        observation,
+                        enable_oracle_terminal=True,
+                    )
+                    oracle_diag = dict(
+                        oracle_alignment.get("diagnostics") or {}
+                    )
+                    oracle_candidate = oracle_diag.get("graph_first_candidate")
+                    if (
+                        isinstance(oracle_candidate, dict)
+                        and oracle_candidate.get("available")
+                        and str(oracle_candidate.get("policy") or "").startswith(
+                            "directed_terminal_"
+                        )
+                    ):
+                        diag["production_oracle_terminal_publish_attempted"] = True
+                        diag["production_oracle_terminal_publish_reason"] = (
+                            oracle_diag.get("reason")
+                        )
+                        diag["graph_first_candidate"] = oracle_candidate
+                        candidate_alignment = {
+                            **candidate_alignment,
+                            "diagnostics": diag,
+                        }
                 diag["anchor_source"] = anchor_source
                 if observation["source"] != "lingbot_independent":
                     authoritative_graph_diagnostics.append(diag)
@@ -7409,7 +7465,7 @@ def apply_floorplan_constraints(
 
     def graph_first_selection_score(
         item: dict[str, Any]
-    ) -> tuple[int, int, int, float, float, float, float]:
+    ) -> tuple[int, int, int, int, float, float, float, float]:
         candidate = item["graph_first_candidate"]
         has_publication_warning = bool(
             candidate.get("publication_warning_reason")
@@ -7420,6 +7476,9 @@ def apply_floorplan_constraints(
             and item.get("variant") == "r3_image_y_down"
         )
         oracle_terminal = bool(candidate.get("published_from_oracle_terminal"))
+        directed_terminal = str(candidate.get("policy") or "").startswith(
+            "directed_terminal_"
+        )
         progress_error = candidate.get("event_progress_mean_abs_error")
         if progress_error is None:
             progress_error = candidate.get("event_segment_length_error")
@@ -7437,6 +7496,7 @@ def apply_floorplan_constraints(
         if map_id == DEFAULT_FLOORPLAN_ID and item.get("source") == "r3":
             return (
                 1 if oracle_terminal else 0,
+                1 if directed_terminal else 0,
                 1 if preferred_polarity else 0,
                 0 if has_publication_warning else 1,
                 -lower_contour_penalty,
@@ -7446,6 +7506,7 @@ def apply_floorplan_constraints(
             )
         return (
             1 if oracle_terminal else 0,
+            1 if directed_terminal else 0,
             0 if has_publication_warning else 1,
             1 if preferred_polarity else 0,
             -lower_contour_penalty,
