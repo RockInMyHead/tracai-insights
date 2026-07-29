@@ -121,6 +121,10 @@ DIRECTED_EDGE_LATE_TURN_ARC_TOLERANCE = 0.08
 DIRECTED_EDGE_DEAD_END_ENTRY_MIN_FRACTION = 1.01
 DIRECTED_EDGE_EVENT_SEGMENT_LENGTH_WEIGHT = 8.0
 DIRECTED_EDGE_EVENT_POSITION_WEIGHT = 18.0
+DIRECTED_EDGE_HEADING_ANCHOR_CANDIDATES = 20
+DIRECTED_EDGE_HEADING_ANCHOR_LIMIT = 4
+DIRECTED_EDGE_HEADING_ANCHOR_TOLERANCE_DEGREES = 45.0
+DIRECTED_EDGE_FIRST_TURN_HARD_GATE_TOLERANCE = 0.08
 DIRECTED_EDGE_EARLY_LOWER_ZONE_FRACTION_LIMIT = 0.68
 DIRECTED_EDGE_EARLY_LOWER_ZONE_Y_FRACTION = 0.30
 DIRECTED_EDGE_EARLY_LOWER_ZONE_PENALTY = 44.0
@@ -132,6 +136,12 @@ DIRECTED_EDGE_SHAPE_SEED_LIMIT = 48
 DIRECTED_EDGE_SHAPE_SEED_SOFT_START_DISTANCE_METERS = 5.0
 DIRECTED_EDGE_SHAPE_SEED_MAX_START_DISTANCE_METERS = 22.0
 DIRECTED_EDGE_SHAPE_SEED_START_DISTANCE_WEIGHT = 3.5
+DIRECTED_EDGE_SHAPE_SEED_POSITION_MEAN_WEIGHT = 42.0
+DIRECTED_EDGE_SHAPE_SEED_POSITION_MAX_WEIGHT = 16.0
+DIRECTED_EDGE_SHAPE_SEED_BONUS = 2.5
+DIRECTED_EDGE_SCALE_FACTOR_MIN = 0.80
+DIRECTED_EDGE_SCALE_FACTOR_MAX = 1.25
+DIRECTED_EDGE_SCALE_FACTOR_PENALTY_WEIGHT = 6.0
 KERAMA_LOWER_LEFT_CONTOUR_EDGE_IDS = frozenset({
     "edge_00151",
     "edge_00051",
@@ -1127,10 +1137,41 @@ class FloorplanConstraintEngine:
         ) -> None:
             if len(positions) < min(2, wanted_count):
                 return
+            raw_positions = tuple(float(item) for item in positions)
+            scale_factor = 1.0
+            if len(raw_positions) >= 2 and len(wanted) >= 2:
+                r3_delta = max(
+                    float(wanted[1][0]) - float(wanted[0][0]),
+                    1e-6,
+                )
+                graph_delta = max(raw_positions[1] - raw_positions[0], 1e-6)
+                scale_factor = float(np.clip(
+                    graph_delta / r3_delta,
+                    DIRECTED_EDGE_SCALE_FACTOR_MIN,
+                    DIRECTED_EDGE_SCALE_FACTOR_MAX,
+                ))
+            adjusted_positions = tuple(
+                float(item) / max(scale_factor, 1e-9)
+                for item in raw_positions
+            )
             errors = [
                 abs(float(actual) - float(want[0]))
-                for actual, want in zip(positions, wanted)
+                for actual, want in zip(adjusted_positions, wanted)
             ]
+            adjusted_segment_error = 0.0
+            previous_actual = 0.0
+            previous_expected = 0.0
+            for actual, want in zip(adjusted_positions, wanted):
+                adjusted_segment_error += abs(
+                    (float(actual) - previous_actual)
+                    - (float(want[0]) - previous_expected)
+                )
+                previous_actual = float(actual)
+                previous_expected = float(want[0])
+            scale_penalty = (
+                DIRECTED_EDGE_SCALE_FACTOR_PENALTY_WEIGHT
+                * abs(math.log(max(scale_factor, 1e-9)))
+            )
             first = self._topology_node_points[path[0]]
             start_distance_pixels = float(np.linalg.norm(first - start_point))
             start_distance_meters = (
@@ -1151,13 +1192,18 @@ class FloorplanConstraintEngine:
                 "previous": previous,
                 "node": node,
                 "heading": heading,
-                "last_event_position": positions[-1],
-                "segment_length_error": segment_error,
-                "matched_event_positions": positions,
+                "last_event_position": adjusted_positions[-1],
+                "segment_length_error": adjusted_segment_error,
+                "matched_event_positions": adjusted_positions,
+                "scale_factor": scale_factor,
+                "raw_matched_event_positions": raw_positions,
                 "cost": (
                     cost
-                    + 24.0 * float(np.mean(errors))
-                    + 8.0 * float(max(errors))
+                    + DIRECTED_EDGE_SHAPE_SEED_POSITION_MEAN_WEIGHT
+                    * float(np.mean(errors))
+                    + DIRECTED_EDGE_SHAPE_SEED_POSITION_MAX_WEIGHT
+                    * float(max(errors))
+                    + scale_penalty
                     + DIRECTED_EDGE_SHAPE_SEED_START_DISTANCE_WEIGHT
                     * start_distance_excess ** 2
                     + 0.25 * zone_cost
@@ -1166,6 +1212,7 @@ class FloorplanConstraintEngine:
                 "start_node_id": self._topology_node_id(path[0]),
                 "mean_abs_error": float(np.mean(errors)),
                 "max_abs_error": float(max(errors)),
+                "scale_penalty": float(scale_penalty),
                 "node_ids": [self._topology_node_id(item) for item in path],
                 "edge_ids": self._topology_edge_sequence(
                     self._topology_node_points[np.asarray(path, dtype=int)]
@@ -1191,7 +1238,7 @@ class FloorplanConstraintEngine:
                 0.0,
                 0.0,
             ))
-        max_steps = 72
+        max_steps = 160
         while stack:
             (
                 node, previous, path, travelled, committed_heading,
@@ -1496,7 +1543,6 @@ class FloorplanConstraintEngine:
         start_distances = np.linalg.norm(
             self._topology_node_points - points[0][None, :], axis=1
         )
-        start_nodes = np.argsort(start_distances)[:4]
         initial_direction = self._topology_route_initial_direction(points)
         initial_direction /= max(
             float(np.linalg.norm(initial_direction)), 1e-9
@@ -1504,6 +1550,41 @@ class FloorplanConstraintEngine:
 
         initial_heading = math.atan2(
             float(initial_direction[1]), float(initial_direction[0])
+        )
+        potential_starts = [
+            int(index)
+            for index in np.argsort(start_distances)[
+                :DIRECTED_EDGE_HEADING_ANCHOR_CANDIDATES
+            ]
+        ]
+        heading_filtered_starts: list[int] = []
+        for candidate in potential_starts:
+            current = self._topology_node_points[candidate]
+            for neighbour, _edge_length in self._topology_adjacency.get(
+                candidate, []
+            ):
+                endpoint = self._topology_node_points[int(neighbour)]
+                direction = endpoint - current
+                direction_length = float(np.linalg.norm(direction))
+                if direction_length <= 1e-9:
+                    continue
+                edge_heading = math.atan2(
+                    float(direction[1]), float(direction[0])
+                )
+                heading_delta = abs(math.degrees(math.atan2(
+                    math.sin(edge_heading - initial_heading),
+                    math.cos(edge_heading - initial_heading),
+                )))
+                if (
+                    heading_delta
+                    <= DIRECTED_EDGE_HEADING_ANCHOR_TOLERANCE_DEGREES
+                ):
+                    heading_filtered_starts.append(candidate)
+                    break
+        start_nodes = (
+            heading_filtered_starts[:DIRECTED_EDGE_HEADING_ANCHOR_LIMIT]
+            if heading_filtered_starts
+            else potential_starts[:DIRECTED_EDGE_HEADING_ANCHOR_LIMIT]
         )
         shape_seed_states = self._shape_seed_start_states(
             expected=expected,
@@ -1514,12 +1595,13 @@ class FloorplanConstraintEngine:
         # cost, node, previous, path, travelled, matched events, used arcs,
         # heading committed after the last matched R3 turn, graph arc fraction
         # at the last consumed event, accumulated per-event distance error,
-        # matched graph turn positions along the route.
+        # matched graph turn positions along the route, candidate-local R3 to
+        # graph length scale correction.
         beam: list[
             tuple[
                 float, int, int, tuple[int, ...], float, int,
                 frozenset[tuple[int, int]], float, float, float,
-                tuple[float, ...],
+                tuple[float, ...], float,
             ]
         ] = []
         for seed in shape_seed_states:
@@ -1529,7 +1611,7 @@ class FloorplanConstraintEngine:
                 for left, right in zip(path, path[1:])
             )
             beam.append((
-                float(seed["cost"]),
+                float(seed["cost"]) - DIRECTED_EDGE_SHAPE_SEED_BONUS,
                 int(seed["node"]),
                 int(seed["previous"]),
                 path,
@@ -1540,6 +1622,7 @@ class FloorplanConstraintEngine:
                 float(seed["last_event_position"]),
                 float(seed["segment_length_error"]),
                 tuple(float(item) for item in seed["matched_event_positions"]),
+                float(seed.get("scale_factor", 1.0)),
             ))
         for start_node in start_nodes:
             start_node = int(start_node)
@@ -1558,37 +1641,68 @@ class FloorplanConstraintEngine:
                 0.0,
                 0.0,
                 (),
+                1.0,
             ))
 
         terminals: list[
             tuple[
                 float, tuple[int, ...], float, int, float, tuple[float, ...],
+                float,
             ]
         ] = []
         best: dict[tuple[int, int, int, int, int], float] = {}
         rejected_inverted_turns = 0
+        first_turn_kill_count = 0
         maximum_matched_events = 0
         maximum_travel_fraction = 0.0
         maximum_steps = min(max(len(self._topology_node_points), 32), 220)
+
+        def shape_seed_diagnostics(seed: dict[str, Any]) -> dict[str, Any]:
+            seed_scale = float(seed.get("scale_factor", 1.0))
+            return {
+                "cost": round(float(seed["cost"]), 6),
+                "start_node_id": seed.get("start_node_id"),
+                "start_distance_meters": round(
+                    float(seed.get("start_distance_meters", 0.0)), 3
+                ),
+                "mean_abs_error": round(float(seed["mean_abs_error"]), 6),
+                "max_abs_error": round(float(seed["max_abs_error"]), 6),
+                "event_index": int(seed["event_index"]),
+                "scale_factor": round(seed_scale, 6),
+                "scale_penalty": round(
+                    float(seed.get("scale_penalty", 0.0)), 6
+                ),
+                "travel_fraction": round(
+                    float(seed["travelled"])
+                    / max(target_length * seed_scale, 1e-9),
+                    6,
+                ),
+                "node_ids": seed["node_ids"][:8],
+                "edge_ids": seed["edge_ids"][:8],
+            }
+
         for _ in range(maximum_steps):
             expanded: list[
                 tuple[
                     float, int, int, tuple[int, ...], float, int,
                     frozenset[tuple[int, int]], float, float, float,
-                    tuple[float, ...],
+                    tuple[float, ...], float,
                 ]
             ] = []
             for (
                 cost, node, previous, path, travelled, event_index, used_arcs,
                 committed_heading, last_event_position, segment_length_error,
-                matched_event_positions,
+                matched_event_positions, scale_factor,
             ) in beam:
+                adjusted_target_length = max(
+                    target_length * scale_factor, 1e-9
+                )
                 maximum_matched_events = max(
                     maximum_matched_events, event_index
                 )
                 maximum_travel_fraction = max(
                     maximum_travel_fraction,
-                    travelled / target_length,
+                    travelled / adjusted_target_length,
                 )
                 if (
                     travelled >= target_length * 0.65
@@ -1600,7 +1714,7 @@ class FloorplanConstraintEngine:
                     last_expected_fraction = (
                         float(expected[-1][0]) if expected else 0.0
                     )
-                    terminal_fraction = travelled / target_length
+                    terminal_fraction = travelled / adjusted_target_length
                     terminal_segment_error = abs(
                         (terminal_fraction - last_event_position)
                         - (1.0 - last_expected_fraction)
@@ -1610,7 +1724,7 @@ class FloorplanConstraintEngine:
                     )
                     terminals.append((
                         cost
-                        + 2.0 * abs(travelled / target_length - 1.0)
+                        + 2.0 * abs(travelled / adjusted_target_length - 1.0)
                         + DIRECTED_EDGE_EVENT_SEGMENT_LENGTH_WEIGHT
                         * terminal_segment_error
                         + 0.35 * endpoint_error ** 2,
@@ -1619,8 +1733,9 @@ class FloorplanConstraintEngine:
                         event_index,
                         total_segment_length_error,
                         matched_event_positions,
+                        scale_factor,
                     ))
-                if travelled >= target_length * 1.65:
+                if travelled >= adjusted_target_length * 1.65:
                     continue
                 current = self._topology_node_points[node]
                 for neighbour, edge_length in self._topology_adjacency.get(
@@ -1676,7 +1791,7 @@ class FloorplanConstraintEngine:
                             expected_fraction, expected_angle = expected[
                                 next_event_index
                             ]
-                            event_position = travelled / target_length
+                            event_position = travelled / adjusted_target_length
                             if (
                                 event_position
                                 < float(expected_fraction)
@@ -1729,7 +1844,7 @@ class FloorplanConstraintEngine:
                                 next_committed_heading = direction_heading
                     next_length = travelled + float(edge_length)
                     fraction = float(np.clip(
-                        next_length / target_length, 0.0, 1.0
+                        next_length / adjusted_target_length, 0.0, 1.0
                     ))
                     if (
                         next_event_index == event_index
@@ -1738,6 +1853,9 @@ class FloorplanConstraintEngine:
                         > float(expected[next_event_index][0])
                         + DIRECTED_EDGE_LATE_TURN_ARC_TOLERANCE
                     ):
+                        if next_event_index == 0:
+                            first_turn_kill_count += 1
+                            continue
                         turn_penalty += (
                             DIRECTED_EDGE_EVENT_POSITION_WEIGHT
                             * (
@@ -1807,6 +1925,7 @@ class FloorplanConstraintEngine:
                         next_last_event_position,
                         next_segment_length_error,
                         next_matched_event_positions,
+                        scale_factor,
                     ))
             if not expanded:
                 break
@@ -1818,32 +1937,18 @@ class FloorplanConstraintEngine:
                 "expected_turn_events": len(expected),
                 "states_evaluated": len(best),
                 "rejected_inverted_turns": rejected_inverted_turns,
+                "heading_filtered_anchors_count": len(
+                    heading_filtered_starts
+                ),
+                "heading_anchor_candidates": len(potential_starts),
+                "first_turn_kill_count": first_turn_kill_count,
                 "maximum_matched_turn_events": maximum_matched_events,
                 "maximum_travel_fraction": round(
                     maximum_travel_fraction, 6
                 ),
                 "shape_seed_count": len(shape_seed_states),
                 "best_shape_seeds": [
-                    {
-                        "cost": round(float(seed["cost"]), 6),
-                        "start_node_id": seed.get("start_node_id"),
-                        "start_distance_meters": round(
-                            float(seed.get("start_distance_meters", 0.0)),
-                            3,
-                        ),
-                        "mean_abs_error": round(
-                            float(seed["mean_abs_error"]), 6
-                        ),
-                        "max_abs_error": round(
-                            float(seed["max_abs_error"]), 6
-                        ),
-                        "event_index": int(seed["event_index"]),
-                        "travel_fraction": round(
-                            float(seed["travelled"]) / target_length, 6
-                        ),
-                        "node_ids": seed["node_ids"][:8],
-                        "edge_ids": seed["edge_ids"][:8],
-                    }
+                    shape_seed_diagnostics(seed)
                     for seed in shape_seed_states[:5]
                 ],
             }
@@ -1857,9 +1962,10 @@ class FloorplanConstraintEngine:
         best_terminal_event_max_error: Optional[float] = None
         best_terminal_zone_penalty: Optional[float] = None
         best_terminal_lower_contour_penalty: Optional[float] = None
+        best_terminal_scale_factor: Optional[float] = None
         for (
             objective, path, travelled, matched_events, segment_length_error,
-            matched_event_positions,
+            matched_event_positions, scale_factor,
         ) in terminals:
             route = self._topology_node_points[
                 np.asarray(path, dtype=int)
@@ -1947,6 +2053,7 @@ class FloorplanConstraintEngine:
                 best_terminal_lower_contour_penalty = float(
                     lower_contour_penalty
                 )
+                best_terminal_scale_factor = float(scale_factor)
                 best_terminal_inversion = self._turn_inversion_diagnostics(
                     points, route
                 )
@@ -1983,31 +2090,18 @@ class FloorplanConstraintEngine:
                     "segment_length_error": round(
                         float(segment_length_error), 6
                     ),
+                    "scale_factor": round(float(scale_factor), 6),
                 },
                 "states_evaluated": len(best),
                 "rejected_inverted_turns": rejected_inverted_turns,
+                "heading_filtered_anchors_count": len(
+                    heading_filtered_starts
+                ),
+                "heading_anchor_candidates": len(potential_starts),
+                "first_turn_kill_count": first_turn_kill_count,
                 "shape_seed_count": len(shape_seed_states),
                 "best_shape_seeds": [
-                    {
-                        "cost": round(float(seed["cost"]), 6),
-                        "start_node_id": seed.get("start_node_id"),
-                        "start_distance_meters": round(
-                            float(seed.get("start_distance_meters", 0.0)),
-                            3,
-                        ),
-                        "mean_abs_error": round(
-                            float(seed["mean_abs_error"]), 6
-                        ),
-                        "max_abs_error": round(
-                            float(seed["max_abs_error"]), 6
-                        ),
-                        "event_index": int(seed["event_index"]),
-                        "travel_fraction": round(
-                            float(seed["travelled"]) / target_length, 6
-                        ),
-                        "node_ids": seed["node_ids"][:8],
-                        "edge_ids": seed["edge_ids"][:8],
-                    }
+                    shape_seed_diagnostics(seed)
                     for seed in shape_seed_states[:5]
                 ],
                 "branch_commitment": "connected_edges_only",
@@ -2028,26 +2122,12 @@ class FloorplanConstraintEngine:
             "terminal_candidates": len(terminals),
             "states_evaluated": len(best),
             "rejected_inverted_turns": rejected_inverted_turns,
+            "heading_filtered_anchors_count": len(heading_filtered_starts),
+            "heading_anchor_candidates": len(potential_starts),
+            "first_turn_kill_count": first_turn_kill_count,
             "shape_seed_count": len(shape_seed_states),
             "best_shape_seeds": [
-                {
-                    "cost": round(float(seed["cost"]), 6),
-                    "start_node_id": seed.get("start_node_id"),
-                    "start_distance_meters": round(
-                        float(seed.get("start_distance_meters", 0.0)),
-                        3,
-                    ),
-                    "mean_abs_error": round(
-                        float(seed["mean_abs_error"]), 6
-                    ),
-                    "max_abs_error": round(float(seed["max_abs_error"]), 6),
-                    "event_index": int(seed["event_index"]),
-                    "travel_fraction": round(
-                        float(seed["travelled"]) / target_length, 6
-                    ),
-                    "node_ids": seed["node_ids"][:8],
-                    "edge_ids": seed["edge_ids"][:8],
-                }
+                shape_seed_diagnostics(seed)
                 for seed in shape_seed_states[:5]
             ],
             "best_terminal_turn_topology": best_terminal_topology,
@@ -2084,6 +2164,10 @@ class FloorplanConstraintEngine:
                     round(float(best_terminal_segment_length_error), 6)
                     if best_terminal_segment_length_error is not None
                     else None
+                ),
+                "scale_factor": (
+                    round(float(best_terminal_scale_factor), 6)
+                    if best_terminal_scale_factor is not None else None
                 ),
             },
             "turn_inversion": best_terminal_inversion,
@@ -6994,6 +7078,15 @@ def apply_floorplan_constraints(
         lower_contour_penalty = float(
             item.get("graph_first_lower_left_contour_penalty", 0.0) or 0.0
         )
+        if map_id == DEFAULT_FLOORPLAN_ID and item.get("source") == "r3":
+            return (
+                1 if preferred_polarity else 0,
+                0 if has_publication_warning else 1,
+                -lower_contour_penalty,
+                -progress_error,
+                -max_progress_error,
+                float(candidate.get("confirmed_source_fraction", 0.0)),
+            )
         return (
             0 if has_publication_warning else 1,
             1 if preferred_polarity else 0,
