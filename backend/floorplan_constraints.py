@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_event_state_oracle_terminal_publish_v36"
+    "kerama_event_state_oracle_terminal_publish_v37_supermap_lite"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -127,6 +127,9 @@ DIRECTED_EDGE_ORACLE_SIGN_MISMATCH_PENALTY = 220.0
 DIRECTED_EDGE_ORACLE_FRONTIER_LIMIT = 12000
 DIRECTED_EDGE_EARLY_EVENT_COUNT = 3
 DIRECTED_EDGE_EARLY_EVENT_POSITION_WEIGHT_MULTIPLIER = 4.0
+DIRECTED_EDGE_EARLY_EVENT_HARD_FRACTION_ERROR = 0.05
+DIRECTED_EDGE_EARLY_EVENT_HARD_ANGLE_ERROR_DEGREES = 25.0
+GRAPH_TURN_EVENT_MIN_DEGREES = 20.0
 DIRECTED_EDGE_FIRST_TURN_LATE_EXTRA_WEIGHT = 180.0
 DIRECTED_EDGE_FIRST_TURN_MAX_LATE_TOLERANCE = 0.11
 DIRECTED_EDGE_DEAD_END_ENTRY_MIN_FRACTION = 1.01
@@ -868,6 +871,10 @@ class FloorplanConstraintEngine:
         self._topology_authored_node_count = 0
         self._topology_adjacency: dict[int, list[tuple[int, float]]] = {}
         self._topology_segment_edges: dict[tuple[int, int], str] = {}
+        self._graph_events_by_node: dict[int, list[dict[str, Any]]] = {}
+        self._graph_event_by_transition: dict[
+            tuple[int, int, int], dict[str, Any]
+        ] = {}
         self._topology_node_ids: list[str] = []
         self._build_grid(self._full_mask, annotation_mask=mask)
         if config.topology_graph_file:
@@ -1018,10 +1025,61 @@ class FloorplanConstraintEngine:
         self._topology_segment_edges = segment_edges
         self._topology_dead_end_edge_ids = dead_end_edge_ids
         self._topology_node_ids = node_ids
+        self._build_graph_turn_events()
         self._corridor_nodes = np.rint(
             self._topology_node_points
             / max(self.config.grid_cell_pixels, 1)
         ).astype(np.int32)
+
+    def _build_graph_turn_events(self) -> None:
+        events_by_node: dict[int, list[dict[str, Any]]] = {}
+        event_by_transition: dict[tuple[int, int, int], dict[str, Any]] = {}
+        authored_limit = max(0, int(self._topology_authored_node_count))
+        for node in range(authored_limit):
+            current = self._topology_node_points[node]
+            neighbours = [
+                int(neighbour)
+                for neighbour, _edge_length in self._topology_adjacency.get(
+                    node, []
+                )
+            ]
+            for incoming in neighbours:
+                incoming_point = self._topology_node_points[incoming]
+                incoming_heading = math.atan2(
+                    float(current[1] - incoming_point[1]),
+                    float(current[0] - incoming_point[0]),
+                )
+                for outgoing in neighbours:
+                    if outgoing == incoming:
+                        continue
+                    outgoing_point = self._topology_node_points[outgoing]
+                    outgoing_heading = math.atan2(
+                        float(outgoing_point[1] - current[1]),
+                        float(outgoing_point[0] - current[0]),
+                    )
+                    angle = math.degrees(math.atan2(
+                        math.sin(outgoing_heading - incoming_heading),
+                        math.cos(outgoing_heading - incoming_heading),
+                    ))
+                    if abs(angle) < GRAPH_TURN_EVENT_MIN_DEGREES:
+                        continue
+                    event = {
+                        "node_id": self._topology_node_id(node),
+                        "node_index": node,
+                        "incoming_node_id": self._topology_node_id(incoming),
+                        "outgoing_node_id": self._topology_node_id(outgoing),
+                        "incoming_edge_id": self._topology_segment_edges.get(
+                            (incoming, node)
+                        ),
+                        "outgoing_edge_id": self._topology_segment_edges.get(
+                            (node, outgoing)
+                        ),
+                        "turn_angle_degrees": float(angle),
+                    }
+                    events_by_node.setdefault(node, []).append(event)
+                    event_by_transition[(incoming, node, outgoing)] = event
+        self._graph_events_by_node = events_by_node
+        self._graph_event_by_transition = event_by_transition
 
     def _topology_route(
         self, start: np.ndarray, end: np.ndarray
@@ -1669,6 +1727,9 @@ class FloorplanConstraintEngine:
         first_turn_late_penalty_count = 0
         event_window_kill_count = [0 for _ in expected]
         event_sign_mismatch_kill_count = [0 for _ in expected]
+        predictive_risk_position_kill_count = [0 for _ in expected]
+        predictive_risk_angle_kill_count = [0 for _ in expected]
+        graph_turn_event_match_count = 0
         beam_size_history: list[int] = []
         oracle_dominance_reject_count = 0
         oracle_frontier_trim_count = 0
@@ -1750,6 +1811,12 @@ class FloorplanConstraintEngine:
                 if event_index < DIRECTED_EDGE_EARLY_EVENT_COUNT else 1.0
             )
             return DIRECTED_EDGE_EVENT_POSITION_WEIGHT * multiplier
+
+        def signed_angle_delta_degrees(left: float, right: float) -> float:
+            return math.degrees(math.atan2(
+                math.sin(math.radians(float(left) - float(right))),
+                math.cos(math.radians(float(left) - float(right))),
+            ))
 
         def shape_seed_diagnostics(seed: dict[str, Any]) -> dict[str, Any]:
             seed_scale = float(seed.get("scale_factor", 1.0))
@@ -1924,6 +1991,44 @@ class FloorplanConstraintEngine:
                                 next_event_index
                             ]
                             event_position = travelled / adjusted_target_length
+                            graph_turn_event = (
+                                self._graph_event_by_transition.get(
+                                    (previous, node, neighbour)
+                                )
+                            )
+                            if graph_turn_event is not None:
+                                graph_turn_event_match_count += 1
+                            if (
+                                oracle_mode
+                                and
+                                next_event_index
+                                < DIRECTED_EDGE_EARLY_EVENT_COUNT
+                            ):
+                                early_position_error = abs(
+                                    event_position - float(expected_fraction)
+                                )
+                                early_angle_error = abs(
+                                    signed_angle_delta_degrees(
+                                        angle,
+                                        float(expected_angle),
+                                    )
+                                )
+                                if (
+                                    early_position_error
+                                    > DIRECTED_EDGE_EARLY_EVENT_HARD_FRACTION_ERROR
+                                ):
+                                    predictive_risk_position_kill_count[
+                                        next_event_index
+                                    ] += 1
+                                    continue
+                                if (
+                                    early_angle_error
+                                    > DIRECTED_EDGE_EARLY_EVENT_HARD_ANGLE_ERROR_DEGREES
+                                ):
+                                    predictive_risk_angle_kill_count[
+                                        next_event_index
+                                    ] += 1
+                                    continue
                             window_start, window_end = event_window(
                                 next_event_index,
                                 matched_event_positions,
@@ -2207,6 +2312,17 @@ class FloorplanConstraintEngine:
                 "event_sign_mismatch_kill_count": (
                     event_sign_mismatch_kill_count
                 ),
+                "predictive_risk_position_kill_count": (
+                    predictive_risk_position_kill_count
+                ),
+                "predictive_risk_angle_kill_count": (
+                    predictive_risk_angle_kill_count
+                ),
+                "graph_turn_event_count": sum(
+                    len(events)
+                    for events in self._graph_events_by_node.values()
+                ),
+                "graph_turn_event_match_count": graph_turn_event_match_count,
                 "beam_size_history": beam_size_history,
                 "maximum_matched_turn_events": maximum_matched_events,
                 "maximum_travel_fraction": round(
@@ -2397,6 +2513,17 @@ class FloorplanConstraintEngine:
                 "event_sign_mismatch_kill_count": (
                     event_sign_mismatch_kill_count
                 ),
+                "predictive_risk_position_kill_count": (
+                    predictive_risk_position_kill_count
+                ),
+                "predictive_risk_angle_kill_count": (
+                    predictive_risk_angle_kill_count
+                ),
+                "graph_turn_event_count": sum(
+                    len(events)
+                    for events in self._graph_events_by_node.values()
+                ),
+                "graph_turn_event_match_count": graph_turn_event_match_count,
                 "beam_size_history": beam_size_history,
                 "shape_seed_count": len(shape_seed_states),
                 "shape_seed_scale_histogram": shape_seed_scale_histogram,
@@ -2432,6 +2559,16 @@ class FloorplanConstraintEngine:
             "first_turn_late_penalty_count": first_turn_late_penalty_count,
             "event_window_kill_count": event_window_kill_count,
             "event_sign_mismatch_kill_count": event_sign_mismatch_kill_count,
+            "predictive_risk_position_kill_count": (
+                predictive_risk_position_kill_count
+            ),
+            "predictive_risk_angle_kill_count": (
+                predictive_risk_angle_kill_count
+            ),
+            "graph_turn_event_count": sum(
+                len(events) for events in self._graph_events_by_node.values()
+            ),
+            "graph_turn_event_match_count": graph_turn_event_match_count,
             "beam_size_history": beam_size_history,
             "shape_seed_count": len(shape_seed_states),
             "shape_seed_scale_histogram": shape_seed_scale_histogram,
