@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_event_state_oracle_terminal_publish_v37_supermap_lite"
+    "kerama_event_state_oracle_terminal_publish_v38_event_guided_tail"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -4671,6 +4671,270 @@ class FloorplanConstraintEngine:
             "policy": "stop_at_last_confirmed_viterbi_node_v2",
         }
 
+    def _continue_viterbi_prefix_with_events(
+        self,
+        observation: np.ndarray,
+        partial: dict[str, Any],
+        *,
+        beam_width: int = 96,
+        maximum_steps: int = 96,
+    ) -> dict[str, Any]:
+        base = self._viterbi_prefix_candidate(partial)
+        if (
+            not base.get("available")
+            or len(base.get("trajectory") or []) < 2
+            or not self._topology_adjacency
+        ):
+            return base
+        observation_xy = np.asarray(observation, dtype=np.float64)
+        if observation_xy.ndim != 2 or len(observation_xy) < 2:
+            return base
+        if observation_xy.shape[1] > 2:
+            observation_xy = observation_xy[:, :2]
+        confirmed = [
+            np.asarray(point, dtype=np.float64)
+            for point in base.get("trajectory") or []
+        ]
+        confirmed_fraction = float(base.get("confirmed_source_fraction", 0.0))
+        if confirmed_fraction >= 0.92:
+            return base
+        target_length = _polyline_length(observation_xy)
+        if target_length <= 1e-6:
+            return base
+        expected = _turn_events(
+            _resample_polyline(
+                observation_xy,
+                np.linspace(0.0, 1.0, 128),
+            ),
+            samples=128,
+            min_turn_degrees=TURN_TOPOLOGY_MIN_DEGREES,
+        )
+        next_expected_index = 0
+        for index, (fraction, _angle) in enumerate(expected):
+            if float(fraction) > confirmed_fraction + 0.025:
+                next_expected_index = index
+                break
+        else:
+            return base
+        marker = np.asarray(confirmed[-1], dtype=np.float64)
+        node = int(np.argmin(np.linalg.norm(
+            self._topology_node_points - marker[None, :], axis=1
+        )))
+        if len(confirmed) >= 2:
+            previous = int(np.argmin(np.linalg.norm(
+                self._topology_node_points - confirmed[-2][None, :], axis=1
+            )))
+        else:
+            previous = -1
+        committed_vector = marker - confirmed[-2]
+        if float(np.linalg.norm(committed_vector)) <= 1e-9:
+            committed_vector = self._topology_node_points[node] - confirmed[-2]
+        committed_heading = math.atan2(
+            float(committed_vector[1]),
+            float(committed_vector[0]),
+        )
+        confirmed_pixels = _polyline_length(np.asarray(confirmed, dtype=np.float64))
+        adjusted_target_length = max(
+            confirmed_pixels / max(confirmed_fraction, 1e-6),
+            target_length,
+            1e-9,
+        )
+        used_edges = set(base.get("segments", [{}])[0].get("edge_ids") or [])
+        beam: list[tuple[
+            float,
+            int,
+            int,
+            tuple[int, ...],
+            float,
+            int,
+            float,
+            tuple[str, ...],
+            tuple[tuple[float, float], ...],
+        ]] = [(
+            0.0,
+            node,
+            previous,
+            (node,),
+            confirmed_fraction,
+            next_expected_index,
+            committed_heading,
+            tuple(),
+            tuple(),
+        )]
+        best_tail: Optional[tuple[float, tuple[int, ...], float, int, tuple[str, ...]]] = None
+        evaluated = 0
+        killed_by_event_window = 0
+        killed_by_event_sign = 0
+        killed_by_revisit = 0
+        for _step in range(maximum_steps):
+            expanded: list[tuple[
+                float,
+                int,
+                int,
+                tuple[int, ...],
+                float,
+                int,
+                float,
+                tuple[str, ...],
+                tuple[tuple[float, float], ...],
+            ]] = []
+            for (
+                cost,
+                current_node,
+                previous_node,
+                path,
+                fraction,
+                event_index,
+                heading,
+                tail_edge_ids,
+                matched_events,
+            ) in beam:
+                evaluated += 1
+                if fraction >= 0.96 or event_index >= len(expected):
+                    candidate = (cost, path, fraction, event_index, tail_edge_ids)
+                    if best_tail is None or candidate[0] < best_tail[0]:
+                        best_tail = candidate
+                current = self._topology_node_points[current_node]
+                for neighbour, edge_length in self._topology_adjacency.get(
+                    current_node, []
+                ):
+                    neighbour = int(neighbour)
+                    if neighbour == previous_node or neighbour in path:
+                        killed_by_revisit += 1
+                        continue
+                    endpoint = self._topology_node_points[neighbour]
+                    direction = endpoint - current
+                    direction_length = max(float(np.linalg.norm(direction)), 1e-9)
+                    next_fraction = float(np.clip(
+                        fraction + direction_length / adjusted_target_length,
+                        0.0,
+                        1.25,
+                    ))
+                    next_event_index = event_index
+                    next_heading = math.atan2(
+                        float(direction[1]),
+                        float(direction[0]),
+                    )
+                    next_matched_events = matched_events
+                    penalty = 0.0
+                    angle = math.degrees(math.atan2(
+                        math.sin(next_heading - heading),
+                        math.cos(next_heading - heading),
+                    ))
+                    if abs(angle) >= GRAPH_TURN_EVENT_MIN_DEGREES:
+                        if next_event_index >= len(expected):
+                            killed_by_event_window += 1
+                            continue
+                        expected_fraction, expected_angle = expected[next_event_index]
+                        if next_fraction < float(expected_fraction) - 0.08:
+                            penalty += 50.0 * (
+                                float(expected_fraction) - 0.08 - next_fraction
+                            )
+                        if next_fraction > float(expected_fraction) + 0.12:
+                            killed_by_event_window += 1
+                            continue
+                        if float(expected_angle) * angle < 0.0:
+                            killed_by_event_sign += 1
+                            continue
+                        penalty += (
+                            46.0 * abs(next_fraction - float(expected_fraction))
+                            + 0.9
+                            * abs(angle - float(expected_angle))
+                            / max(abs(float(expected_angle)), 35.0)
+                        )
+                        next_event_index += 1
+                        next_matched_events = matched_events + ((
+                            float(next_fraction),
+                            float(angle),
+                        ),)
+                    elif (
+                        next_event_index < len(expected)
+                        and next_fraction > float(expected[next_event_index][0]) + 0.12
+                    ):
+                        killed_by_event_window += 1
+                        continue
+                    edge_id = self._topology_segment_edges.get(
+                        (current_node, neighbour)
+                    )
+                    if not edge_id:
+                        continue
+                    reuse_penalty = 4.0 if edge_id in used_edges else 0.0
+                    observed_point = _resample_polyline(
+                        observation_xy,
+                        np.asarray([min(next_fraction, 1.0)], dtype=np.float64),
+                    )[0]
+                    observation_error = (
+                        float(np.linalg.norm(endpoint - observed_point))
+                        * self.config.meters_per_pixel
+                    )
+                    expanded.append((
+                        cost + penalty + reuse_penalty + 0.04 * observation_error,
+                        neighbour,
+                        current_node,
+                        path + (neighbour,),
+                        next_fraction,
+                        next_event_index,
+                        next_heading,
+                        tail_edge_ids + (edge_id,),
+                        next_matched_events,
+                    ))
+            if not expanded:
+                break
+            expanded.sort(key=lambda item: item[0])
+            beam = expanded[:beam_width]
+        if best_tail is None or best_tail[2] <= confirmed_fraction + 0.12:
+            base["event_guided_continuation"] = {
+                "attempted": True,
+                "accepted": False,
+                "states_evaluated": evaluated,
+                "killed_by_event_window": killed_by_event_window,
+                "killed_by_event_sign": killed_by_event_sign,
+                "killed_by_revisit": killed_by_revisit,
+            }
+            return base
+        _cost, tail_path, tail_fraction, tail_events, tail_edge_ids = best_tail
+        tail_points = self._topology_node_points[np.asarray(tail_path, dtype=int)]
+        merged = [list(point) for point in confirmed]
+        for point in tail_points[1:]:
+            merged.append([float(point[0]), float(point[1])])
+        deduped_tail_edges = [
+            edge_id for index, edge_id in enumerate(tail_edge_ids)
+            if index == 0 or edge_id != tail_edge_ids[index - 1]
+        ]
+        base.update({
+            "trajectory": merged,
+            "segments": [
+                base["segments"][0],
+                {
+                    "start_index": len(confirmed) - 1,
+                    "end_index": len(merged) - 1,
+                    "source_fraction_start": confirmed_fraction,
+                    "source_fraction_end": round(float(min(tail_fraction, 1.0)), 8),
+                    "status": "event_guided",
+                    "edge_ids": deduped_tail_edges,
+                },
+            ],
+            "uncertain_segments": int(base.get("uncertain_segments", 0)) + 1,
+            "uncertainty_source_fraction_start": confirmed_fraction,
+            "uncertainty_marker": [
+                round(float(merged[-1][0]), 3),
+                round(float(merged[-1][1]), 3),
+            ],
+            "competing_next_edges": [],
+            "policy": "viterbi_prefix_event_guided_continuation_v1",
+            "event_guided_continuation": {
+                "attempted": True,
+                "accepted": True,
+                "states_evaluated": evaluated,
+                "tail_source_fraction_end": round(float(min(tail_fraction, 1.0)), 8),
+                "matched_remaining_events": int(tail_events - next_expected_index),
+                "killed_by_event_window": killed_by_event_window,
+                "killed_by_event_sign": killed_by_event_sign,
+                "killed_by_revisit": killed_by_revisit,
+            },
+        })
+        return base
+
     @staticmethod
     def _directed_terminal_fallback_candidate(
         directed_diag: dict[str, Any],
@@ -4888,7 +5152,10 @@ class FloorplanConstraintEngine:
         diagnostics["local_correspondence_loss_proven"] = local_loss_proven
         if coarse is None:
             diagnostics["reason"] = coarse_diag.get("reason")
-            prefix_candidate = self._viterbi_prefix_candidate(best_partial)
+            prefix_candidate = self._continue_viterbi_prefix_with_events(
+                observation,
+                best_partial,
+            )
             diagnostics["graph_first_candidate"] = (
                 directed_terminal_fallback
                 if directed_terminal_fallback.get("available")
@@ -4934,8 +5201,9 @@ class FloorplanConstraintEngine:
         diagnostics["fine_attempts"] = fine_attempts
         if fine is None:
             diagnostics["reason"] = fine_diag.get("reason")
-            prefix_candidate = self._viterbi_prefix_candidate(
-                fine_partial or best_partial
+            prefix_candidate = self._continue_viterbi_prefix_with_events(
+                observation,
+                fine_partial or best_partial,
             )
             diagnostics["graph_first_candidate"] = (
                 directed_terminal_fallback
@@ -5185,7 +5453,10 @@ class FloorplanConstraintEngine:
                     else "viterbi_cost_exceeded"
                 )
                 diagnostics["graph_first_candidate"] = (
-                    self._viterbi_prefix_candidate(partial)
+                    self._continue_viterbi_prefix_with_events(
+                        observation,
+                        partial,
+                    )
                 )
                 diagnostics["strict_graph_gate"] = {
                     "event_sequence_preserved":
