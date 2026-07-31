@@ -13,9 +13,9 @@
     "graph_scale_pixels": 8,
     "minimum_edge_meters": 1.5,
     "normalization": "preserve_ids_explicit_turn_nodes_v3",
-    "geometry_sha256": "a70c7860391010b41d64a4ffc1a5ef33fd65eb5b93c892c3f8bb6f81a786d20b",
+    "geometry_sha256": "175c800819f4789ad5f8261c8de6a669cddb1c6e5ae0813a7299eb618d31f261",
     "saved_from_admin": true,
-    "saved_at_unix": 1785416813.285
+    "saved_at_unix": 1785506123.415
   },
   "nodes": [
     {
@@ -335,7 +335,7 @@
       "kind": "junction",
       "x": 2848,
       "y": 1088,
-      "degree": 5,
+      "degree": 6,
       "enabled": true
     },
     {
@@ -343,7 +343,7 @@
       "kind": "junction",
       "x": 2840,
       "y": 1504,
-      "degree": 3,
+      "degree": 4,
       "enabled": true
     },
     {
@@ -1043,7 +1043,7 @@
       "kind": "turn",
       "x": 2824,
       "y": 1064,
-      "degree": 3,
+      "degree": 4,
       "enabled": true,
       "source_edge_id": "edge_00084",
       "source_point_index": 1
@@ -1310,6 +1310,14 @@
       "x": 2641.1892109375,
       "y": 988.8271518554687,
       "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0128",
+      "kind": "manual",
+      "x": 2832.923943359375,
+      "y": 1233.64953515625,
+      "degree": 3,
       "enabled": true
     }
   ],
@@ -2879,18 +2887,18 @@
     {
       "id": "edge_00086",
       "from": "node_0054",
-      "to": "node_0055",
+      "to": "node_0128",
       "points": [
         [
           2848,
           1088
         ],
         [
-          2840,
-          1504
+          2832.923943359375,
+          1233.64953515625
         ]
       ],
-      "length_meters": 20.6496,
+      "length_meters": 7.267085282973328,
       "minimum_width_meters": 3.97,
       "median_width_meters": 3.97,
       "bidirectional": true,
@@ -5109,21 +5117,83 @@
       "median_width_meters": null,
       "bidirectional": true,
       "enabled": true
+    },
+    {
+      "id": "edge_00188",
+      "from": "node_0128",
+      "to": "node_0055",
+      "points": [
+        [
+          2832.923943359375,
+          1233.64953515625
+        ],
+        [
+          2840,
+          1504
+        ]
+      ],
+      "length_meters": 13.421863314184904,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00086",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00189",
+      "from": "turn__edge_00084__p001",
+      "to": "node_0128",
+      "points": [
+        [
+          2824,
+          1064
+        ],
+        [
+          2832.923943359375,
+          1233.64953515625
+        ]
+      ],
+      "length_meters": 8.431205458140138,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00190",
+      "from": "node_0054",
+      "to": "node_0055",
+      "points": [
+        [
+          2848,
+          1088
+        ],
+        [
+          2840,
+          1504
+        ]
+      ],
+      "length_meters": 20.649550621906993,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
     }
   ],
   "validation": {
-    "node_count": 149,
-    "edge_count": 176,
+    "node_count": 150,
+    "edge_count": 179,
     "disabled_nodes": 0,
     "disabled_edges": 0,
     "invalid_edges": 0,
     "endpoint_mismatches": 0
   },
   "production_validation": {
-    "file_sha256": "7ede1ccc04898960dbb45f75085413cff215c820163d8ab3b64aac3800a71e23",
-    "expected_file_sha256": "7ede1ccc04898960dbb45f75085413cff215c820163d8ab3b64aac3800a71e23",
+    "file_sha256": "8ec6677e123a5b8ed6b06f3c261a0992e1c27407880a30476ae9a0e4319548b5",
+    "expected_file_sha256": "8ec6677e123a5b8ed6b06f3c261a0992e1c27407880a30476ae9a0e4319548b5",
     "file_sha256_matches": true,
-    "geometry_sha256": "a70c7860391010b41d64a4ffc1a5ef33fd65eb5b93c892c3f8bb6f81a786d20b",
-    "embedded_geometry_sha256": "a70c7860391010b41d64a4ffc1a5ef33fd65eb5b93c892c3f8bb6f81a786d20b"
+    "geometry_sha256": "175c800819f4789ad5f8261c8de6a669cddb1c6e5ae0813a7299eb618d31f261",
+    "embedded_geometry_sha256": "175c800819f4789ad5f8261c8de6a669cddb1c6e5ae0813a7299eb618d31f261"
   }
 }
