@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_event_state_oracle_terminal_publish_v38_event_guided_tail"
+    "kerama_event_state_oracle_terminal_publish_v39_operator_locked_start"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -1138,6 +1138,86 @@ class FloorplanConstraintEngine:
             return self._topology_node_ids[int(index)]
         return f"topology_node_{int(index)}"
 
+    def _operator_start_edge(
+        self,
+        requested_start: np.ndarray,
+        requested_direction: np.ndarray,
+        *,
+        maximum_angle_degrees: float = 25.0,
+        minimum_margin_degrees: float = 15.0,
+    ) -> dict[str, Any]:
+        if len(self._topology_node_points) == 0 or self._topology_authored_node_count <= 0:
+            return {"accepted": False, "reason": "topology_graph_unavailable"}
+        direction = (
+            np.asarray(requested_direction, dtype=np.float64)
+            - np.asarray(requested_start, dtype=np.float64)
+        )
+        direction_length = float(np.linalg.norm(direction))
+        if direction_length <= 1e-9:
+            return {"accepted": False, "reason": "operator_direction_too_short"}
+        direction /= direction_length
+        authored_points = self._topology_node_points[
+            : self._topology_authored_node_count
+        ]
+        nearest_node = int(np.argmin(
+            np.linalg.norm(authored_points - requested_start[None, :], axis=1)
+        ))
+        current = self._topology_node_points[nearest_node]
+        candidates: list[dict[str, Any]] = []
+        for neighbour, edge_length in self._topology_adjacency.get(nearest_node, []):
+            neighbour = int(neighbour)
+            endpoint = self._topology_node_points[neighbour]
+            vector = endpoint - current
+            vector_length = float(np.linalg.norm(vector))
+            if vector_length <= 1e-9:
+                continue
+            unit = vector / vector_length
+            angle = math.degrees(math.acos(float(np.clip(
+                np.dot(direction, unit), -1.0, 1.0
+            ))))
+            candidates.append({
+                "node": nearest_node,
+                "next_node": neighbour,
+                "node_id": self._topology_node_id(nearest_node),
+                "next_node_id": self._topology_node_id(neighbour),
+                "edge_id": self._topology_segment_edges.get((nearest_node, neighbour)),
+                "angle_error_degrees": angle,
+                "edge_length_pixels": float(edge_length),
+            })
+        candidates.sort(key=lambda item: float(item["angle_error_degrees"]))
+        if not candidates:
+            return {
+                "accepted": False,
+                "reason": "operator_start_node_has_no_outgoing_edges",
+                "node": nearest_node,
+                "node_id": self._topology_node_id(nearest_node),
+            }
+        best = candidates[0]
+        second_angle = (
+            float(candidates[1]["angle_error_degrees"])
+            if len(candidates) > 1 else float("inf")
+        )
+        margin = second_angle - float(best["angle_error_degrees"])
+        accepted = (
+            float(best["angle_error_degrees"]) <= maximum_angle_degrees
+            and margin >= minimum_margin_degrees
+        )
+        result = {
+            "accepted": accepted,
+            "reason": None if accepted else "operator_start_edge_ambiguous_or_off_heading",
+            "maximum_angle_degrees": maximum_angle_degrees,
+            "minimum_margin_degrees": minimum_margin_degrees,
+            "margin_degrees": margin if math.isfinite(margin) else None,
+            "start_snap_meters": (
+                float(np.linalg.norm(current - requested_start))
+                * self.config.meters_per_pixel
+            ),
+            "candidate_count": len(candidates),
+            "candidates": candidates[:6],
+        }
+        result.update(best)
+        return result
+
     def _shape_seed_start_states(
         self,
         *,
@@ -1584,6 +1664,7 @@ class FloorplanConstraintEngine:
         *,
         reject_committed_inversions: bool = False,
         oracle_mode: bool = False,
+        operator_start_edge: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
         """Follow connected directed graph edges using R3 turn events.
 
@@ -1656,11 +1737,21 @@ class FloorplanConstraintEngine:
             if heading_filtered_starts
             else potential_starts[:DIRECTED_EDGE_HEADING_ANCHOR_LIMIT]
         )
-        shape_seed_states = self._shape_seed_start_states(
-            expected=expected,
-            target_length=target_length,
-            initial_heading=initial_heading,
-            start_point=points[0],
+        forced_start = (
+            operator_start_edge
+            if isinstance(operator_start_edge, dict)
+            and operator_start_edge.get("accepted")
+            else None
+        )
+        shape_seed_states = (
+            []
+            if forced_start
+            else self._shape_seed_start_states(
+                expected=expected,
+                target_length=target_length,
+                initial_heading=initial_heading,
+                start_point=points[0],
+            )
         )
         # cost, node, previous, path, travelled, matched events, used arcs,
         # heading committed after the last matched R3 turn, graph arc fraction
@@ -1694,25 +1785,51 @@ class FloorplanConstraintEngine:
                 tuple(float(item) for item in seed["matched_event_positions"]),
                 float(seed.get("scale_factor", 1.0)),
             ))
-        for start_node in start_nodes:
-            start_node = int(start_node)
-            start_cost = (
-                float(start_distances[start_node]) / radius_pixels
-            ) ** 2
+        if forced_start:
+            start_node = int(forced_start["node"])
+            next_node = int(forced_start["next_node"])
+            start_edge_length = float(np.linalg.norm(
+                self._topology_node_points[next_node]
+                - self._topology_node_points[start_node]
+            ))
+            edge_heading = math.atan2(
+                float(self._topology_node_points[next_node][1] - self._topology_node_points[start_node][1]),
+                float(self._topology_node_points[next_node][0] - self._topology_node_points[start_node][0]),
+            )
             beam.append((
-                start_cost,
-                start_node,
-                -1,
-                (start_node,),
                 0.0,
+                next_node,
+                start_node,
+                (start_node, next_node),
+                start_edge_length,
                 0,
-                frozenset(),
-                initial_heading,
+                frozenset({(start_node, next_node)}),
+                edge_heading,
                 0.0,
                 0.0,
                 (),
                 1.0,
             ))
+        else:
+            for start_node in start_nodes:
+                start_node = int(start_node)
+                start_cost = (
+                    float(start_distances[start_node]) / radius_pixels
+                ) ** 2
+                beam.append((
+                    start_cost,
+                    start_node,
+                    -1,
+                    (start_node,),
+                    0.0,
+                    0,
+                    frozenset(),
+                    initial_heading,
+                    0.0,
+                    0.0,
+                    (),
+                    1.0,
+                ))
 
         terminals: list[
             tuple[
@@ -2303,6 +2420,7 @@ class FloorplanConstraintEngine:
                     heading_filtered_starts
                 ),
                 "heading_anchor_candidates": len(potential_starts),
+                "operator_start_edge": forced_start,
                 "first_turn_kill_count": first_turn_kill_count,
                 "first_turn_late_kill_count": first_turn_late_kill_count,
                 "first_turn_late_penalty_count": (
@@ -2554,6 +2672,7 @@ class FloorplanConstraintEngine:
             "rejected_inverted_turns": rejected_inverted_turns,
             "heading_filtered_anchors_count": len(heading_filtered_starts),
             "heading_anchor_candidates": len(potential_starts),
+            "operator_start_edge": forced_start,
             "first_turn_kill_count": first_turn_kill_count,
             "first_turn_late_kill_count": first_turn_late_kill_count,
             "first_turn_late_penalty_count": first_turn_late_penalty_count,
@@ -5013,6 +5132,7 @@ class FloorplanConstraintEngine:
         baseline: np.ndarray,
         *,
         allow_global_recovery: bool = False,
+        operator_start_edge: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[np.ndarray], dict[str, Any]]:
         diagnostics: dict[str, Any] = {
             "attempted": True,
@@ -5026,6 +5146,7 @@ class FloorplanConstraintEngine:
                 os.getenv("FLOORPLAN_DIRECTED_EDGE_ORACLE", "").strip()
                 in {"1", "true", "yes", "on"}
             ),
+            operator_start_edge=operator_start_edge,
         )
         diagnostics["directed_edge_search"] = directed_diag
         directed_terminal_fallback = (
@@ -5063,6 +5184,15 @@ class FloorplanConstraintEngine:
                 ),
             })
             return directed_route, diagnostics
+        if operator_start_edge and operator_start_edge.get("accepted"):
+            diagnostics["reason"] = (
+                directed_diag.get("reason")
+                or "operator_locked_directed_edge_search_failed"
+            )
+            diagnostics["operator_locked_local_walk_only"] = True
+            if directed_terminal_fallback.get("available"):
+                diagnostics["graph_first_candidate"] = directed_terminal_fallback
+            return None, diagnostics
         if os.getenv("TRACKAI_DIRECTED_EDGE_ONLY", "").strip().lower() in {
             "1", "true", "yes", "on",
         }:
@@ -5664,12 +5794,26 @@ class FloorplanConstraintEngine:
         # The operator's start is ground truth.  Never move the entire route
         # to make that point fit an imperfect support mask.
         start = requested_start.copy()
+        operator_start_edge = self._operator_start_edge(
+            requested_start,
+            direction,
+        )
         base_diagnostics.update({
             "requested_start_pixels": requested_start.tolist(),
             "nearest_walkable_start_pixels": nearest_walkable_start.tolist(),
             "start_snap_meters": round(start_snap_meters, 3),
             "start_anchor_locked": True,
+            "operator_start_edge": operator_start_edge,
         })
+        if topology_recovery_enabled and not operator_start_edge.get("accepted"):
+            return {
+                "accepted": False,
+                "trajectory": [],
+                "diagnostics": {
+                    **base_diagnostics,
+                    "reason": "operator_start_edge_not_unique",
+                },
+            }
 
         relative = raw - raw[0]
         if coordinate_convention == "x_forward_y_left_z_up":
@@ -5928,6 +6072,7 @@ class FloorplanConstraintEngine:
                             observation_policy == "authoritative"
                             or allow_independent_corridor_recovery
                         ),
+                        operator_start_edge=operator_start_edge,
                     )
                     topology_recovery.update({
                         "phase": "local_search_exhaustion_recovery",
@@ -5967,6 +6112,7 @@ class FloorplanConstraintEngine:
                     hypothesis["points"],
                     repaired,
                     allow_global_recovery=observation_policy == "authoritative",
+                    operator_start_edge=operator_start_edge,
                 )
                 topology_recovery.update({
                     "phase": (
@@ -6653,6 +6799,7 @@ class FloorplanConstraintEngine:
                 best["points"],
                 repaired,
                 allow_global_recovery=observation_policy == "authoritative",
+                operator_start_edge=operator_start_edge,
             )
             nonlinear_diagnostics["production_enabled"] = True
             nonlinear_diagnostics["phase"] = "postselection_refinement"
