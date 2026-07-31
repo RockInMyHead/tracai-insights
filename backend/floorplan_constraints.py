@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_event_state_oracle_terminal_publish_v39_operator_locked_start"
+    "kerama_event_state_oracle_terminal_publish_v40_local_event_walk"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -1847,11 +1847,20 @@ class FloorplanConstraintEngine:
         predictive_risk_position_kill_count = [0 for _ in expected]
         predictive_risk_angle_kill_count = [0 for _ in expected]
         graph_turn_event_match_count = 0
+        non_event_turn_passthrough_count = 0
+        locked_late_event_passthrough_count = 0
+        locked_early_event_passthrough_count = 0
+        skipped_r3_micro_event_count = 0
         beam_size_history: list[int] = []
+        last_frontier: list[dict[str, Any]] = []
         oracle_dominance_reject_count = 0
         oracle_frontier_trim_count = 0
         maximum_matched_events = 0
         maximum_travel_fraction = 0.0
+        best_partial_path: tuple[int, ...] = ()
+        best_partial_fraction = 0.0
+        best_partial_matched_events = 0
+        best_partial_cost = float("inf")
         maximum_steps = min(max(len(self._topology_node_points), 32), 220)
         sliding_event_gate_enabled = (
             self.config.map_id == DEFAULT_FLOORPLAN_ID
@@ -2020,6 +2029,18 @@ class FloorplanConstraintEngine:
                     maximum_travel_fraction,
                     travelled / adjusted_target_length,
                 )
+                current_fraction = travelled / adjusted_target_length
+                if (
+                    current_fraction > best_partial_fraction + 1e-9
+                    or (
+                        abs(current_fraction - best_partial_fraction) <= 1e-9
+                        and cost < best_partial_cost
+                    )
+                ):
+                    best_partial_path = path
+                    best_partial_fraction = float(current_fraction)
+                    best_partial_matched_events = int(event_index)
+                    best_partial_cost = float(cost)
                 if (
                     travelled >= target_length * 0.65
                     and event_index == len(expected)
@@ -2098,24 +2119,61 @@ class FloorplanConstraintEngine:
                                 direction_heading - committed_heading
                             ),
                         ))
-                        # A physical bend may be authored as several small
-                        # edge turns. Measure the cumulative heading change
-                        # since the last consumed R3 event.
-                        if abs(angle) >= 35.0:
-                            if next_event_index >= len(expected):
-                                continue
-                            expected_fraction, expected_angle = expected[
-                                next_event_index
-                            ]
-                            event_position = travelled / adjusted_target_length
-                            graph_turn_event = (
-                                self._graph_event_by_transition.get(
-                                    (previous, node, neighbour)
-                                )
+                        graph_turn_event = (
+                            self._graph_event_by_transition.get(
+                                (previous, node, neighbour)
                             )
-                            if graph_turn_event is not None:
-                                graph_turn_event_match_count += 1
+                        )
+                        # A physical bend may be authored as several sampled
+                        # edge turns. Only explicit graph-turn transitions
+                        # consume R3 events; non-event bends are pass-through
+                        # geometry while the walker keeps moving locally.
+                        if graph_turn_event is None and abs(angle) >= 35.0:
+                            non_event_turn_passthrough_count += 1
+                        if graph_turn_event is not None:
+                            if next_event_index >= len(expected):
+                                if forced_start:
+                                    turn_penalty += 0.25
+                                    next_committed_heading = direction_heading
+                                    expected_fraction = 1.0
+                                    expected_angle = angle
+                                    event_position = travelled / adjusted_target_length
+                                else:
+                                    continue
+                            else:
+                                expected_fraction, expected_angle = expected[
+                                    next_event_index
+                                ]
+                                event_position = travelled / adjusted_target_length
+                            graph_turn_event_match_count += 1
+                            while (
+                                forced_start
+                                and next_event_index < len(expected)
+                                and next_event_index + 1 < len(expected)
+                                and abs(float(expected[next_event_index][1])) < 45.0
+                                and event_position
+                                > float(expected[next_event_index][0])
+                                + DIRECTED_EDGE_LATE_TURN_BASE_TOLERANCE
+                            ):
+                                skipped_r3_micro_event_count += 1
+                                next_event_index += 1
+                                expected_fraction, expected_angle = expected[
+                                    next_event_index
+                                ]
+                            while (
+                                forced_start
+                                and next_event_index < len(expected)
+                                and next_event_index + 1 < len(expected)
+                                and float(expected_angle) * angle < 0.0
+                            ):
+                                skipped_r3_micro_event_count += 1
+                                next_event_index += 1
+                                expected_fraction, expected_angle = expected[
+                                    next_event_index
+                                ]
                             if (
+                                next_event_index < len(expected)
+                                and
                                 oracle_mode
                                 and
                                 next_event_index
@@ -2147,14 +2205,18 @@ class FloorplanConstraintEngine:
                                     ] += 1
                                     continue
                             window_start, window_end = event_window(
-                                next_event_index,
+                                min(next_event_index, len(expected) - 1),
                                 matched_event_positions,
                             )
                             if (
+                                next_event_index < len(expected)
+                                and
                                 sliding_event_gate_enabled
                                 and event_position < window_start
                             ):
-                                if oracle_mode:
+                                if oracle_mode or forced_start:
+                                    if forced_start and not oracle_mode:
+                                        locked_early_event_passthrough_count += 1
                                     turn_penalty += (
                                         DIRECTED_EDGE_ORACLE_WINDOW_PENALTY
                                         * (window_start - event_position)
@@ -2162,6 +2224,8 @@ class FloorplanConstraintEngine:
                                 else:
                                     continue
                             elif (
+                                next_event_index < len(expected)
+                                and
                                 not sliding_event_gate_enabled
                                 and event_position
                                 < float(expected_fraction)
@@ -2169,6 +2233,8 @@ class FloorplanConstraintEngine:
                             ):
                                 continue
                             if (
+                                next_event_index < len(expected)
+                                and
                                 sliding_event_gate_enabled
                                 and event_position > window_end
                             ):
@@ -2190,6 +2256,8 @@ class FloorplanConstraintEngine:
                                 else:
                                     continue
                             if (
+                                next_event_index < len(expected)
+                                and
                                 sliding_event_gate_enabled
                                 and float(expected_angle) * angle < 0.0
                             ):
@@ -2198,13 +2266,15 @@ class FloorplanConstraintEngine:
                                 ] += 1
                                 if reject_committed_inversions:
                                     rejected_inverted_turns += 1
-                                if oracle_mode:
+                                if oracle_mode or forced_start:
                                     turn_penalty += (
                                         DIRECTED_EDGE_ORACLE_SIGN_MISMATCH_PENALTY
                                     )
                                 else:
                                     continue
                             if (
+                                next_event_index < len(expected)
+                                and
                                 reject_committed_inversions
                                 and
                                 next_event_index > 0
@@ -2216,7 +2286,7 @@ class FloorplanConstraintEngine:
                                 # graph-first diagnostics with wrong tails.
                                 rejected_inverted_turns += 1
                                 continue
-                            else:
+                            elif next_event_index < len(expected):
                                 previous_expected_fraction = (
                                     float(expected[next_event_index - 1][0])
                                     if next_event_index > 0 else 0.0
@@ -2284,7 +2354,11 @@ class FloorplanConstraintEngine:
                             next_event_index,
                             matched_event_positions,
                         )
-                        if sliding_event_gate_enabled and fraction > window_end:
+                        if (
+                            sliding_event_gate_enabled
+                            and fraction > window_end
+                            and not forced_start
+                        ):
                             event_window_kill_count[next_event_index] += 1
                             if next_event_index == 0:
                                 first_turn_kill_count += 1
@@ -2302,6 +2376,13 @@ class FloorplanConstraintEngine:
                                 )
                             else:
                                 continue
+                        elif (
+                            sliding_event_gate_enabled
+                            and fraction > window_end
+                            and forced_start
+                        ):
+                            locked_late_event_passthrough_count += 1
+                            turn_penalty += 0.15 * (fraction - window_end)
                         if (
                             not sliding_event_gate_enabled
                             and fraction
@@ -2365,6 +2446,11 @@ class FloorplanConstraintEngine:
                         int(round(fraction * 30.0)),
                         heading_bin,
                         int(round(next_last_event_position * 30.0)),
+                        (
+                            hash(path[-4:])
+                            if forced_start and len(path) >= 4
+                            else 0
+                        ),
                     )
                     if oracle_mode:
                         if oracle_dominated(
@@ -2380,6 +2466,16 @@ class FloorplanConstraintEngine:
                         if next_cost >= best.get(key, float("inf")):
                             continue
                         best[key] = next_cost
+                    last_frontier.append({
+                        "node_id": self._topology_node_id(node),
+                        "next_node_id": self._topology_node_id(neighbour),
+                        "edge_id": edge_id,
+                        "source_fraction": round(float(fraction), 6),
+                        "matched_events": int(next_event_index),
+                        "cost": round(float(next_cost), 6),
+                    })
+                    if len(last_frontier) > 80:
+                        del last_frontier[:len(last_frontier) - 80]
                     expanded.append((
                         next_cost,
                         neighbour,
@@ -2441,10 +2537,48 @@ class FloorplanConstraintEngine:
                     for events in self._graph_events_by_node.values()
                 ),
                 "graph_turn_event_match_count": graph_turn_event_match_count,
+                "non_event_turn_passthrough_count": (
+                    non_event_turn_passthrough_count
+                ),
+                "locked_late_event_passthrough_count": (
+                    locked_late_event_passthrough_count
+                ),
+                "locked_early_event_passthrough_count": (
+                    locked_early_event_passthrough_count
+                ),
+                "skipped_r3_micro_event_count": skipped_r3_micro_event_count,
                 "beam_size_history": beam_size_history,
+                "last_frontier": last_frontier[-12:],
                 "maximum_matched_turn_events": maximum_matched_events,
                 "maximum_travel_fraction": round(
                     maximum_travel_fraction, 6
+                ),
+                "best_partial_trajectory": (
+                    [
+                        [round(float(point[0]), 3), round(float(point[1]), 3)]
+                        for point in self._topology_node_points[
+                            np.asarray(best_partial_path, dtype=int)
+                        ]
+                    ]
+                    if len(best_partial_path) >= 2 else []
+                ),
+                "best_partial_edge_ids": (
+                    self._topology_edge_sequence(
+                        self._topology_node_points[
+                            np.asarray(best_partial_path, dtype=int)
+                        ]
+                    )
+                    if len(best_partial_path) >= 2 else []
+                ),
+                "best_partial_source_fraction": round(
+                    float(best_partial_fraction), 6
+                ),
+                "best_partial_matched_turn_events": (
+                    best_partial_matched_events
+                ),
+                "best_partial_cost": (
+                    round(float(best_partial_cost), 6)
+                    if math.isfinite(best_partial_cost) else None
                 ),
                 "shape_seed_count": len(shape_seed_states),
                 "shape_seed_scale_histogram": shape_seed_scale_histogram,
@@ -2642,7 +2776,18 @@ class FloorplanConstraintEngine:
                     for events in self._graph_events_by_node.values()
                 ),
                 "graph_turn_event_match_count": graph_turn_event_match_count,
+                "non_event_turn_passthrough_count": (
+                    non_event_turn_passthrough_count
+                ),
+                "locked_late_event_passthrough_count": (
+                    locked_late_event_passthrough_count
+                ),
+                "locked_early_event_passthrough_count": (
+                    locked_early_event_passthrough_count
+                ),
+                "skipped_r3_micro_event_count": skipped_r3_micro_event_count,
                 "beam_size_history": beam_size_history,
+                "last_frontier": last_frontier[-12:],
                 "shape_seed_count": len(shape_seed_states),
                 "shape_seed_scale_histogram": shape_seed_scale_histogram,
                 "best_shape_seeds": [
@@ -2688,7 +2833,18 @@ class FloorplanConstraintEngine:
                 len(events) for events in self._graph_events_by_node.values()
             ),
             "graph_turn_event_match_count": graph_turn_event_match_count,
+            "non_event_turn_passthrough_count": (
+                non_event_turn_passthrough_count
+            ),
+            "locked_late_event_passthrough_count": (
+                locked_late_event_passthrough_count
+            ),
+            "locked_early_event_passthrough_count": (
+                locked_early_event_passthrough_count
+            ),
+            "skipped_r3_micro_event_count": skipped_r3_micro_event_count,
             "beam_size_history": beam_size_history,
+            "last_frontier": last_frontier[-12:],
             "shape_seed_count": len(shape_seed_states),
             "shape_seed_scale_histogram": shape_seed_scale_histogram,
             "best_shape_seeds": [
@@ -5061,7 +5217,48 @@ class FloorplanConstraintEngine:
         trajectory = directed_diag.get("best_terminal_trajectory") or []
         edge_ids = directed_diag.get("best_terminal_edge_ids") or []
         if len(trajectory) < 2 or not edge_ids:
-            return {"available": False, "reason": "no_directed_terminal_route"}
+            partial = directed_diag.get("best_partial_trajectory") or []
+            partial_edge_ids = directed_diag.get("best_partial_edge_ids") or []
+            partial_fraction = float(
+                directed_diag.get("best_partial_source_fraction") or 0.0
+            )
+            if len(partial) < 2 or not partial_edge_ids or partial_fraction <= 0.0:
+                return {"available": False, "reason": "no_directed_terminal_route"}
+            return {
+                "available": True,
+                "reason": "operator_locked_local_partial_route",
+                "trajectory": partial,
+                "segments": [{
+                    "start_index": 0,
+                    "end_index": len(partial) - 1,
+                    "source_fraction_start": 0.0,
+                    "source_fraction_end": partial_fraction,
+                    "status": "confirmed",
+                    "edge_ids": partial_edge_ids,
+                }],
+                "confirmed_segments": 1,
+                "uncertain_segments": 0,
+                "confirmed_source_fraction": partial_fraction,
+                "uncertainty_source_fraction_start": partial_fraction,
+                "uncertainty_marker": partial[-1],
+                "competing_next_edges": [],
+                "policy": "operator_locked_local_partial_v1",
+                "strict_topology_preserved": True,
+                "published_from_oracle_terminal": False,
+                "publication_warning_reason": None,
+                "turn_topology": {},
+                "turn_inversion": directed_diag.get("turn_inversion"),
+                "event_progress": {
+                    "matched_turn_events": directed_diag.get(
+                        "best_partial_matched_turn_events"
+                    ),
+                    "expected_turn_events": directed_diag.get(
+                        "expected_turn_events"
+                    ),
+                },
+                "event_progress_mean_abs_error": None,
+                "event_progress_max_abs_error": None,
+            }
         topology = directed_diag.get("best_terminal_turn_topology") or {}
         event_progress = directed_diag.get("best_terminal_event_progress") or {}
         sign_preserved = float(topology.get("sign_mismatch_ratio", 1.0)) == 0.0
