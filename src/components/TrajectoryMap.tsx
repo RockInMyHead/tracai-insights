@@ -541,6 +541,14 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
     return Array.from(segments.values()).sort((a, b) => a.count - b.count);
   }, [floorPlan, getTransformedTrajectories]);
 
+  const revisitLabelSegments = useMemo(() => {
+    const minCountForLabel = 4;
+    return revisitRouteSegments
+      .filter((segment) => segment.count >= minCountForLabel)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 40);
+  }, [revisitRouteSegments]);
+
   // Calculate movement analysis data
   const movementAnalysis = useMemo(() => {
     const allTrajectories = getTransformedTrajectories.flatMap(data => data.trajectory);
@@ -1456,17 +1464,17 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                     d={getPathString(data.trajectory)}
                     fill="none"
                     stroke="#06b6d4"
-                    strokeWidth={floorPlan ? 3 : 2}
+                    strokeWidth={floorPlan ? 2.5 : 2}
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    opacity="0.82"
+                    opacity="0.72"
                   />
                 ))}
                 {revisitRouteSegments.map((segment, index) => {
                   const repeated = segment.count > 1;
                   const width = repeated
-                    ? Math.min(floorPlan ? 16 : 12, (floorPlan ? 5 : 4) + segment.count * 1.7)
-                    : floorPlan ? 4 : 3;
+                    ? Math.min(floorPlan ? 24 : 18, (floorPlan ? 7 : 5) + Math.log2(segment.count + 1) * 5)
+                    : floorPlan ? 5 : 4;
                   return (
                     <line
                       key={`revisit-segment-${index}`}
@@ -1477,8 +1485,36 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       stroke={repeated ? "#a855f7" : "#ef4444"}
                       strokeWidth={width}
                       strokeLinecap="round"
-                      opacity={repeated ? 0.72 : 0.5}
+                      opacity={repeated ? 0.9 : 0.72}
                     />
+                  );
+                })}
+                {revisitLabelSegments.map((segment, index) => {
+                  const x = (segment.x1 + segment.x2) / 2;
+                  const y = (segment.y1 + segment.y2) / 2;
+                  return (
+                    <g key={`revisit-label-${index}`} pointerEvents="none">
+                      <rect
+                        x={x - 13}
+                        y={y - 10}
+                        width="26"
+                        height="18"
+                        rx="4"
+                        fill="rgba(88, 28, 135, 0.86)"
+                        stroke="rgba(255,255,255,0.9)"
+                        strokeWidth="1"
+                      />
+                      <text
+                        x={x}
+                        y={y + 4}
+                        textAnchor="middle"
+                        fontSize={floorPlan ? 11 : 9}
+                        fontWeight="700"
+                        fill="white"
+                      >
+                        ×{segment.count}
+                      </text>
+                    </g>
                   );
                 })}
               </g>
