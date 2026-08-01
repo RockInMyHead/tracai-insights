@@ -1311,9 +1311,24 @@ def _extract_xy(point: Any) -> Optional[Tuple[float, float]]:
 
 def _result_plan_size(result: Dict[str, Any]) -> Tuple[float, float]:
     stats = result.get("processing_stats") if isinstance(result.get("processing_stats"), dict) else {}
-    for source in (result, stats):
-        width = source.get("floorplan_width") or source.get("map_width") or source.get("width")
-        height = source.get("floorplan_height") or source.get("map_height") or source.get("height")
+    floorplan = (
+        result.get("floorplan_constraint")
+        if isinstance(result.get("floorplan_constraint"), dict)
+        else {}
+    )
+    for source in (result, floorplan, stats):
+        width = (
+            source.get("floorplan_width")
+            or source.get("plan_width")
+            or source.get("map_width")
+            or source.get("width")
+        )
+        height = (
+            source.get("floorplan_height")
+            or source.get("plan_height")
+            or source.get("map_height")
+            or source.get("height")
+        )
         try:
             width_f = float(width)
             height_f = float(height)
@@ -1387,8 +1402,12 @@ def _derive_queue_map_context(
     dir_y = max(0.0, min(height, end_y + dy / norm * direction_len))
     context = dict(base_context or {})
     context.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
-    context["reference_point"] = {"x": end_x / width * 100.0, "y": end_y / height * 100.0}
-    context["direction_point"] = {"x": dir_x / width * 100.0, "y": dir_y / height * 100.0}
+    ref_x = max(0.0, min(100.0, end_x / width * 100.0))
+    ref_y = max(0.0, min(100.0, end_y / height * 100.0))
+    dir_pct_x = max(0.0, min(100.0, dir_x / width * 100.0))
+    dir_pct_y = max(0.0, min(100.0, dir_y / height * 100.0))
+    context["reference_point"] = {"x": ref_x, "y": ref_y}
+    context["direction_point"] = {"x": dir_pct_x, "y": dir_pct_y}
     context["queue_anchor_source"] = "previous_video_tail"
     context["queue_previous_video_id"] = previous_video_id
     context["queue_tail_seconds"] = tail_seconds
