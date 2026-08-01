@@ -512,43 +512,34 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
     return () => { cancelled = true; };
   }, [floorPlan, usePathfinding, getTransformedTrajectories, viewBox.width, viewBox.height]);
 
-  // Generate heatmap data based on trajectory density
-  const generateHeatmapData = useMemo(() => {
-    const allTrajectories = getTransformedTrajectories.flatMap(data => data.trajectory);
-    if (allTrajectories.length === 0) return [];
+  const revisitRouteSegments = useMemo(() => {
+    const gridSize = floorPlan ? 10 : 6;
+    const segments = new Map<string, { x1: number; y1: number; x2: number; y2: number; count: number }>();
+    const bucketPoint = (point: { x: number; y: number }) =>
+      `${Math.round(point.x / gridSize)},${Math.round(point.y / gridSize)}`;
 
-    // Create a grid to calculate density
-    const gridSize = 20;
-    const grid = new Map();
-
-    // Count points in each grid cell
-    allTrajectories.forEach(point => {
-      const gridX = Math.floor(point.x / gridSize);
-      const gridY = Math.floor(point.y / gridSize);
-      const key = `${gridX}-${gridY}`;
-
-      grid.set(key, (grid.get(key) || 0) + 1);
+    getTransformedTrajectories.forEach((data) => {
+      const points = data.trajectory;
+      for (let index = 1; index < points.length; index += 1) {
+        const previous = points[index - 1];
+        const current = points[index];
+        if (!Number.isFinite(previous.x) || !Number.isFinite(previous.y) || !Number.isFinite(current.x) || !Number.isFinite(current.y)) continue;
+        const length = Math.hypot(current.x - previous.x, current.y - previous.y);
+        if (length < 1 || length > 220) continue;
+        const a = bucketPoint(previous);
+        const b = bucketPoint(current);
+        const key = a <= b ? `${a}|${b}` : `${b}|${a}`;
+        const existing = segments.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          segments.set(key, { x1: previous.x, y1: previous.y, x2: current.x, y2: current.y, count: 1 });
+        }
+      }
     });
 
-    // Convert grid to heatmap data with intensity
-    const heatmapData = [];
-    const maxDensity = Math.max(...grid.values());
-
-    for (const [key, density] of grid.entries()) {
-      const [gridX, gridY] = key.split('-').map(Number);
-      const intensity = density / maxDensity;
-
-      heatmapData.push({
-        x: gridX * gridSize,
-        y: gridY * gridSize,
-        width: gridSize,
-        height: gridSize,
-        intensity,
-      });
-    }
-
-    return heatmapData;
-  }, [getTransformedTrajectories]);
+    return Array.from(segments.values()).sort((a, b) => a.count - b.count);
+  }, [floorPlan, getTransformedTrajectories]);
 
   // Calculate movement analysis data
   const movementAnalysis = useMemo(() => {
@@ -1132,7 +1123,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           size="icon"
           className="h-10 w-10 shadow-lg backdrop-blur-md"
           onClick={(e) => { e.stopPropagation(); setShowHeatmap(!showHeatmap); }}
-          title={showHeatmap ? "Показать траекторию" : "Показать тепловую карту"}
+          title={showHeatmap ? "Показать траекторию" : "Показать повторные проходы"}
         >
           {showHeatmap ? <Route className="h-5 w-5" /> : <Thermometer className="h-5 w-5" />}
         </Button>
@@ -1458,18 +1449,39 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
 
             {/* Heatmap or Trajectory visualization - INSIDE scaled group */}
             {showHeatmap ? (
-              /* Heatmap visualization */
-              generateHeatmapData.map((cell, index) => (
-                <rect
-                  key={`heatmap-${index}`}
-                  x={cell.x}
-                  y={cell.y}
-                  width={cell.width}
-                  height={cell.height}
-                  fill={`rgba(255, ${Math.round(255 * (1 - cell.intensity))}, 0, ${0.3 + cell.intensity * 0.5})`}
-                  opacity={cell.intensity * 0.8}
-                />
-              ))
+              <g>
+                {getTransformedTrajectories.map((data, trajectoryIndex) => (
+                  <path
+                    key={`revisit-sampled-${trajectoryIndex}`}
+                    d={getPathString(data.trajectory)}
+                    fill="none"
+                    stroke="#06b6d4"
+                    strokeWidth={floorPlan ? 3 : 2}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    opacity="0.82"
+                  />
+                ))}
+                {revisitRouteSegments.map((segment, index) => {
+                  const repeated = segment.count > 1;
+                  const width = repeated
+                    ? Math.min(floorPlan ? 16 : 12, (floorPlan ? 5 : 4) + segment.count * 1.7)
+                    : floorPlan ? 4 : 3;
+                  return (
+                    <line
+                      key={`revisit-segment-${index}`}
+                      x1={segment.x1}
+                      y1={segment.y1}
+                      x2={segment.x2}
+                      y2={segment.y2}
+                      stroke={repeated ? "#a855f7" : "#ef4444"}
+                      strokeWidth={width}
+                      strokeLinecap="round"
+                      opacity={repeated ? 0.72 : 0.5}
+                    />
+                  );
+                })}
+              </g>
             ) : (
               <g>
               {/* R³ Point Cloud — все позиции камер как полупрозрачные точки */}
