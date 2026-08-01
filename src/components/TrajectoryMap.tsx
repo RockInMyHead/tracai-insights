@@ -532,7 +532,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         const current = points[index];
         if (!Number.isFinite(previous.x) || !Number.isFinite(previous.y) || !Number.isFinite(current.x) || !Number.isFinite(current.y)) continue;
         const length = Math.hypot(current.x - previous.x, current.y - previous.y);
-        if (length < 1 || length > 220) continue;
+        if (length < 0.01 || length > 220) continue;
         const a = bucketPoint(previous);
         const b = bucketPoint(current);
         const key = a <= b ? `${a}|${b}` : `${b}|${a}`;
