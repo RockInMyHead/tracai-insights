@@ -79,7 +79,7 @@ except ImportError:  # pragma: no cover - package import path
 
 DEFAULT_FLOORPLAN_ID = "kerama_marazzi_2025"
 FLOORPLAN_CONSTRAINT_REVISION = (
-    "kerama_event_state_oracle_terminal_publish_v40_local_event_walk"
+    "kerama_event_state_oracle_terminal_publish_v41_revisit_local_walk"
 )
 ASSET_ROOT = Path(__file__).resolve().parent / "assets" / "floorplans"
 
@@ -1851,6 +1851,8 @@ class FloorplanConstraintEngine:
         locked_late_event_passthrough_count = 0
         locked_early_event_passthrough_count = 0
         skipped_r3_micro_event_count = 0
+        locked_revisit_edge_count = 0
+        locked_backtrack_edge_count = 0
         beam_size_history: list[int] = []
         last_frontier: list[dict[str, Any]] = []
         oracle_dominance_reject_count = 0
@@ -1869,6 +1871,20 @@ class FloorplanConstraintEngine:
             tuple[int, int],
             list[tuple[float, int, float]],
         ] = {}
+        observed_point_cache: dict[int, np.ndarray] = {}
+
+        def observed_at_fraction(fraction: float) -> np.ndarray:
+            bucket = int(round(float(fraction) * 4000.0))
+            cached = observed_point_cache.get(bucket)
+            if cached is not None:
+                return cached
+            value = _resample_polyline(
+                points,
+                np.asarray([float(np.clip(fraction, 0.0, 1.0))], dtype=np.float64),
+            )[0]
+            if len(observed_point_cache) < 8192:
+                observed_point_cache[bucket] = value
+            return value
 
         def event_window(
             event_index: int,
@@ -2080,11 +2096,23 @@ class FloorplanConstraintEngine:
                 ):
                     neighbour = int(neighbour)
                     arc = (node, neighbour)
+                    revisits_node = neighbour in path
+                    revisits_arc = arc in used_arcs
+                    backtracks = neighbour == previous
+                    node_visit_count = path.count(neighbour)
+                    arc_visit_count = sum(
+                        1
+                        for left, right in zip(path, path[1:])
+                        if left == node and right == neighbour
+                    )
                     if (
-                        neighbour == previous
-                        or neighbour in path
-                        or arc in used_arcs
+                        not forced_start
+                        and (backtracks or revisits_node or revisits_arc)
                     ):
+                        continue
+                    if forced_start and node_visit_count >= 2:
+                        continue
+                    if forced_start and arc_visit_count >= 2:
                         continue
                     endpoint = self._topology_node_points[neighbour]
                     direction = endpoint - current
@@ -2097,6 +2125,13 @@ class FloorplanConstraintEngine:
                     next_segment_length_error = segment_length_error
                     next_matched_event_positions = matched_event_positions
                     turn_penalty = 0.0
+                    if forced_start:
+                        if backtracks:
+                            locked_backtrack_edge_count += 1
+                            turn_penalty += 0.35
+                        if revisits_node or revisits_arc:
+                            locked_revisit_edge_count += 1
+                            turn_penalty += 0.18 + 0.12 * node_visit_count
                     direction_heading = math.atan2(
                         float(direction[1]), float(direction[0])
                     )
@@ -2426,9 +2461,7 @@ class FloorplanConstraintEngine:
                                 - DIRECTED_EDGE_EARLY_LOWER_ZONE_Y_FRACTION
                             )
                         )
-                    observed_point = _resample_polyline(
-                        points, np.asarray([fraction], dtype=np.float64)
-                    )[0]
+                    observed_point = observed_at_fraction(fraction)
                     observation_error = (
                         float(np.linalg.norm(endpoint - observed_point))
                         / radius_pixels
@@ -2447,10 +2480,11 @@ class FloorplanConstraintEngine:
                         heading_bin,
                         int(round(next_last_event_position * 30.0)),
                         (
-                            hash(path[-4:])
+                            hash(path[-3:])
                             if forced_start and len(path) >= 4
                             else 0
                         ),
+                        min(node_visit_count, 2),
                     )
                     if oracle_mode:
                         if oracle_dominated(
@@ -2500,7 +2534,13 @@ class FloorplanConstraintEngine:
                     )
                 beam = expanded[:DIRECTED_EDGE_ORACLE_FRONTIER_LIMIT]
             else:
-                beam = expanded[:DIRECTED_EDGE_EVENT_BEAM_WIDTH]
+                beam = expanded[
+                    : (
+                        180
+                        if forced_start
+                        else DIRECTED_EDGE_EVENT_BEAM_WIDTH
+                    )
+                ]
         if not terminals:
             return None, {
                 "reason": "directed_edge_event_sequence_not_found",
@@ -2547,6 +2587,8 @@ class FloorplanConstraintEngine:
                     locked_early_event_passthrough_count
                 ),
                 "skipped_r3_micro_event_count": skipped_r3_micro_event_count,
+                "locked_revisit_edge_count": locked_revisit_edge_count,
+                "locked_backtrack_edge_count": locked_backtrack_edge_count,
                 "beam_size_history": beam_size_history,
                 "last_frontier": last_frontier[-12:],
                 "maximum_matched_turn_events": maximum_matched_events,
@@ -2786,6 +2828,8 @@ class FloorplanConstraintEngine:
                     locked_early_event_passthrough_count
                 ),
                 "skipped_r3_micro_event_count": skipped_r3_micro_event_count,
+                "locked_revisit_edge_count": locked_revisit_edge_count,
+                "locked_backtrack_edge_count": locked_backtrack_edge_count,
                 "beam_size_history": beam_size_history,
                 "last_frontier": last_frontier[-12:],
                 "shape_seed_count": len(shape_seed_states),
@@ -2843,6 +2887,8 @@ class FloorplanConstraintEngine:
                 locked_early_event_passthrough_count
             ),
             "skipped_r3_micro_event_count": skipped_r3_micro_event_count,
+            "locked_revisit_edge_count": locked_revisit_edge_count,
+            "locked_backtrack_edge_count": locked_backtrack_edge_count,
             "beam_size_history": beam_size_history,
             "last_frontier": last_frontier[-12:],
             "shape_seed_count": len(shape_seed_states),
@@ -5074,9 +5120,19 @@ class FloorplanConstraintEngine:
                     current_node, []
                 ):
                     neighbour = int(neighbour)
-                    if neighbour == previous_node or neighbour in path:
+                    backtracks = neighbour == previous_node
+                    revisits = neighbour in path
+                    node_visit_count = path.count(neighbour)
+                    arc_visit_count = sum(
+                        1
+                        for left, right in zip(path, path[1:])
+                        if left == current_node and right == neighbour
+                    )
+                    if node_visit_count >= 2 or arc_visit_count >= 2:
                         killed_by_revisit += 1
                         continue
+                    if backtracks or revisits:
+                        killed_by_revisit += 1
                     endpoint = self._topology_node_points[neighbour]
                     direction = endpoint - current
                     direction_length = max(float(np.linalg.norm(direction)), 1e-9)
@@ -5092,6 +5148,10 @@ class FloorplanConstraintEngine:
                     )
                     next_matched_events = matched_events
                     penalty = 0.0
+                    if backtracks:
+                        penalty += 0.35
+                    if revisits:
+                        penalty += 0.18
                     angle = math.degrees(math.atan2(
                         math.sin(next_heading - heading),
                         math.cos(next_heading - heading),
