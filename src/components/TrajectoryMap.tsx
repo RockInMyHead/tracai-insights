@@ -513,13 +513,20 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
   }, [floorPlan, usePathfinding, getTransformedTrajectories, viewBox.width, viewBox.height]);
 
   const revisitRouteSegments = useMemo(() => {
-    const gridSize = floorPlan ? 10 : 6;
+    const gridSize = floorPlan ? 26 : 14;
     const segments = new Map<string, { x1: number; y1: number; x2: number; y2: number; count: number }>();
+    const density = new Map<string, number>();
     const bucketPoint = (point: { x: number; y: number }) =>
       `${Math.round(point.x / gridSize)},${Math.round(point.y / gridSize)}`;
 
     getTransformedTrajectories.forEach((data) => {
       const points = data.trajectory;
+      points.forEach((point, index) => {
+        if (index % 3 !== 0) return;
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+        const key = bucketPoint(point);
+        density.set(key, (density.get(key) || 0) + 1);
+      });
       for (let index = 1; index < points.length; index += 1) {
         const previous = points[index - 1];
         const current = points[index];
@@ -529,11 +536,13 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
         const a = bucketPoint(previous);
         const b = bucketPoint(current);
         const key = a <= b ? `${a}|${b}` : `${b}|${a}`;
+        const corridorCount = Math.max(density.get(a) || 0, density.get(b) || 0);
         const existing = segments.get(key);
         if (existing) {
           existing.count += 1;
+          existing.count = Math.max(existing.count, corridorCount);
         } else {
-          segments.set(key, { x1: previous.x, y1: previous.y, x2: current.x, y2: current.y, count: 1 });
+          segments.set(key, { x1: previous.x, y1: previous.y, x2: current.x, y2: current.y, count: Math.max(1, corridorCount) });
         }
       }
     });
@@ -542,7 +551,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
   }, [floorPlan, getTransformedTrajectories]);
 
   const revisitLabelSegments = useMemo(() => {
-    const minCountForLabel = 4;
+    const minCountForLabel = 10;
     return revisitRouteSegments
       .filter((segment) => segment.count >= minCountForLabel)
       .sort((a, b) => b.count - a.count)
@@ -1463,18 +1472,18 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                     key={`revisit-sampled-${trajectoryIndex}`}
                     d={getPathString(data.trajectory)}
                     fill="none"
-                    stroke="#06b6d4"
-                    strokeWidth={floorPlan ? 2.5 : 2}
+                    stroke="#94a3b8"
+                    strokeWidth={floorPlan ? 1.4 : 1.2}
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    opacity="0.72"
+                    opacity="0.35"
                   />
                 ))}
                 {revisitRouteSegments.map((segment, index) => {
-                  const repeated = segment.count > 1;
+                  const repeated = segment.count >= 6;
                   const width = repeated
-                    ? Math.min(floorPlan ? 24 : 18, (floorPlan ? 7 : 5) + Math.log2(segment.count + 1) * 5)
-                    : floorPlan ? 5 : 4;
+                    ? Math.min(floorPlan ? 28 : 20, (floorPlan ? 8 : 6) + Math.log2(segment.count + 1) * 4.8)
+                    : floorPlan ? 6 : 4.5;
                   return (
                     <line
                       key={`revisit-segment-${index}`}
