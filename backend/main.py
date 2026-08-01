@@ -1035,11 +1035,13 @@ OUTPUT_DIR = Path("outputs")
 VIDEOS_DIR = Path("videos")  # Для хранения оригинальных видео
 VIDEO_PREVIEWS_DIR = Path("video_previews")
 MANUAL_TRAJECTORIES_PATH = Path("backend/data/manual_trajectories.json")
+PROCESSING_QUEUE_PATH = Path("backend/data/video_processing_queues.json")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 VIDEOS_DIR.mkdir(exist_ok=True)
 VIDEO_PREVIEWS_DIR.mkdir(exist_ok=True)
 MANUAL_TRAJECTORIES_PATH.parent.mkdir(exist_ok=True, parents=True)
+PROCESSING_QUEUE_PATH.parent.mkdir(exist_ok=True, parents=True)
 
 # Database initialization
 DB_PATH = Path(__file__).parent / "data" / "database.db"
@@ -1257,6 +1259,288 @@ def _merge_task_map_context(video_id: str, map_context: Optional[Dict[str, Any]]
         conn.close()
     except Exception as exc:
         logger.warning(f"[{video_id}] Failed to persist map context: {exc}")
+
+
+_processing_queue_lock = threading.Lock()
+
+
+def _load_processing_queues() -> Dict[str, Any]:
+    if not PROCESSING_QUEUE_PATH.exists():
+        return {}
+    try:
+        with open(PROCESSING_QUEUE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning(f"Failed to load processing queues: {exc}")
+        return {}
+
+
+def _save_processing_queues(data: Dict[str, Any]) -> None:
+    with open(PROCESSING_QUEUE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_to_json_serializable(data), f, ensure_ascii=False, indent=2)
+
+
+def _queue_sort_value(item: Dict[str, Any]) -> Tuple[float, float]:
+    seq = item.get("sequence_index")
+    try:
+        seq_value = float(seq)
+    except (TypeError, ValueError):
+        seq_value = float("inf")
+    try:
+        created = float(item.get("created_at") or 0.0)
+    except (TypeError, ValueError):
+        created = 0.0
+    return seq_value, created
+
+
+def _extract_xy(point: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(point, dict):
+        if "x" in point and "y" in point:
+            try:
+                return float(point["x"]), float(point["y"])
+            except (TypeError, ValueError):
+                return None
+    if isinstance(point, (list, tuple)) and len(point) >= 2:
+        try:
+            return float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _result_plan_size(result: Dict[str, Any]) -> Tuple[float, float]:
+    stats = result.get("processing_stats") if isinstance(result.get("processing_stats"), dict) else {}
+    for source in (result, stats):
+        width = source.get("floorplan_width") or source.get("map_width") or source.get("width")
+        height = source.get("floorplan_height") or source.get("map_height") or source.get("height")
+        try:
+            width_f = float(width)
+            height_f = float(height)
+            if width_f > 0 and height_f > 0:
+                return width_f, height_f
+        except (TypeError, ValueError):
+            pass
+    return 800.0, 600.0
+
+
+def _derive_queue_map_context(
+    previous_video_id: str,
+    previous_result: Dict[str, Any],
+    base_context: Optional[Dict[str, Any]] = None,
+    tail_seconds: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    trajectory = (
+        previous_result.get("map_trajectory")
+        or previous_result.get("graph_first_trajectory")
+        or previous_result.get("trajectory")
+        or []
+    )
+    if not isinstance(trajectory, list) or len(trajectory) < 2:
+        return None
+    points: List[Tuple[float, float]] = []
+    for raw in trajectory:
+        xy = _extract_xy(raw)
+        if xy is not None:
+            points.append(xy)
+    if len(points) < 2:
+        return None
+
+    timestamps = (
+        previous_result.get("r3_source_timestamps_seconds")
+        or previous_result.get("source_timestamps_seconds")
+        or []
+    )
+    prior_index = max(0, len(points) - 40)
+    if isinstance(timestamps, list) and len(timestamps) == len(points):
+        try:
+            last_t = float(timestamps[-1])
+            target_t = last_t - float(tail_seconds)
+            for idx in range(len(timestamps) - 2, -1, -1):
+                value = timestamps[idx]
+                if value is None:
+                    continue
+                if float(value) <= target_t:
+                    prior_index = idx
+                    break
+        except (TypeError, ValueError):
+            pass
+
+    end_x, end_y = points[-1]
+    prior_x, prior_y = points[prior_index]
+    # If the last seconds barely moved, walk farther back until the heading is usable.
+    for idx in range(len(points) - 2, -1, -1):
+        dx = end_x - prior_x
+        dy = end_y - prior_y
+        if _math.hypot(dx, dy) >= 8.0:
+            break
+        prior_x, prior_y = points[idx]
+
+    dx = end_x - prior_x
+    dy = end_y - prior_y
+    norm = _math.hypot(dx, dy)
+    if norm < 1e-6:
+        return None
+    width, height = _result_plan_size(previous_result)
+    direction_len = max(40.0, min(width, height) * 0.08)
+    dir_x = max(0.0, min(width, end_x + dx / norm * direction_len))
+    dir_y = max(0.0, min(height, end_y + dy / norm * direction_len))
+    context = dict(base_context or {})
+    context.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
+    context["reference_point"] = {"x": end_x / width * 100.0, "y": end_y / height * 100.0}
+    context["direction_point"] = {"x": dir_x / width * 100.0, "y": dir_y / height * 100.0}
+    context["queue_anchor_source"] = "previous_video_tail"
+    context["queue_previous_video_id"] = previous_video_id
+    context["queue_tail_seconds"] = tail_seconds
+    return context
+
+
+def _enqueue_processing_queue_item(
+    queue_id: str,
+    video_id: str,
+    *,
+    original_filename: str,
+    analysis_method: str,
+    sequence_index: Optional[Any],
+    run_params: Dict[str, Any],
+    map_context: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], bool]:
+    now = time.time()
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        queue = queues.setdefault(queue_id, {"queue_id": queue_id, "created_at": now, "items": []})
+        items = queue.setdefault("items", [])
+        existing = None
+        for item in items:
+            if item.get("video_id") == video_id:
+                existing = item
+                break
+        item_payload = {
+            "video_id": video_id,
+            "original_filename": original_filename,
+            "analysis_method": analysis_method,
+            "sequence_index": sequence_index,
+            "run_params": run_params,
+            "map_context": map_context or {"floorplan_id": DEFAULT_FLOORPLAN_ID},
+            "updated_at": now,
+        }
+        if existing is None:
+            item_payload.update({"status": "queued", "created_at": now})
+            items.append(item_payload)
+            existing = item_payload
+        else:
+            existing.update(item_payload)
+            if existing.get("status") in {"completed", "failed"}:
+                existing["status"] = "queued"
+        items.sort(key=_queue_sort_value)
+        has_active_before = False
+        for item in items:
+            if item.get("video_id") == video_id:
+                break
+            if item.get("status") in {"queued", "running"}:
+                has_active_before = True
+                break
+        start_now = not has_active_before and existing.get("status") != "running"
+        if start_now:
+            existing["status"] = "running"
+            existing["started_at"] = now
+        queue["updated_at"] = now
+        _save_processing_queues(queues)
+        return dict(existing), start_now
+
+
+def _mark_processing_queue_item(video_id: str, status: str, **fields: Any) -> None:
+    now = time.time()
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        changed = False
+        for queue in queues.values():
+            if not isinstance(queue, dict):
+                continue
+            for item in queue.get("items") or []:
+                if item.get("video_id") == video_id:
+                    item.update(fields)
+                    item["status"] = status
+                    item["updated_at"] = now
+                    queue["updated_at"] = now
+                    changed = True
+        if changed:
+            _save_processing_queues(queues)
+
+
+async def _continue_processing_queue_after_completion(
+    previous_video_id: str,
+    previous_result: Dict[str, Any],
+) -> None:
+    next_item: Optional[Dict[str, Any]] = None
+    next_queue_id: Optional[str] = None
+    inherited_context: Optional[Dict[str, Any]] = None
+    now = time.time()
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        for queue_id, queue in queues.items():
+            if not isinstance(queue, dict):
+                continue
+            items = queue.get("items") or []
+            items.sort(key=_queue_sort_value)
+            for idx, item in enumerate(items):
+                if item.get("video_id") != previous_video_id:
+                    continue
+                item["status"] = "completed"
+                item["completed_at"] = now
+                item["updated_at"] = now
+                queue["updated_at"] = now
+                for candidate in items[idx + 1:]:
+                    if candidate.get("status") == "queued":
+                        inherited_context = _derive_queue_map_context(
+                            previous_video_id,
+                            previous_result,
+                            candidate.get("map_context") if isinstance(candidate.get("map_context"), dict) else None,
+                        )
+                        if inherited_context is not None:
+                            candidate["map_context"] = inherited_context
+                        candidate["status"] = "running"
+                        candidate["started_at"] = now
+                        candidate["updated_at"] = now
+                        next_item = dict(candidate)
+                        next_queue_id = str(queue_id)
+                        break
+                break
+            if next_item is not None:
+                break
+        _save_processing_queues(queues)
+
+    if next_item is None:
+        return
+    video_id = str(next_item.get("video_id") or "")
+    if not video_id:
+        return
+    run_params = next_item.get("run_params") if isinstance(next_item.get("run_params"), dict) else {}
+    map_context = next_item.get("map_context") if isinstance(next_item.get("map_context"), dict) else inherited_context
+    _merge_task_map_context(video_id, map_context)
+    _begin_analysis_run(video_id, message=f"Очередь {next_queue_id}: запуск после {previous_video_id}")
+    processing_status[video_id].update({
+        "queue_id": next_queue_id,
+        "queue_previous_video_id": previous_video_id,
+        "queue_anchor_source": "previous_video_tail",
+    })
+    video_filename = UPLOADED_VIDEOS.get(video_id)
+    video_path = (VIDEOS_DIR / video_filename) if video_filename else None
+    if video_path and not video_path.exists():
+        video_path = None
+    _schedule_r3_process_background(
+        None,
+        video_id,
+        video_path,
+        str(next_item.get("original_filename") or "video"),
+        float(run_params.get("scale_factor", 12.306)),
+        int(run_params.get("frame_stride", 5)),
+        int(run_params.get("max_frames", 1500)),
+        str(run_params.get("ckpt", "r3_long.safetensors")),
+        int(run_params.get("size", 392)),
+        str(run_params.get("mode", "strided")),
+        map_context,
+    )
 
 
 def _load_manual_trajectories() -> Dict[str, Any]:
@@ -3270,6 +3554,7 @@ async def process_video_background(
         })
         _update_task_status(video_id, "completed", 100)
         logger.info(f"[{video_id}] Analysis saved and status set to completed")
+        await _continue_processing_queue_after_completion(video_id, result)
 
     except Exception as e:
         error_msg = str(e)
@@ -3283,6 +3568,7 @@ async def process_video_background(
                 "suppress_disk_completion": True,
             })
             processing_status[video_id].pop("result", None)
+        _mark_processing_queue_item(video_id, "failed", error=error_msg)
         await send_error_to_telegram(error_msg, f"Фон. обработка: {original_filename}")
 
 # ──────────────────────────────────────────────
@@ -3584,6 +3870,7 @@ async def process_video_r3_background(
         )
         _update_task_status(video_id, "completed", 100)
         logger.info(f"[{video_id}] R³ analysis saved and status set to completed")
+        await _continue_processing_queue_after_completion(video_id, trajectory_data)
 
     except Exception as e:
         error_msg = str(e)
@@ -3604,6 +3891,7 @@ async def process_video_r3_background(
                 suppress_disk_completion=True,
             )
             processing_status[video_id].pop("result", None)
+        _mark_processing_queue_item(video_id, "failed", error=error_msg)
 
 
 def _schedule_r3_process_background(
@@ -4212,6 +4500,15 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
         map_context = _extract_map_context(body)
         _merge_task_map_context(video_id, map_context)
         force_reprocess = bool(body.get("force_reprocess", False))
+        employee_name = body.get("employee_name")
+        analysis_method = body.get("analysis_method", "slam")
+        queue_id = (
+            body.get("queue_id")
+            or body.get("processing_queue_id")
+            or body.get("shift_id")
+            or body.get("batch_id")
+        )
+        sequence_index = body.get("sequence_index")
 
         # При явном новом анализе ручная траектория больше не должна подменять результат.
         # Иначе выбранное с сервера видео с прежней админ-разметкой сразу возвращает manual_result.
@@ -4267,17 +4564,62 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 else:
                     raise HTTPException(status_code=404, detail=f"Видео {video_id} не найдено на сервере")
 
+        if queue_id:
+            if analysis_method != "r3":
+                raise HTTPException(status_code=400, detail="Очередь смены сейчас поддерживает только analysis_method='r3'")
+            run_params = {
+                "scale_factor": scale_factor,
+                "frame_stride": int(body.get("frame_stride", 5)),
+                "max_frames": int(body.get("max_frames", 1500)),
+                "ckpt": body.get("ckpt", "r3_long.safetensors"),
+                "size": int(body.get("size", 392)),
+                "mode": body.get("mode", "strided"),
+            }
+            queue_item, queue_start_now = _enqueue_processing_queue_item(
+                str(queue_id),
+                video_id,
+                original_filename=original_filename,
+                analysis_method=analysis_method,
+                sequence_index=sequence_index,
+                run_params=run_params,
+                map_context=map_context,
+            )
+            if not queue_start_now:
+                processing_status[video_id] = {
+                    "status": "queued",
+                    "progress": 0,
+                    "message": f"Ожидает предыдущий ролик в очереди {queue_id}",
+                    "start_time": time.time(),
+                    "stage": "queued",
+                    "stage_started_at": time.time(),
+                    "stage_timings": {},
+                    "queue_id": str(queue_id),
+                    "queue_sequence_index": sequence_index,
+                    "suppress_disk_completion": True,
+                }
+                _update_task_status(video_id, "queued", 0)
+                return {
+                    "success": True,
+                    "video_id": video_id,
+                    "status": "queued",
+                    "message": "Видео добавлено в очередь и ждёт предыдущий сегмент",
+                    "queue_id": str(queue_id),
+                    "queue_item": queue_item,
+                }
+
         # Invalidate prior *_analysis.json and arm a run id so /api/status cannot
         # return the previous completed payload while this job is still running.
         analysis_run_id = _begin_analysis_run(
             video_id,
             message="Поставлено в очередь на обработку",
         )
+        if queue_id:
+            processing_status[video_id].update({
+                "queue_id": str(queue_id),
+                "queue_sequence_index": sequence_index,
+            })
 
         # ─── НЕМЕДЛЕННО запускаем обработку на GPU Worker ────────
-        employee_name = body.get("employee_name")
-        analysis_method = body.get("analysis_method", "slam")
-
         if analysis_method == "lingbot":
             lingbot_result = await _start_lingbot_session(
                 video_id,
@@ -4340,6 +4682,24 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
     except Exception as e:
         logger.error(f"Error in analyze_video_by_id: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/processing-queue/{queue_id}")
+async def get_processing_queue(queue_id: str) -> Dict[str, Any]:
+    queues = _load_processing_queues()
+    queue = queues.get(queue_id)
+    if not isinstance(queue, dict):
+        raise HTTPException(status_code=404, detail=f"Очередь {queue_id} не найдена")
+    items = queue.get("items") or []
+    return {
+        "success": True,
+        "queue_id": queue_id,
+        "queue": {
+            **queue,
+            "items": sorted(items, key=_queue_sort_value),
+        },
+    }
+
 
 @app.post("/api/analyze-video")
 async def analyze_video(background_tasks: BackgroundTasks, request: Request) -> Dict[str, Any]:
