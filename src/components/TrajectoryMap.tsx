@@ -1482,8 +1482,8 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                 {revisitRouteSegments.map((segment, index) => {
                   const repeated = segment.count >= 6;
                   const width = repeated
-                    ? Math.min(floorPlan ? 28 : 20, (floorPlan ? 8 : 6) + Math.log2(segment.count + 1) * 4.8)
-                    : floorPlan ? 6 : 4.5;
+                    ? Math.min(floorPlan ? 42 : 28, (floorPlan ? 16 : 10) + Math.log2(segment.count + 1) * 6.5)
+                    : floorPlan ? 12 : 7;
                   return (
                     <line
                       key={`revisit-segment-${index}`}
@@ -1494,7 +1494,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       stroke={repeated ? "#a855f7" : "#ef4444"}
                       strokeWidth={width}
                       strokeLinecap="round"
-                      opacity={repeated ? 0.9 : 0.72}
+                      opacity={repeated ? 0.82 : 0.74}
                     />
                   );
                 })}
