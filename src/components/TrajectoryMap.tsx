@@ -1472,18 +1472,18 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                     key={`revisit-sampled-${trajectoryIndex}`}
                     d={getPathString(data.trajectory)}
                     fill="none"
-                    stroke="#94a3b8"
-                    strokeWidth={floorPlan ? 1.4 : 1.2}
+                    stroke="#ef4444"
+                    strokeWidth={floorPlan ? 14 : 8}
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    opacity="0.35"
+                    opacity="0.62"
                   />
                 ))}
                 {revisitRouteSegments.map((segment, index) => {
                   const repeated = segment.count >= 6;
                   const width = repeated
-                    ? Math.min(floorPlan ? 42 : 28, (floorPlan ? 16 : 10) + Math.log2(segment.count + 1) * 6.5)
-                    : floorPlan ? 12 : 7;
+                    ? Math.min(floorPlan ? 48 : 30, (floorPlan ? 20 : 12) + Math.log2(segment.count + 1) * 7.5)
+                    : floorPlan ? 10 : 6;
                   return (
                     <line
                       key={`revisit-segment-${index}`}
@@ -1494,7 +1494,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       stroke={repeated ? "#a855f7" : "#ef4444"}
                       strokeWidth={width}
                       strokeLinecap="round"
-                      opacity={repeated ? 0.82 : 0.74}
+                      opacity={repeated ? 0.48 : 0.42}
                     />
                   );
                 })}
@@ -1504,20 +1504,20 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                   return (
                     <g key={`revisit-label-${index}`} pointerEvents="none">
                       <rect
-                        x={x - 13}
-                        y={y - 10}
-                        width="26"
-                        height="18"
+                        x={x - 11}
+                        y={y - 8}
+                        width="22"
+                        height="15"
                         rx="4"
-                        fill="rgba(88, 28, 135, 0.86)"
-                        stroke="rgba(255,255,255,0.9)"
+                        fill="rgba(88, 28, 135, 0.72)"
+                        stroke="rgba(255,255,255,0.78)"
                         strokeWidth="1"
                       />
                       <text
                         x={x}
-                        y={y + 4}
+                        y={y + 3}
                         textAnchor="middle"
-                        fontSize={floorPlan ? 11 : 9}
+                        fontSize={floorPlan ? 9 : 8}
                         fontWeight="700"
                         fill="white"
                       >
