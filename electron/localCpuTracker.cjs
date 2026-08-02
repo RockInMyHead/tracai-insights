@@ -183,13 +183,18 @@ async function copyToLocal({ filePath, fileName, onProgress, signal }) {
   return { video_id: id, filename: fileName, original_filename: fileName, file_size: stat.size, localPath: targetPath };
 }
 
-async function processLocalVideo(video) {
+async function processLocalVideo(video, onProgress) {
   const history = readHistory();
   const item = history.find((entry) => entry.video_id === video.video_id);
   const sourcePath = video.localPath || item?.localPath;
   if (!sourcePath || !fs.existsSync(sourcePath)) throw new Error('Копия видео не найдена');
-  const raw = await extractFrames(sourcePath);
+  if (typeof onProgress === 'function') onProgress({ percent: 5, stage: 'reading', message: 'Читаем видео' });
+  const raw = await extractFrames(sourcePath, (percent) => {
+    if (typeof onProgress === 'function') onProgress({ percent, stage: 'frames', message: 'Извлекаем кадры' });
+  });
+  if (typeof onProgress === 'function') onProgress({ percent: 82, stage: 'trajectory', message: 'Строим траекторию' });
   const trajectory = buildTrajectory(decodeFrames(raw));
+  if (typeof onProgress === 'function') onProgress({ percent: 95, stage: 'saving', message: 'Сохраняем результат' });
   const result = {
     method: 'local_cpu_optical_flow',
     trajectory,
@@ -201,6 +206,7 @@ async function processLocalVideo(video) {
   };
   const record = { video_id: video.video_id, filename: video.filename, original_filename: video.original_filename || video.filename, file_size: video.file_size || 0, uploaded_at: new Date().toISOString(), has_analysis: true, localPath: sourcePath, data: result };
   writeHistory([record, ...history.filter((entry) => entry.video_id !== video.video_id)]);
+  if (typeof onProgress === 'function') onProgress({ percent: 100, stage: 'completed', message: 'Готово' });
   return { success: true, status: 'completed', video_id: video.video_id, data: result };
 }
 

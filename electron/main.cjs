@@ -156,7 +156,13 @@ function setupCameraImport() {
   ipcMain.handle('local-gpu:history', () => localGpuRuntime.getHistory());
   ipcMain.handle('local-gpu:analysis', (_event, videoId) => localGpuRuntime.getAnalysis(videoId));
   ipcMain.handle('local-cpu:process', async (_event, video) => {
-    const result = await localCpuTracker.processLocalVideo(video);
+    const result = await localCpuTracker.processLocalVideo(video, (progress) => {
+      broadcastToRenderer('local-cpu:progress', {
+        video_id: video.video_id,
+        filename: video.original_filename || video.filename,
+        ...progress,
+      });
+    });
     adminMirror.enqueueResult(video.video_id, result.data);
     void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
     return result;

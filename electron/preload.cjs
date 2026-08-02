@@ -19,6 +19,11 @@ contextBridge.exposeInMainWorld('trackai', {
     process: (video) => ipcRenderer.invoke('local-cpu:process', video),
     history: () => ipcRenderer.invoke('local-cpu:history'),
     analysis: (videoId) => ipcRenderer.invoke('local-cpu:analysis', videoId),
+    onProgress: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on('local-cpu:progress', listener);
+      return () => ipcRenderer.removeListener('local-cpu:progress', listener);
+    },
   },
   localGpu: {
     process: (video) => ipcRenderer.invoke('local-gpu:process', video),

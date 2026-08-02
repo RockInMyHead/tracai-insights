@@ -13,6 +13,15 @@ type DesktopState = "ready" | "looking" | "copying" | "processing" | "done" | "n
 type ProcessingMode = "online" | "local_gpu" | "local_cpu";
 type ProcessingResolution = Awaited<ReturnType<NonNullable<Window["trackai"]>["processing"]["resolveMode"]>>;
 type PlanPoint = { x: number; y: number };
+type VideoProcessingProgress = {
+  videoId: string;
+  fileName: string;
+  index: number;
+  total: number;
+  percent: number;
+  status: "queued" | "processing" | "done" | "error";
+  message?: string;
+};
 
 function getDesktopBridge() {
   return (window as unknown as { trackai?: Window["trackai"] }).trackai;
@@ -72,11 +81,20 @@ export default function WindowsCameraDesktop() {
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [stats, setStats] = useState<Record<string, unknown>>({});
   const [processingStatus, setProcessingStatus] = useState<ProcessingResolution | null>(null);
+  const [processingProgress, setProcessingProgress] = useState<VideoProcessingProgress[]>([]);
   const [referencePoint, setReferencePoint] = useState<PlanPoint | null>(null);
   const [directionPoint, setDirectionPoint] = useState<PlanPoint | null>(null);
   const [planPickMode, setPlanPickMode] = useState<"start" | "direction">("start");
   const processingModeRef = useRef<ProcessingMode>("online");
   const analysisQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  const upsertProcessingProgress = useCallback((next: VideoProcessingProgress) => {
+    setProcessingProgress((current) => {
+      const existingIndex = current.findIndex((item) => item.videoId === next.videoId);
+      if (existingIndex === -1) return [...current, next];
+      return current.map((item, index) => index === existingIndex ? { ...item, ...next } : item);
+    });
+  }, []);
 
   const resolveProcessingMode = useCallback(async () => {
     const bridge = getDesktopBridge();
@@ -135,6 +153,25 @@ export default function WindowsCameraDesktop() {
     void resolveProcessingMode().then(() => refreshHistory());
   }, [refreshHistory, resolveProcessingMode]);
 
+  useEffect(() => {
+    const unsubscribe = getDesktopBridge()?.localCpu?.onProgress?.((payload) => {
+      const progressPayload = payload as { video_id?: string; percent?: number; message?: string };
+      if (!progressPayload.video_id) return;
+      const percent = Number(progressPayload.percent);
+      setProcessingProgress((current) => current.map((item) => (
+        item.videoId === progressPayload.video_id
+          ? {
+              ...item,
+              percent: Number.isFinite(percent) ? Math.max(item.percent, Math.min(100, percent)) : item.percent,
+              status: percent >= 100 ? "done" : "processing",
+              message: progressPayload.message || item.message,
+            }
+          : item
+      )));
+    });
+    return () => unsubscribe?.();
+  }, []);
+
   const busy = ["looking", "copying", "processing"].includes(state);
 
   const handlePlanClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
@@ -168,11 +205,36 @@ export default function WindowsCameraDesktop() {
     setState("processing");
     setProgress(null);
     setMessage(`Запускаем анализ: 0 из ${videos.length}`);
+    setProcessingProgress((current) => {
+      const incomingIds = new Set(videos.map((video) => video.video_id));
+      return [
+        ...current.filter((item) => !incomingIds.has(item.videoId)),
+        ...videos.map((video, index) => ({
+          videoId: video.video_id,
+          fileName: video.original_filename || video.filename,
+          index: index + 1,
+          total: videos.length,
+          percent: 0,
+          status: "queued" as const,
+          message: "В очереди",
+        })),
+      ];
+    });
 
     try {
       for (let index = 0; index < videos.length; index += 1) {
         const video = videos[index];
-        setMessage(`Анализируем ${index + 1} из ${videos.length}: ${video.original_filename || video.filename}`);
+        const fileName = video.original_filename || video.filename;
+        setMessage(`Анализируем ${index + 1} из ${videos.length}: ${fileName}`);
+        upsertProcessingProgress({
+          videoId: video.video_id,
+          fileName,
+          index: index + 1,
+          total: videos.length,
+          percent: 2,
+          status: "processing",
+          message: "Запущено",
+        });
         const videoMode: ProcessingMode = video.localPath ? "local_cpu" : processingModeRef.current;
         if (videoMode !== "online") {
           const local = videoMode === "local_gpu"
@@ -182,6 +244,15 @@ export default function WindowsCameraDesktop() {
           if (!nextTrajectory.length) throw new Error("Не удалось построить траекторию для этого видео");
           setTrajectories((current) => [...current, ...nextTrajectory]);
           setStats(((local as VideoAnalysisResult).data?.processing_stats || {}) as Record<string, unknown>);
+          upsertProcessingProgress({
+            videoId: video.video_id,
+            fileName,
+            index: index + 1,
+            total: videos.length,
+            percent: 100,
+            status: "done",
+            message: "Готово",
+          });
           continue;
         }
         const started = await apiClient.analyzeVideoById(
@@ -204,9 +275,28 @@ export default function WindowsCameraDesktop() {
         let result = started.data;
 
         if (started.status === "queued") {
+          upsertProcessingProgress({
+            videoId: video.video_id,
+            fileName,
+            index: index + 1,
+            total: videos.length,
+            percent: 5,
+            status: "queued",
+            message: "Ждет сервер",
+          });
           for (let attempt = 0; attempt < 1800; attempt += 1) {
             const status = await apiClient.getProcessingStatus(video.video_id);
             setMessage(status.message || `Обрабатываем ${index + 1} из ${videos.length}`);
+            const percent = Number((status as { progress?: unknown }).progress);
+            upsertProcessingProgress({
+              videoId: video.video_id,
+              fileName,
+              index: index + 1,
+              total: videos.length,
+              percent: Number.isFinite(percent) ? Math.max(5, Math.min(99, percent)) : Math.min(95, 8 + attempt),
+              status: "processing",
+              message: status.message || "Обрабатывается",
+            });
             if (status.status === "error" || status.status === "failed") {
               throw new Error(status.message || "Сервер не смог обработать видео");
             }
@@ -222,16 +312,30 @@ export default function WindowsCameraDesktop() {
         if (!nextTrajectory.length) throw new Error("Сервер не вернул траекторию для отображения на плане");
         setTrajectories((current) => [...current, ...nextTrajectory]);
         setStats((result?.processing_stats || {}) as Record<string, unknown>);
+        upsertProcessingProgress({
+          videoId: video.video_id,
+          fileName,
+          index: index + 1,
+          total: videos.length,
+          percent: 100,
+          status: "done",
+          message: "Готово",
+        });
       }
       setState("done");
       setMessage("Готово. Траектория показана на плане Kerama Marazzi.");
       await refreshHistory();
     } catch (error) {
+      setProcessingProgress((current) => current.map((item) => (
+        item.status === "processing" || item.status === "queued"
+          ? { ...item, status: "error", message: error instanceof Error ? error.message : "Ошибка обработки" }
+          : item
+      )));
       setState("error");
       setMessage(error instanceof Error ? error.message : "Не удалось выполнить анализ");
       await refreshHistory();
     }
-  }, [directionPoint, referencePoint, refreshHistory]);
+  }, [directionPoint, referencePoint, refreshHistory, upsertProcessingProgress]);
 
   const enqueueImportedVideos = useCallback((videos: CameraImportedVideo[]) => {
     if (!videos.length) return;
@@ -366,6 +470,12 @@ export default function WindowsCameraDesktop() {
   const buttonText = busy ? "Выполняется" : "Загрузить";
   const canUpload = Boolean(referencePoint && directionPoint);
   const canCancelImport = state === "copying" || (progress && state !== "processing");
+  const processingStatusLabel: Record<VideoProcessingProgress["status"], string> = {
+    queued: "В очереди",
+    processing: "Обработка",
+    done: "Готово",
+    error: "Ошибка",
+  };
 
   return (
     <main className="min-h-[100dvh] bg-slate-50 text-slate-950">
@@ -410,7 +520,39 @@ export default function WindowsCameraDesktop() {
             </button>}
           </div>}
           <p className={`mt-4 text-sm ${state === "error" ? "text-rose-700" : state === "needs_camera" ? "text-amber-700" : "text-slate-600"}`}>{message}</p>
-          {progress && <p className="mt-2 text-xs text-teal-700">{Math.round(progress.percent)}% скопировано</p>}
+          {progress && <div className="mt-3">
+            <div className="mb-1 flex items-center justify-between gap-3 text-xs font-medium text-slate-600">
+              <span className="truncate">{progress.fileName}</span>
+              <span className="shrink-0">{Math.round(progress.percent)}%</span>
+            </div>
+            <div className="h-2.5 overflow-hidden rounded-full bg-slate-200">
+              <div className="h-full rounded-full bg-teal-600 transition-all" style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }} />
+            </div>
+            <p className="mt-1 text-xs text-teal-700">Выгрузка с камеры: {progress.index} из {progress.total}</p>
+          </div>}
+          {processingProgress.length > 0 && <div className="mt-4 space-y-2">
+            <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <span>Обработка видео</span>
+              <span>{processingProgress.filter((item) => item.status === "done").length}/{processingProgress.length}</span>
+            </div>
+            {processingProgress.slice(-6).map((item) => (
+              <div key={item.videoId} className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="flex items-center justify-between gap-3 text-xs">
+                  <span className="min-w-0 truncate font-medium text-slate-800">{item.fileName}</span>
+                  <span className={`shrink-0 font-semibold ${item.status === "error" ? "text-rose-700" : item.status === "done" ? "text-teal-700" : "text-slate-600"}`}>
+                    {processingStatusLabel[item.status]} {Math.round(item.percent)}%
+                  </span>
+                </div>
+                <div className="mt-1.5 h-2.5 overflow-hidden rounded-full bg-slate-200">
+                  <div
+                    className={`h-full rounded-full transition-all ${item.status === "error" ? "bg-rose-600" : item.status === "done" ? "bg-teal-600" : "bg-blue-600"}`}
+                    style={{ width: `${Math.max(0, Math.min(100, item.percent))}%` }}
+                  />
+                </div>
+                {item.message && <p className="mt-1 truncate text-[11px] text-slate-500">{item.index} из {item.total}: {item.message}</p>}
+              </div>
+            ))}
+          </div>}
         </div>
         <div className="min-h-[520px] overflow-hidden rounded-2xl border border-slate-200 bg-slate-100 p-2 shadow-sm shadow-slate-300/40">
           {trajectories.length ? <TrajectoryMap trajectories={trajectories} stats={stats} floorPlan={FLOORPLAN_URL} compactMode /> : (

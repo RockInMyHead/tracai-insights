@@ -57,6 +57,7 @@ interface TrackAIWindowBridge {
     process: (video: unknown) => Promise<unknown>;
     history: () => Promise<unknown[]>;
     analysis: (videoId: string) => Promise<unknown>;
+    onProgress: (callback: (progress: unknown) => void) => () => void;
   };
   localGpu?: {
     process: (video: unknown) => Promise<unknown>;
