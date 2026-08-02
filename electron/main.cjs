@@ -32,7 +32,20 @@ function setupCameraImport() {
     serverUrl: APP_URL,
     importFile: async (input) => {
       if (processingMode === 'online') {
-        return require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input });
+        try {
+          return await require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input });
+        } catch (error) {
+          processingMode = 'local_cpu';
+          processingModeDetails = {
+            mode: processingMode,
+            label: 'Локально',
+            onlineUploadError: error instanceof Error ? error.message : String(error),
+          };
+          desktopLogs?.log('warn', 'camera-import:online-upload-fallback-local', {
+            fileName: input.fileName,
+            error: processingModeDetails.onlineUploadError,
+          });
+        }
       }
       const copied = await localCpuTracker.copyToLocal(input);
       adminMirror.enqueueVideo(copied);

@@ -141,8 +141,9 @@ export default function WindowsCameraDesktop() {
       for (let index = 0; index < videos.length; index += 1) {
         const video = videos[index];
         setMessage(`Анализируем ${index + 1} из ${videos.length}: ${video.original_filename || video.filename}`);
-        if (processingModeRef.current !== "online") {
-          const local = processingModeRef.current === "local_gpu"
+        const videoMode: ProcessingMode = video.localPath ? "local_cpu" : processingModeRef.current;
+        if (videoMode !== "online") {
+          const local = videoMode === "local_gpu"
             ? await getDesktopBridge()?.localGpu?.process(video)
             : await getDesktopBridge()?.localCpu?.process(video);
           const nextTrajectory = getDesktopTrajectory((local as VideoAnalysisResult | undefined)?.data, video.video_id);
