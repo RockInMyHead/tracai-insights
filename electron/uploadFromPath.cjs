@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { Readable } = require('stream');
 
-async function initUpload(serverUrl, filename, employeeName) {
+async function initUpload(serverUrl, filename, employeeName, signal) {
   const response = await fetch(`${serverUrl}/api/init-upload`, {
     method: 'POST',
     headers: {
@@ -14,6 +14,7 @@ async function initUpload(serverUrl, filename, employeeName) {
       employee_name: employeeName || null,
       client_source: 'camera_auto',
     }),
+    signal,
   });
 
   if (!response.ok) {
@@ -28,12 +29,14 @@ async function initUpload(serverUrl, filename, employeeName) {
   return payload;
 }
 
-async function uploadVideoStream(serverUrl, videoId, filePath, onProgress) {
+async function uploadVideoStream(serverUrl, videoId, filePath, onProgress, signal) {
   const stat = await fs.promises.stat(filePath);
   const totalBytes = stat.size;
   let uploadedBytes = 0;
 
   const nodeStream = fs.createReadStream(filePath);
+  const abort = () => nodeStream.destroy(signal?.reason || new Error('Upload cancelled'));
+  signal?.addEventListener('abort', abort, { once: true });
   nodeStream.on('data', (chunk) => {
     uploadedBytes += chunk.length;
     if (typeof onProgress === 'function' && totalBytes > 0) {
@@ -51,7 +54,9 @@ async function uploadVideoStream(serverUrl, videoId, filePath, onProgress) {
     },
     body: webStream,
     duplex: 'half',
+    signal,
   });
+  signal?.removeEventListener('abort', abort);
 
   if (!response.ok) {
     const text = await response.text();
@@ -66,10 +71,11 @@ async function uploadFileFromPath({
   filePath,
   employeeName,
   onProgress,
+  signal,
 }) {
   const filename = path.basename(filePath);
-  const init = await initUpload(serverUrl, filename, employeeName);
-  await uploadVideoStream(serverUrl, init.video_id, filePath, onProgress);
+  const init = await initUpload(serverUrl, filename, employeeName, signal);
+  await uploadVideoStream(serverUrl, init.video_id, filePath, onProgress, signal);
   return {
     video_id: init.video_id,
     filename,

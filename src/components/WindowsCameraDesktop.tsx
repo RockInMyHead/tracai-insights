@@ -338,8 +338,21 @@ export default function WindowsCameraDesktop() {
     }
   };
 
+  const cancelCameraImport = async () => {
+    try {
+      const result = await cameraImport?.cancel?.();
+      setProgress(null);
+      if (result?.cancelled) {
+        setMessage("Выгрузка с камеры остановлена. Уже скопированные видео останутся в обработке.");
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Не удалось остановить выгрузку с камеры");
+    }
+  };
+
   const buttonText = busy ? "Выполняется" : "Загрузить";
   const canUpload = Boolean(referencePoint && directionPoint);
+  const canCancelImport = state === "copying" || (progress && state !== "processing");
 
   return (
     <main className="min-h-[100dvh] bg-slate-50 text-slate-950">
@@ -369,6 +382,9 @@ export default function WindowsCameraDesktop() {
           <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-700 text-base font-semibold text-slate-50 hover:bg-teal-800 active:translate-y-px" disabled={busy || !canUpload} onClick={() => void handleUpload()}>
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Upload className="h-5 w-5" />}{buttonText}
           </Button>
+          {canCancelImport && <Button type="button" variant="outline" className="mt-3 h-11 w-full border-rose-300 bg-white text-rose-700 hover:bg-rose-50 hover:text-rose-800" onClick={() => void cancelCameraImport()}>
+            Остановить выгрузку
+          </Button>}
           {!canUpload && <p className="mt-3 text-xs font-medium text-teal-800">Перед загрузкой задайте стартовую точку и направление движения на плане.</p>}
           {runtimeNotice && <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
             <p className="font-semibold">{runtimeNotice.title}</p>

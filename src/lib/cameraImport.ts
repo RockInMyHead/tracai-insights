@@ -54,6 +54,7 @@ export interface TrackAICameraImportAPI {
   getSettings: () => Promise<CameraImportSettings>;
   setSettings: (settings: Partial<CameraImportSettings>) => Promise<CameraImportSettings>;
   scanNow: (options?: { forceImport?: boolean }) => Promise<CameraImportStatus>;
+  cancel: () => Promise<{ cancelled: boolean }>;
   getStatus: () => Promise<CameraImportStatus>;
   onStatus: (callback: (status: CameraImportStatus) => void) => () => void;
   onProgress: (callback: (progress: CameraImportProgress) => void) => () => void;

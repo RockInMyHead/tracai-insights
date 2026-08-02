@@ -102,6 +102,7 @@ function setupCameraImport() {
   });
 
   ipcMain.handle('camera-import:get-status', () => cameraImportService.getStatus());
+  ipcMain.handle('camera-import:cancel', () => cameraImportService.cancelImport());
 
   ipcMain.handle('processing:resolve-mode', async () => {
     const gpu = await localGpuRuntime.start((level, event, data) => desktopLogs?.log(level, event, data));

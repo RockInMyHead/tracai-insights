@@ -136,25 +136,50 @@ function extractFrames(videoPath, onProgress) {
   });
 }
 
-async function copyToLocal({ filePath, fileName, onProgress }) {
+function createAbortError() {
+  const error = new Error('Копирование видео остановлено');
+  error.name = 'AbortError';
+  return error;
+}
+
+async function copyToLocal({ filePath, fileName, onProgress, signal }) {
   const id = crypto.randomUUID();
   const targetDir = videosPath();
   const targetPath = path.join(targetDir, `${id}_${fileName}`);
   const stat = await fs.promises.stat(filePath);
   await fs.promises.mkdir(targetDir, { recursive: true });
-  await new Promise((resolve, reject) => {
+  try {
+    await new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(signal.reason || createAbortError());
+        return;
+      }
     let copied = 0;
     const input = fs.createReadStream(filePath);
     const output = fs.createWriteStream(targetPath, { flags: 'wx' });
+    const abort = () => {
+      const error = signal?.reason || createAbortError();
+      input.destroy(error);
+      output.destroy(error);
+      reject(error);
+    };
+    signal?.addEventListener('abort', abort, { once: true });
     input.on('data', (chunk) => {
       copied += chunk.length;
       if (typeof onProgress === 'function' && stat.size) onProgress(Math.min(100, (copied / stat.size) * 100));
     });
     input.on('error', reject);
     output.on('error', reject);
-    output.on('finish', resolve);
+    output.on('finish', () => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    });
     input.pipe(output);
-  });
+    });
+  } catch (error) {
+    await fs.promises.rm(targetPath, { force: true }).catch(() => {});
+    throw error;
+  }
   return { video_id: id, filename: fileName, original_filename: fileName, file_size: stat.size, localPath: targetPath };
 }
 

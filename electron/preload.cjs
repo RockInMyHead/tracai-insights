@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('trackai', {
     getSettings: () => ipcRenderer.invoke('camera-import:get-settings'),
     setSettings: (settings) => ipcRenderer.invoke('camera-import:set-settings', settings),
     scanNow: (options) => ipcRenderer.invoke('camera-import:scan-now', options),
+    cancel: () => ipcRenderer.invoke('camera-import:cancel'),
     getStatus: () => ipcRenderer.invoke('camera-import:get-status'),
     onStatus: (callback) => {
       const listener = (_event, payload) => callback(payload);
