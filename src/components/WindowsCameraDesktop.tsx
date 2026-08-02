@@ -92,7 +92,7 @@ export default function WindowsCameraDesktop() {
     if (reason === "nvidia_driver_missing") {
       return {
         title: "Локальная GPU-обработка недоступна: не установлен драйвер NVIDIA.",
-        detail: `Установите NVIDIA Driver версии ${processingStatus.localGpuDetails?.minimumDriver || "560.76"} или новее. До этого TrackAI будет использовать сетевую обработку, если сервер доступен.`,
+        detail: `Установите NVIDIA Driver версии ${processingStatus.localGpuDetails?.minimumDriver || "560.76"} или новее.`,
         driverUrl: processingStatus.localGpuDetails?.driverUrl,
       };
     }
@@ -111,13 +111,6 @@ export default function WindowsCameraDesktop() {
       return {
         title: "Локальная GPU-обработка недоступна: в установщике нет полного R3 runtime.",
         detail: "Установите полную Windows-сборку TrackAI с bundled GPU runtime.",
-        driverUrl: undefined,
-      };
-    }
-    if (processingStatus.mode === "online") {
-      return {
-        title: "Используется сетевая обработка.",
-        detail: "Локальный GPU runtime не выбран, видео будет отправлено на сервер TrackAI.",
         driverUrl: undefined,
       };
     }

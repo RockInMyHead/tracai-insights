@@ -113,7 +113,7 @@ function setupCameraImport() {
     }
     processingModeDetails = {
       mode: processingMode,
-      label: processingMode === 'online' ? 'Сетевая обработка' : 'Локально',
+      label: 'Локально',
       localGpuReason: gpu.reason,
       localGpuDetails: {
         reason: gpu.reason,
