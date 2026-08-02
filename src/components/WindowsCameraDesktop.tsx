@@ -107,13 +107,6 @@ export default function WindowsCameraDesktop() {
         driverUrl: processingStatus.localGpuDetails?.driverUrl,
       };
     }
-    if (reason === "runtime_missing" || reason === "runtime_incomplete") {
-      return {
-        title: "Локальная GPU-обработка недоступна: в установщике нет полного R3 runtime.",
-        detail: "Установите полную Windows-сборку TrackAI с bundled GPU runtime.",
-        driverUrl: undefined,
-      };
-    }
     return null;
   }, [processingStatus]);
 
