@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import TrajectoryMap, { type TrajectoryData, type TurnPoint } from "@/components/TrajectoryMap";
 import { apiClient, type VideoAnalysisResult, type VideoListItem } from "@/lib/api";
@@ -12,6 +12,7 @@ const CAMERA_OWNER = "Экшен-камера";
 type DesktopState = "ready" | "looking" | "copying" | "processing" | "done" | "needs_camera" | "error";
 type ProcessingMode = "online" | "local_gpu" | "local_cpu";
 type ProcessingResolution = Awaited<ReturnType<NonNullable<Window["trackai"]>["processing"]["resolveMode"]>>;
+type PlanPoint = { x: number; y: number };
 
 function getDesktopBridge() {
   return (window as unknown as { trackai?: Window["trackai"] }).trackai;
@@ -71,6 +72,9 @@ export default function WindowsCameraDesktop() {
   const [trajectories, setTrajectories] = useState<TrajectoryData[]>([]);
   const [stats, setStats] = useState<Record<string, unknown>>({});
   const [processingStatus, setProcessingStatus] = useState<ProcessingResolution | null>(null);
+  const [referencePoint, setReferencePoint] = useState<PlanPoint | null>(null);
+  const [directionPoint, setDirectionPoint] = useState<PlanPoint | null>(null);
+  const [planPickMode, setPlanPickMode] = useState<"start" | "direction">("start");
   const processingModeRef = useRef<ProcessingMode>("online");
   const analysisQueueRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -131,6 +135,34 @@ export default function WindowsCameraDesktop() {
     void resolveProcessingMode().then(() => refreshHistory());
   }, [refreshHistory, resolveProcessingMode]);
 
+  const busy = ["looking", "copying", "processing"].includes(state);
+
+  const handlePlanClick = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    if (busy) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+    const point = { x, y };
+    if (!referencePoint || planPickMode === "start") {
+      setReferencePoint(point);
+      setDirectionPoint(null);
+      setPlanPickMode("direction");
+      setMessage("Укажите направление первого движения на плане.");
+      return;
+    }
+    setDirectionPoint(point);
+    setPlanPickMode("direction");
+    setMessage("Старт и направление заданы. Теперь можно загрузить видео с камеры.");
+  }, [busy, planPickMode, referencePoint]);
+
+  const resetPlanSelection = useCallback(() => {
+    if (busy) return;
+    setReferencePoint(null);
+    setDirectionPoint(null);
+    setPlanPickMode("start");
+    setMessage("Укажите стартовую точку на плане Kerama Marazzi.");
+  }, [busy]);
+
   const processImportedVideos = useCallback(async (videos: CameraImportedVideo[]) => {
     if (!videos.length) return;
     setState("processing");
@@ -158,7 +190,11 @@ export default function WindowsCameraDesktop() {
           true,
           video.original_filename || video.filename,
           undefined,
-          { floorplan_id: "kerama_marazzi_2025" },
+          {
+            floorplan_id: "kerama_marazzi_2025",
+            reference_point: referencePoint,
+            direction_point: directionPoint,
+          },
           CAMERA_OWNER,
           "r3",
           undefined,
@@ -195,7 +231,7 @@ export default function WindowsCameraDesktop() {
       setMessage(error instanceof Error ? error.message : "Не удалось выполнить анализ");
       await refreshHistory();
     }
-  }, [refreshHistory]);
+  }, [directionPoint, referencePoint, refreshHistory]);
 
   const enqueueImportedVideos = useCallback((videos: CameraImportedVideo[]) => {
     if (!videos.length) return;
@@ -233,6 +269,14 @@ export default function WindowsCameraDesktop() {
     if (!cameraImport) {
       setState("error");
       setMessage("Откройте это окно в приложении TrackAI для Windows.");
+      return;
+    }
+    if (!referencePoint || !directionPoint) {
+      setState("ready");
+      setMessage(!referencePoint
+        ? "Перед загрузкой укажите стартовую точку на плане."
+        : "Перед загрузкой укажите направление движения на плане.");
+      setPlanPickMode(referencePoint ? "direction" : "start");
       return;
     }
     setState("looking");
@@ -294,8 +338,8 @@ export default function WindowsCameraDesktop() {
     }
   };
 
-  const busy = ["looking", "copying", "processing"].includes(state);
   const buttonText = busy ? "Выполняется" : "Загрузить";
+  const canUpload = Boolean(referencePoint && directionPoint);
 
   return (
     <main className="min-h-[100dvh] bg-slate-50 text-slate-950">
@@ -321,10 +365,11 @@ export default function WindowsCameraDesktop() {
         <div className="flex min-h-[430px] flex-col justify-center">
           <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-teal-100 text-teal-800"><Camera className="h-6 w-6" /></div>
           <h1 className="text-4xl font-semibold tracking-tight">Видео с камеры</h1>
-          <p className="mt-3 max-w-sm leading-6 text-slate-600">Подключите экшен-камеру. TrackAI скопирует новые видео, обработает их и покажет маршрут на плане.</p>
-          <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-700 text-base font-semibold text-slate-50 hover:bg-teal-800 active:translate-y-px" disabled={busy} onClick={() => void handleUpload()}>
+          <p className="mt-3 max-w-sm leading-6 text-slate-600">Сначала укажите старт и направление на плане. Затем подключите экшен-камеру, TrackAI скопирует видео и покажет маршрут.</p>
+          <Button size="lg" className="mt-8 h-14 w-full gap-3 bg-teal-700 text-base font-semibold text-slate-50 hover:bg-teal-800 active:translate-y-px" disabled={busy || !canUpload} onClick={() => void handleUpload()}>
             {busy ? <Loader2 className="h-5 w-5 animate-spin" /> : <Upload className="h-5 w-5" />}{buttonText}
           </Button>
+          {!canUpload && <p className="mt-3 text-xs font-medium text-teal-800">Перед загрузкой задайте стартовую точку и направление движения на плане.</p>}
           {runtimeNotice && <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
             <p className="font-semibold">{runtimeNotice.title}</p>
             <p className="mt-1 leading-5">{runtimeNotice.detail}</p>
@@ -336,7 +381,59 @@ export default function WindowsCameraDesktop() {
           {progress && <p className="mt-2 text-xs text-teal-700">{Math.round(progress.percent)}% скопировано</p>}
         </div>
         <div className="min-h-[520px] overflow-hidden rounded-2xl border border-slate-200 bg-slate-100 p-2 shadow-sm shadow-slate-300/40">
-          {trajectories.length ? <TrajectoryMap trajectories={trajectories} stats={stats} floorPlan={FLOORPLAN_URL} compactMode /> : <div className="flex h-full min-h-[500px] items-center justify-center bg-slate-100 text-center text-sm text-slate-500">После обработки здесь появится траектория<br />на плане Kerama Marazzi</div>}
+          {trajectories.length ? <TrajectoryMap trajectories={trajectories} stats={stats} floorPlan={FLOORPLAN_URL} compactMode /> : (
+            <div className="flex h-full min-h-[500px] flex-col bg-white">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-950">План Kerama Marazzi</p>
+                  <p className="text-xs text-slate-500">{referencePoint ? "2. Укажите направление первого движения" : "1. Укажите стартовую точку"}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button type="button" size="sm" variant={planPickMode === "start" ? "default" : "outline"} disabled={busy} onClick={() => setPlanPickMode("start")}>Старт</Button>
+                  <Button type="button" size="sm" variant={planPickMode === "direction" ? "default" : "outline"} disabled={busy || !referencePoint} onClick={() => setPlanPickMode("direction")}>Направление</Button>
+                  <Button type="button" size="sm" variant="ghost" disabled={busy || (!referencePoint && !directionPoint)} onClick={resetPlanSelection}>Сбросить</Button>
+                </div>
+              </div>
+              <div className="relative flex-1 overflow-auto bg-slate-100 p-3">
+                <div className="relative mx-auto w-full max-w-[980px] cursor-crosshair overflow-hidden rounded-lg border border-slate-300 bg-white" onClick={handlePlanClick}>
+                  <img src={FLOORPLAN_URL} alt="План Kerama Marazzi" className="block w-full select-none" draggable={false} />
+                  {referencePoint && (
+                    <div
+                      className="pointer-events-none absolute h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white bg-amber-400 shadow"
+                      style={{ left: `${referencePoint.x}%`, top: `${referencePoint.y}%` }}
+                    >
+                      <span className="absolute left-6 top-1/2 -translate-y-1/2 rounded bg-slate-950 px-1.5 py-0.5 text-[10px] font-bold text-white">START</span>
+                    </div>
+                  )}
+                  {referencePoint && directionPoint && (
+                    <svg className="pointer-events-none absolute inset-0 h-full w-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+                      <defs>
+                        <marker id="desktop-direction-arrow" markerWidth="4" markerHeight="4" refX="3.6" refY="2" orient="auto">
+                          <path d="M0,0 L4,2 L0,4 Z" fill="#16a34a" />
+                        </marker>
+                      </defs>
+                      <line
+                        x1={referencePoint.x}
+                        y1={referencePoint.y}
+                        x2={directionPoint.x}
+                        y2={directionPoint.y}
+                        stroke="#16a34a"
+                        strokeWidth="0.8"
+                        strokeLinecap="round"
+                        markerEnd="url(#desktop-direction-arrow)"
+                      />
+                    </svg>
+                  )}
+                  {directionPoint && (
+                    <div
+                      className="pointer-events-none absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-green-600 shadow"
+                      style={{ left: `${directionPoint.x}%`, top: `${directionPoint.y}%` }}
+                    />
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </section>
     </main>
