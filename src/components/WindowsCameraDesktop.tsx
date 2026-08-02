@@ -6,7 +6,7 @@ import { getCameraImportAPI, type CameraImportedVideo, type CameraImportProgress
 import { Camera, ChevronDown, Download, History, Loader2, MapPinned, Upload } from "lucide-react";
 import { toast } from "sonner";
 
-const FLOORPLAN_URL = "/floorplans/kerama-marazzi-2025.png";
+const FLOORPLAN_URL = `${import.meta.env.BASE_URL}floorplans/kerama-marazzi-2025.png`;
 const CAMERA_OWNER = "Экшен-камера";
 
 type DesktopState = "ready" | "looking" | "copying" | "processing" | "done" | "needs_camera" | "error";
