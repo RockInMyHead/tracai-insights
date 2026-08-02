@@ -252,6 +252,7 @@ function createCameraImportService(options) {
     isEnabled,
     onStatus,
     onProgress,
+    onFileImported,
     onBatchComplete,
     onError,
     manualOnly = false,
@@ -347,6 +348,9 @@ function createCameraImportService(options) {
           sourcePath: file.path,
           volumeName: file.volumeName || null,
         });
+        if (typeof onFileImported === 'function') {
+          onFileImported(uploaded[uploaded.length - 1]);
+        }
       }
 
       if (typeof onBatchComplete === 'function' && uploaded.length > 0) {

@@ -72,6 +72,7 @@ export default function WindowsCameraDesktop() {
   const [stats, setStats] = useState<Record<string, unknown>>({});
   const [processingStatus, setProcessingStatus] = useState<ProcessingResolution | null>(null);
   const processingModeRef = useRef<ProcessingMode>("online");
+  const analysisQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const resolveProcessingMode = useCallback(async () => {
     const bridge = getDesktopBridge();
@@ -195,6 +196,13 @@ export default function WindowsCameraDesktop() {
     }
   }, [refreshHistory]);
 
+  const enqueueImportedVideos = useCallback((videos: CameraImportedVideo[]) => {
+    if (!videos.length) return;
+    analysisQueueRef.current = analysisQueueRef.current
+      .catch(() => undefined)
+      .then(() => processImportedVideos(videos));
+  }, [processImportedVideos]);
+
   useEffect(() => {
     if (!cameraImport) return;
     const unsubscribeProgress = cameraImport.onProgress((next) => {
@@ -202,8 +210,11 @@ export default function WindowsCameraDesktop() {
       setProgress(next);
       setMessage(`Копируем видео ${next.index + 1} из ${next.total}: ${next.fileName}`);
     });
-    const unsubscribeComplete = cameraImport.onComplete((videos) => {
-      void processImportedVideos(videos as CameraImportedVideo[]);
+    const unsubscribeFileImported = cameraImport.onFileImported((video) => {
+      enqueueImportedVideos([video as CameraImportedVideo]);
+    });
+    const unsubscribeComplete = cameraImport.onComplete(() => {
+      setProgress(null);
     });
     const unsubscribeError = cameraImport.onError((error) => {
       setState("error");
@@ -211,10 +222,11 @@ export default function WindowsCameraDesktop() {
     });
     return () => {
       unsubscribeProgress();
+      unsubscribeFileImported();
       unsubscribeComplete();
       unsubscribeError();
     };
-  }, [cameraImport, processImportedVideos]);
+  }, [cameraImport, enqueueImportedVideos]);
 
   const handleUpload = async () => {
     if (!cameraImport) {

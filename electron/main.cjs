@@ -43,6 +43,13 @@ function setupCameraImport() {
     isEnabled: () => cameraImportSettings.enabled,
     onStatus: (status) => broadcastToRenderer('camera-import:status', status),
     onProgress: (progress) => broadcastToRenderer('camera-import:progress', progress),
+    onFileImported: (uploaded) => {
+      desktopLogs?.log('info', 'camera-import:file-imported', {
+        video_id: uploaded.video_id,
+        filename: uploaded.original_filename || uploaded.filename,
+      });
+      broadcastToRenderer('camera-import:file-imported', uploaded);
+    },
     onBatchComplete: (uploaded) => {
       desktopLogs?.log('info', 'camera-import:batch-complete', { count: uploaded.length });
       broadcastToRenderer('camera-import:complete', uploaded);

@@ -43,6 +43,11 @@ contextBridge.exposeInMainWorld('trackai', {
       ipcRenderer.on('camera-import:progress', listener);
       return () => ipcRenderer.removeListener('camera-import:progress', listener);
     },
+    onFileImported: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on('camera-import:file-imported', listener);
+      return () => ipcRenderer.removeListener('camera-import:file-imported', listener);
+    },
     onComplete: (callback) => {
       const listener = (_event, payload) => callback(payload);
       ipcRenderer.on('camera-import:complete', listener);

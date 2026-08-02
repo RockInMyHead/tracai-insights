@@ -57,6 +57,7 @@ export interface TrackAICameraImportAPI {
   getStatus: () => Promise<CameraImportStatus>;
   onStatus: (callback: (status: CameraImportStatus) => void) => () => void;
   onProgress: (callback: (progress: CameraImportProgress) => void) => () => void;
+  onFileImported: (callback: (video: CameraImportedVideo) => void) => () => void;
   onComplete: (callback: (videos: CameraImportedVideo[]) => void) => () => void;
   onError: (callback: (error: { message: string }) => void) => () => void;
 }
