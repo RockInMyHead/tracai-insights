@@ -397,6 +397,16 @@ function createCameraImportService(options) {
     return { cancelled: true };
   };
 
+  const resetImportedState = () => {
+    const state = loadState();
+    const removed = state.imported.length;
+    saveState({ ...state, imported: [] });
+    currentStatus.pendingFiles = [];
+    currentStatus.lastError = null;
+    emitStatus();
+    return { reset: true, removed };
+  };
+
   const scanNow = async ({ forceImport = false } = {}) => {
     if (currentStatus.scanning) return currentStatus;
     currentStatus.scanning = true;
@@ -464,6 +474,7 @@ function createCameraImportService(options) {
     scanNow,
     importFiles,
     cancelImport,
+    resetImportedState,
     setEnabled,
     getStatus: () => ({ ...currentStatus }),
   };

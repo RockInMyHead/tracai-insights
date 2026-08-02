@@ -350,6 +350,19 @@ export default function WindowsCameraDesktop() {
     }
   };
 
+  const resetCameraImportMemory = async () => {
+    if (busy) return;
+    try {
+      const result = await cameraImport?.resetImportedState?.();
+      setProgress(null);
+      setState("ready");
+      setMessage(`Память камеры очищена. При следующей загрузке TrackAI снова начнет с первого видео${typeof result?.removed === "number" ? ` (${result.removed} записей сброшено)` : ""}.`);
+    } catch (error) {
+      setState("error");
+      setMessage(error instanceof Error ? error.message : "Не удалось сбросить память камеры");
+    }
+  };
+
   const buttonText = busy ? "Выполняется" : "Загрузить";
   const canUpload = Boolean(referencePoint && directionPoint);
   const canCancelImport = state === "copying" || (progress && state !== "processing");
@@ -384,6 +397,9 @@ export default function WindowsCameraDesktop() {
           </Button>
           {canCancelImport && <Button type="button" variant="outline" className="mt-3 h-11 w-full border-rose-300 bg-white text-rose-700 hover:bg-rose-50 hover:text-rose-800" onClick={() => void cancelCameraImport()}>
             Остановить выгрузку
+          </Button>}
+          {!busy && <Button type="button" variant="ghost" className="mt-2 h-10 w-full text-xs text-slate-600 hover:bg-slate-100 hover:text-slate-950" onClick={() => void resetCameraImportMemory()}>
+            Начать с первого видео
           </Button>}
           {!canUpload && <p className="mt-3 text-xs font-medium text-teal-800">Перед загрузкой задайте стартовую точку и направление движения на плане.</p>}
           {runtimeNotice && <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
