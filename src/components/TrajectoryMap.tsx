@@ -1498,34 +1498,6 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                     />
                   );
                 })}
-                {revisitLabelSegments.map((segment, index) => {
-                  const x = (segment.x1 + segment.x2) / 2;
-                  const y = (segment.y1 + segment.y2) / 2;
-                  return (
-                    <g key={`revisit-label-${index}`} pointerEvents="none">
-                      <rect
-                        x={x - 11}
-                        y={y - 8}
-                        width="22"
-                        height="15"
-                        rx="4"
-                        fill="rgba(88, 28, 135, 0.72)"
-                        stroke="rgba(255,255,255,0.78)"
-                        strokeWidth="1"
-                      />
-                      <text
-                        x={x}
-                        y={y + 3}
-                        textAnchor="middle"
-                        fontSize={floorPlan ? 9 : 8}
-                        fontWeight="700"
-                        fill="white"
-                      >
-                        ×{segment.count}
-                      </text>
-                    </g>
-                  );
-                })}
               </g>
             ) : (
               <g>
