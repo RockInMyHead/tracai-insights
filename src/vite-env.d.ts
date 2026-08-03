@@ -3,7 +3,7 @@
 interface TrackAICameraImportBridge {
   getSettings: () => Promise<{ enabled: boolean; ownerName: string }>;
   setSettings: (settings: Partial<{ enabled: boolean; ownerName: string }>) => Promise<{ enabled: boolean; ownerName: string }>;
-  scanNow: (options?: { forceImport?: boolean }) => Promise<unknown>;
+  scanNow: (options?: { forceImport?: boolean; ignoreImported?: boolean }) => Promise<unknown>;
   getStatus: () => Promise<unknown>;
   onStatus: (callback: (status: unknown) => void) => () => void;
   onProgress: (callback: (progress: unknown) => void) => () => void;

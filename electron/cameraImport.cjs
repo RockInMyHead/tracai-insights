@@ -282,12 +282,12 @@ function createCameraImportService(options) {
     }
   };
 
-  const getPendingFiles = (volumes, state) => {
+  const getPendingFiles = (volumes, state, { ignoreImported = false } = {}) => {
     const imported = new Set(state.imported);
     const pending = [];
     for (const volume of volumes) {
       for (const file of volume.files) {
-        if (!imported.has(file.fingerprint)) {
+        if (ignoreImported || !imported.has(file.fingerprint)) {
           pending.push({ ...file, volumeName: volume.name });
         }
       }
@@ -322,7 +322,7 @@ function createCameraImportService(options) {
         const file = files[index];
         if (typeof onProgress === 'function') {
           onProgress({
-            index,
+            index: index + 1,
             total: files.length,
             fileName: file.name,
             filePath: file.path,
@@ -340,7 +340,7 @@ function createCameraImportService(options) {
           onProgress: (percent) => {
             if (typeof onProgress === 'function') {
               onProgress({
-                index,
+                index: index + 1,
                 total: files.length,
                 fileName: file.name,
                 filePath: file.path,
@@ -407,7 +407,7 @@ function createCameraImportService(options) {
     return { reset: true, removed };
   };
 
-  const scanNow = async ({ forceImport = false } = {}) => {
+  const scanNow = async ({ forceImport = false, ignoreImported = false } = {}) => {
     if (currentStatus.scanning) return currentStatus;
     currentStatus.scanning = true;
     currentStatus.enabled = isEnabled();
@@ -416,7 +416,7 @@ function createCameraImportService(options) {
     try {
       const volumes = scanConnectedCameraVolumes();
       const state = loadState();
-      const pendingFiles = getPendingFiles(volumes, state);
+      const pendingFiles = getPendingFiles(volumes, state, { ignoreImported });
 
       currentStatus.volumes = volumes.map(({ files, ...rest }) => rest);
       currentStatus.pendingFiles = pendingFiles;

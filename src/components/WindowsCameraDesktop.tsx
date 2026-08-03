@@ -388,13 +388,13 @@ export default function WindowsCameraDesktop() {
     try {
       await resolveProcessingMode();
       await cameraImport.setSettings({ enabled: true, ownerName: CAMERA_OWNER });
-      const status = await cameraImport.scanNow({ forceImport: true });
+      const status = await cameraImport.scanNow({ forceImport: true, ignoreImported: true });
       if (!status.volumes?.length) {
         setState("needs_camera");
         setMessage("Камера не найдена. Подключите её по USB, разблокируйте накопитель и нажмите «Загрузить» ещё раз.");
       } else if (!status.pendingFiles?.length && !status.importing) {
         setState("ready");
-        setMessage("На подключённой камере нет новых видео.");
+        setMessage("На подключённой камере нет видео.");
       }
     } catch (error) {
       setState("error");
