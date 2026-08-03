@@ -388,6 +388,7 @@ export default function WindowsCameraDesktop() {
     try {
       await resolveProcessingMode();
       await cameraImport.setSettings({ enabled: true, ownerName: CAMERA_OWNER });
+      await cameraImport.resetImportedState();
       const status = await cameraImport.scanNow({ forceImport: true, ignoreImported: true });
       if (!status.volumes?.length) {
         setState("needs_camera");
