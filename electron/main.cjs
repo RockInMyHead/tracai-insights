@@ -13,7 +13,7 @@ const DESKTOP_APP_URL = `${APP_URL}/trajectory?desktop=1`;
 let mainWindow = null;
 let cameraImportService = null;
 let desktopLogs = null;
-let processingMode = 'local_cpu';
+let processingMode = 'online';
 let processingModeDetails = {};
 
 const cameraImportSettings = {
@@ -35,16 +35,11 @@ function setupCameraImport() {
         try {
           return await require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input });
         } catch (error) {
-          processingMode = 'local_cpu';
-          processingModeDetails = {
-            mode: processingMode,
-            label: 'Локально',
-            onlineUploadError: error instanceof Error ? error.message : String(error),
-          };
-          desktopLogs?.log('warn', 'camera-import:online-upload-fallback-local', {
+          desktopLogs?.log('error', 'camera-import:online-upload-failed', {
             fileName: input.fileName,
-            error: processingModeDetails.onlineUploadError,
+            error: error instanceof Error ? error.message : String(error),
           });
+          throw error;
         }
       }
       const copied = await localCpuTracker.copyToLocal(input);
@@ -98,6 +93,7 @@ function setupCameraImport() {
   ipcMain.handle('camera-import:scan-now', async (_event, options = {}) => {
     return cameraImportService.scanNow({
       forceImport: Boolean(options.forceImport),
+      ignoreImported: Boolean(options.ignoreImported),
     });
   });
 
@@ -123,28 +119,17 @@ function setupCameraImport() {
       });
       return processingModeDetails;
     }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    try {
-      const response = await fetch(`${APP_URL}/api/health`, { signal: controller.signal });
-      processingMode = response.ok ? 'online' : 'local_cpu';
-    } catch {
-      processingMode = 'local_cpu';
-    } finally {
-      clearTimeout(timer);
-    }
+    processingMode = 'online';
     processingModeDetails = {
       mode: processingMode,
-      label: 'Локально',
-      localGpuReason: gpu.reason,
-      localGpuDetails: {
-        reason: gpu.reason,
-        gpus: gpu.gpus,
-        minimumDriver: gpu.minimumDriver,
-        driverUrl: gpu.driverUrl,
-      },
+      label: 'Серверная GPU',
+      reason: 'server_gpu_fallback',
     };
-    desktopLogs?.log('info', 'processing:mode-resolved', processingModeDetails);
+    desktopLogs?.log('info', 'processing:mode-resolved', {
+      ...processingModeDetails,
+      localGpuReason: gpu.reason,
+      localGpuRoot: gpu.root,
+    });
     return processingModeDetails;
   });
   ipcMain.handle('local-gpu:process', async (_event, video) => {
