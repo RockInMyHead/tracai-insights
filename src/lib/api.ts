@@ -14,6 +14,36 @@ async function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise
   return globalThis.fetch(input, init);
 }
 
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function fetchWithTransientRetry(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  attempts: number = 4,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await agentFetch(input, init);
+      if (!RETRYABLE_HTTP_STATUSES.has(response.status) || attempt >= attempts) {
+        return response;
+      }
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) {
+        throw error;
+      }
+    }
+    await delay(Math.min(15000, 1000 * 2 ** (attempt - 1)));
+  }
+  throw lastError instanceof Error ? lastError : new Error("Сетевая ошибка");
+}
+
 function isDesktopClient(): boolean {
   if (typeof window === 'undefined') return false;
   const trackai = (window as unknown as { trackai?: { isDesktop?: boolean } }).trackai;
@@ -346,11 +376,11 @@ export class ApiClient {
       body.lingbot_mask_sky = false;
     }
 
-    const response = await agentFetch(`${this.baseUrl}/api/analyze-video-by-id`, {
+    const response = await fetchWithTransientRetry(`${this.baseUrl}/api/analyze-video-by-id`, {
       method: 'POST',
       headers: clientHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
-    });
+    }, isDesktopClient() ? 5 : 1);
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));

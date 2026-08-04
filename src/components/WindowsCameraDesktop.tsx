@@ -358,8 +358,13 @@ export default function WindowsCameraDesktop() {
       setProgress(null);
     });
     const unsubscribeError = cameraImport.onError((error) => {
+      const text = error.message || "Не удалось загрузить видео с камеры";
+      if (processingProgress.some((item) => item.status === "processing" || item.status === "queued")) {
+        toast.error(text);
+        return;
+      }
       setState("error");
-      setMessage(error.message || "Не удалось загрузить видео с камеры");
+      setMessage(text);
     });
     return () => {
       unsubscribeProgress();
@@ -367,7 +372,7 @@ export default function WindowsCameraDesktop() {
       unsubscribeComplete();
       unsubscribeError();
     };
-  }, [cameraImport, enqueueImportedVideos]);
+  }, [cameraImport, enqueueImportedVideos, processingProgress]);
 
   const handleUpload = async () => {
     if (!cameraImport) {
