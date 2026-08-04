@@ -387,6 +387,51 @@ export default function WindowsCameraDesktop() {
     };
   }, [cameraImport, enqueueImportedVideos, processingProgress]);
 
+  useEffect(() => {
+    if (!cameraImport) return;
+    let cancelled = false;
+    const syncServerProgress = async () => {
+      if (processingModeRef.current !== "online") return;
+      try {
+        const response = await apiClient.getUploadedVideosList();
+        if (cancelled) return;
+        const activeVideos = (response.videos || []).filter((video) => {
+          const status = String(video.status || "").toLowerCase();
+          const progressValue = Number(video.progress || 0);
+          const isDesktop = video.client_source === "desktop" || /VID\d+\.(avi|mp4|mov|mkv)$/i.test(video.original_filename || video.filename);
+          if (!isDesktop) return false;
+          return (
+            ["uploaded", "queued", "processing", "running", "gpu_processing", "error", "failed"].includes(status)
+            || (progressValue > 0 && progressValue < 100)
+          );
+        }).slice(0, 8);
+        activeVideos.forEach((video, index) => {
+          const progressValue = Number(video.progress || 0);
+          const status = String(video.status || "").toLowerCase();
+          upsertProcessingProgress({
+            videoId: video.video_id,
+            fileName: video.original_filename || video.filename,
+            index: index + 1,
+            total: activeVideos.length,
+            percent: Number.isFinite(progressValue) ? Math.max(0, Math.min(99, progressValue)) : 0,
+            status: ["error", "failed"].includes(status) ? "error" : status === "completed" ? "done" : "processing",
+            message: video.message || (status ? `Сервер: ${status}` : "Сервер обрабатывает"),
+          });
+        });
+      } catch {
+        // The import flow still reports hard errors; this poller is only a UI recovery path.
+      }
+    };
+    void syncServerProgress();
+    const timer = window.setInterval(() => {
+      void syncServerProgress();
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [cameraImport, upsertProcessingProgress]);
+
   const handleUpload = async () => {
     if (!cameraImport) {
       setState("error");

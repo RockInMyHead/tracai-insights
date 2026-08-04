@@ -221,11 +221,17 @@ export interface MapContext {
 export interface VideoListItem {
   video_id: string;
   filename: string;
+  original_filename?: string;
   uploaded_at: string;
   file_size: number;
   scale_factor: number;
   stabilized: boolean;
   has_analysis: boolean;
+  status?: string;
+  progress?: number;
+  message?: string;
+  client_source?: string | null;
+  updated_at?: string;
 }
 
 export interface Plan {

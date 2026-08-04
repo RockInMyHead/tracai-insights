@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body, Backgr
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 import os
 import shutil
 import tempfile
@@ -4080,11 +4080,29 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
 
         # ─── Буферизируем во временный файл ──────────────────────
         file_size = 0
-        with open(local_tmp, "wb") as tmp:
-            async for chunk in request.stream():
-                if chunk:
-                    tmp.write(chunk)
-                    file_size += len(chunk)
+        try:
+            with open(local_tmp, "wb") as tmp:
+                async for chunk in request.stream():
+                    if chunk:
+                        tmp.write(chunk)
+                        file_size += len(chunk)
+        except ClientDisconnect:
+            local_tmp.unlink(missing_ok=True)
+            processing_status[video_id] = {
+                "status": "error",
+                "progress": 0,
+                "message": "Выгрузка оборвалась: камера или приложение закрыли соединение",
+                "stage": "upload",
+            }
+            try:
+                _update_task_status(video_id, "error", 0)
+            except Exception as status_err:
+                logger.warning(f"[{video_id}] Failed to persist upload disconnect status: {status_err}")
+            logger.warning(f"[{video_id}] Upload disconnected after {file_size} bytes")
+            raise HTTPException(
+                status_code=499,
+                detail="Upload disconnected before the video file was fully received",
+            )
 
         if file_size == 0:
             local_tmp.unlink(missing_ok=True)
@@ -4948,6 +4966,7 @@ async def test_endpoint():
 async def get_uploaded_videos_list():
     """Список всех загруженных на сервер видео (для выбора перед анализом)"""
     videos = []
+    seen_ids = set()
     try:
         for f in VIDEOS_DIR.glob("*_*"):
             if f.is_file():
@@ -4964,10 +4983,67 @@ async def get_uploaded_videos_list():
                                 "file_size": stat.st_size,
                                 "scale_factor": 12.306,
                                 "stabilized": False,
-                                "has_analysis": False
+                                "has_analysis": _analysis_file_path(vid).is_file(),
                             })
+                            seen_ids.add(vid)
                         except Exception as e:
                             logger.warning(f"Error stat {f}: {e}")
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, video_filename, original_filename, employee_name, map_context,
+                       status, progress, created_at, updated_at
+                FROM tracking_tasks
+                WHERE updated_at >= datetime('now', '-12 hours')
+                   OR status IN ('registered','uploaded','queued','processing','running','gpu_processing')
+                ORDER BY updated_at DESC
+                LIMIT 200
+                """
+            ).fetchall()
+            conn.close()
+            by_id = {item["video_id"]: item for item in videos}
+            for row in rows:
+                vid = row["id"]
+                live = processing_status.get(vid) if isinstance(processing_status.get(vid), dict) else {}
+                status = str(live.get("status") or row["status"] or "")
+                progress_value = live.get("progress", row["progress"])
+                try:
+                    progress = int(float(progress_value or 0))
+                except Exception:
+                    progress = 0
+                try:
+                    map_context = json.loads(row["map_context"] or "{}")
+                except Exception:
+                    map_context = {}
+                existing = by_id.get(vid)
+                filename = row["video_filename"] or row["original_filename"] or f"{vid}_video.avi"
+                payload = existing or {
+                    "video_id": vid,
+                    "filename": filename,
+                    "uploaded_at": str(row["updated_at"] or row["created_at"] or ""),
+                    "file_size": 0,
+                    "scale_factor": 12.306,
+                    "stabilized": False,
+                    "has_analysis": _analysis_file_path(vid).is_file(),
+                }
+                payload.update({
+                    "original_filename": row["original_filename"] or filename,
+                    "employee_name": row["employee_name"],
+                    "status": status,
+                    "progress": progress,
+                    "message": live.get("message") or "",
+                    "client_source": map_context.get("client_source"),
+                    "updated_at": str(row["updated_at"] or ""),
+                })
+                if existing is None:
+                    videos.append(payload)
+                    by_id[vid] = payload
+                seen_ids.add(vid)
+        except Exception as db_err:
+            logger.warning(f"Error enriching uploaded videos from DB: {db_err}")
+        videos.sort(key=lambda item: str(item.get("updated_at") or item.get("uploaded_at") or ""), reverse=True)
         return {"success": True, "videos": videos}
     except Exception as e:
         logger.error(f"Error getting uploaded videos: {e}")
