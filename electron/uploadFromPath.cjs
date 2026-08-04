@@ -49,7 +49,7 @@ async function withUploadRetry(label, operation, { signal, attempts = 4 } = {}) 
   throw lastError;
 }
 
-async function initUpload(serverUrl, filename, employeeName, signal) {
+async function initUpload(serverUrl, filename, employeeName, signal, analysisContext = null) {
   const response = await fetch(`${serverUrl}/api/init-upload`, {
     method: 'POST',
     headers: {
@@ -60,6 +60,7 @@ async function initUpload(serverUrl, filename, employeeName, signal) {
       filename,
       employee_name: employeeName || null,
       client_source: 'camera_auto',
+      map_context: analysisContext || null,
     }),
     signal,
   });
@@ -123,19 +124,21 @@ async function uploadFileFromPath({
   employeeName,
   onProgress,
   signal,
+  analysisContext,
 }) {
   const filename = path.basename(filePath);
   const init = await withUploadRetry(
     'Init upload',
-    () => initUpload(serverUrl, filename, employeeName, signal),
+    () => initUpload(serverUrl, filename, employeeName, signal, analysisContext),
     { signal, attempts: 3 },
   );
-  await withUploadRetry(
+  const uploaded = await withUploadRetry(
     'Video upload',
     () => uploadVideoStream(serverUrl, init.video_id, filePath, onProgress, signal),
     { signal, attempts: 5 },
   );
   return {
+    ...uploaded,
     video_id: init.video_id,
     filename,
     original_filename: init.original_filename || filename,

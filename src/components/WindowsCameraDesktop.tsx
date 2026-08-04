@@ -255,22 +255,28 @@ export default function WindowsCameraDesktop() {
           });
           continue;
         }
-        const started = await apiClient.analyzeVideoById(
-          video.video_id,
-          12.306,
-          true,
-          video.original_filename || video.filename,
-          undefined,
-          {
-            floorplan_id: "kerama_marazzi_2025",
-            reference_point: referencePoint,
-            direction_point: directionPoint,
-          },
-          CAMERA_OWNER,
-          "r3",
-          undefined,
-          true,
-        );
+        const started = video.auto_analysis_started
+          ? {
+              status: "queued",
+              analysis_run_id: video.analysis_run_id,
+              data: undefined,
+            } as VideoAnalysisResult
+          : await apiClient.analyzeVideoById(
+              video.video_id,
+              12.306,
+              true,
+              video.original_filename || video.filename,
+              undefined,
+              {
+                floorplan_id: "kerama_marazzi_2025",
+                reference_point: referencePoint,
+                direction_point: directionPoint,
+              },
+              CAMERA_OWNER,
+              "r3",
+              undefined,
+              true,
+            );
         const expectedRunId = started.analysis_run_id;
         let result = started.data;
 
@@ -394,7 +400,18 @@ export default function WindowsCameraDesktop() {
       await resolveProcessingMode();
       await cameraImport.setSettings({ enabled: true, ownerName: CAMERA_OWNER });
       await cameraImport.resetImportedState();
-      const status = await cameraImport.scanNow({ forceImport: true, ignoreImported: true });
+      const status = await cameraImport.scanNow({
+        forceImport: true,
+        ignoreImported: true,
+        analysisContext: {
+          floorplan_id: "kerama_marazzi_2025",
+          reference_point: referencePoint,
+          direction_point: directionPoint,
+          employee_name: CAMERA_OWNER,
+          analysis_method: "r3",
+          scale_factor: 12.306,
+        },
+      });
       if (!status.volumes?.length) {
         setState("needs_camera");
         setMessage("Камера не найдена. Подключите её по USB, разблокируйте накопитель и нажмите «Загрузить» ещё раз.");

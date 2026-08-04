@@ -2,8 +2,8 @@ import { Link } from "react-router-dom";
 import { Activity, ArrowLeft, Download, Monitor, Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 
-const DISPLAY_VERSION = "1.18.7";
-const WIN_INSTALLER = "TrackAI-1.18.7-win-unpacked.zip";
+const DISPLAY_VERSION = "1.18.8";
+const WIN_INSTALLER = "TrackAI-1.18.8-win-unpacked.zip";
 const MAC_INSTALLER = "TrackAI-1.18.1.dmg";
 
 const DownloadPage = () => {

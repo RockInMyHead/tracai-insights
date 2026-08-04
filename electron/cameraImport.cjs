@@ -295,7 +295,7 @@ function createCameraImportService(options) {
     return pending;
   };
 
-  const importFiles = async (files, ownerName) => {
+  const importFiles = async (files, ownerName, analysisContext = null) => {
     if (!files.length || importInProgress) return [];
     if (!ownerName?.trim()) {
       const error = new Error('Укажите имя сотрудника для автоимпорта с камеры');
@@ -336,6 +336,7 @@ function createCameraImportService(options) {
           filePath: file.path,
           fileName: file.name,
           employeeName: ownerName.trim(),
+          analysisContext,
           signal: importAbortController.signal,
           onProgress: (percent) => {
             if (typeof onProgress === 'function') {
@@ -407,7 +408,7 @@ function createCameraImportService(options) {
     return { reset: true, removed };
   };
 
-  const scanNow = async ({ forceImport = false, ignoreImported = false } = {}) => {
+  const scanNow = async ({ forceImport = false, ignoreImported = false, analysisContext = null } = {}) => {
     if (currentStatus.scanning) return currentStatus;
     currentStatus.scanning = true;
     currentStatus.enabled = isEnabled();
@@ -426,7 +427,7 @@ function createCameraImportService(options) {
       if (isEnabled() && pendingFiles.length > 0 && (forceImport || !importInProgress)) {
         const ownerName = getOwnerName();
         if (ownerName?.trim()) {
-          await importFiles(pendingFiles, ownerName);
+          await importFiles(pendingFiles, ownerName, analysisContext);
         }
       }
 

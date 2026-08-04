@@ -94,6 +94,9 @@ function setupCameraImport() {
     return cameraImportService.scanNow({
       forceImport: Boolean(options.forceImport),
       ignoreImported: Boolean(options.ignoreImported),
+      analysisContext: options.analysisContext && typeof options.analysisContext === 'object'
+        ? options.analysisContext
+        : null,
     });
   });
 

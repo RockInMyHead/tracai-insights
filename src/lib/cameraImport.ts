@@ -43,6 +43,8 @@ export interface CameraImportedVideo {
   sourcePath: string;
   volumeName: string | null;
   localPath?: string;
+  auto_analysis_started?: boolean;
+  analysis_run_id?: string;
 }
 
 export interface CameraImportSettings {
@@ -53,7 +55,7 @@ export interface CameraImportSettings {
 export interface TrackAICameraImportAPI {
   getSettings: () => Promise<CameraImportSettings>;
   setSettings: (settings: Partial<CameraImportSettings>) => Promise<CameraImportSettings>;
-  scanNow: (options?: { forceImport?: boolean; ignoreImported?: boolean }) => Promise<CameraImportStatus>;
+  scanNow: (options?: { forceImport?: boolean; ignoreImported?: boolean; analysisContext?: Record<string, unknown> }) => Promise<CameraImportStatus>;
   cancel: () => Promise<{ cancelled: boolean }>;
   resetImportedState: () => Promise<{ reset: boolean; removed: number }>;
   getStatus: () => Promise<CameraImportStatus>;

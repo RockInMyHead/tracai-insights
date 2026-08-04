@@ -4006,7 +4006,10 @@ async def init_upload(request: Request) -> Dict[str, Any]:
         # Регистрируем
         UPLOADED_VIDEOS[video_id] = video_filename
 
-        map_context = {"client_source": client_source} if client_source else {}
+        provided_map_context = body.get("map_context")
+        map_context = provided_map_context if isinstance(provided_map_context, dict) else {}
+        if client_source:
+            map_context["client_source"] = client_source
 
         # Создаём задачу в tracking_tasks
         try:
@@ -4133,20 +4136,50 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
                 send_desktop_upload_notification(video_id, original_filename, file_size, gpu_url, upload_source)
             )
 
+        should_auto_start_r3 = (
+            is_desktop_upload
+            and isinstance(map_context.get("reference_point"), dict)
+            and isinstance(map_context.get("direction_point"), dict)
+        )
         if is_desktop_upload:
             # Desktop starts the explicit R3 analysis after upload. Avoid the legacy
             # auto-run here: it competes for the same GPU job/status and can leave
             # the client stuck at the first processing stage.
-            processing_status[video_id] = {
-                "status": "uploaded",
-                "progress": 0,
-                "message": "Видео загружено, ожидает запуска R3",
-                "start_time": time.time(),
-                "stage": "queued",
-                "suppress_disk_completion": True,
-            }
-            _update_task_status(video_id, "uploaded", 0)
-            logger.info(f"[{video_id}] Desktop upload completed; waiting for explicit R3 analysis")
+            if should_auto_start_r3:
+                processing_status[video_id] = {
+                    "status": "queued",
+                    "progress": 2,
+                    "message": "Видео загружено, R3 поставлен в очередь",
+                    "start_time": time.time(),
+                    "stage": "queued",
+                    "suppress_disk_completion": True,
+                }
+                _update_task_status(video_id, "processing", 2)
+                logger.info(f"[{video_id}] Desktop upload completed; auto-starting R3 analysis")
+                _schedule_r3_process_background(
+                    background_tasks,
+                    video_id,
+                    None,
+                    original_filename,
+                    float(map_context.get("scale_factor") or 12.306),
+                    3,
+                    2000,
+                    "r3_long.safetensors",
+                    392,
+                    "strided",
+                    map_context,
+                )
+            else:
+                processing_status[video_id] = {
+                    "status": "uploaded",
+                    "progress": 0,
+                    "message": "Видео загружено, ожидает запуска R3",
+                    "start_time": time.time(),
+                    "stage": "queued",
+                    "suppress_disk_completion": True,
+                }
+                _update_task_status(video_id, "uploaded", 0)
+                logger.info(f"[{video_id}] Desktop upload completed; waiting for explicit R3 analysis")
         else:
             # Запускаем SLAM обработку (с video_path=None — use_uploaded на GPU)
             logger.info(f"[{video_id}] Starting GPU processing")
@@ -4170,6 +4203,7 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
             "filename": video_info,
             "original_filename": original_filename,
             "file_size": file_size,
+            "auto_analysis_started": should_auto_start_r3,
             "message": "Видео загружено на GPU-сервер" if is_desktop_upload else "Видео отправлено на обработку на GPU-сервер"
         }
     except HTTPException:
