@@ -748,7 +748,7 @@ export class ApiClient {
     suppress_disk_completion?: boolean;
     result?: VideoAnalysisResult["data"];
   }> {
-    const response = await agentFetch(`${this.baseUrl}/api/status/${videoId}`);
+    const response = await agentFetch(`${this.baseUrl}/api/processing-status/${videoId}`);
     if (!response.ok) {
       // If status endpoint returns 404 or other error, return default unknown status
       return { status: "unknown", progress: 0, message: "Status not available" };
