@@ -2,6 +2,53 @@ const fs = require('fs');
 const path = require('path');
 const { Readable } = require('stream');
 
+const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason || new Error('Upload cancelled'));
+    };
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function isRetryableUploadError(error) {
+  if (!error || error.name === 'AbortError') {
+    return false;
+  }
+  const message = String(error.message || error);
+  const statusMatch = message.match(/\((\d{3})\)/);
+  if (statusMatch && RETRYABLE_STATUSES.has(Number(statusMatch[1]))) {
+    return true;
+  }
+  return /fetch failed|network|socket|ECONNRESET|ETIMEDOUT|EPIPE|UND_ERR/i.test(message);
+}
+
+async function withUploadRetry(label, operation, { signal, attempts = 4 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted || attempt >= attempts || !isRetryableUploadError(error)) {
+        throw error;
+      }
+      const delayMs = Math.min(15000, 1000 * 2 ** (attempt - 1));
+      console.warn(`${label} failed, retrying in ${delayMs}ms (${attempt}/${attempts})`, error?.message || error);
+      await sleep(delayMs, signal);
+    }
+  }
+  throw lastError;
+}
+
 async function initUpload(serverUrl, filename, employeeName, signal) {
   const response = await fetch(`${serverUrl}/api/init-upload`, {
     method: 'POST',
@@ -45,18 +92,22 @@ async function uploadVideoStream(serverUrl, videoId, filePath, onProgress, signa
   });
 
   const webStream = Readable.toWeb(nodeStream);
-  const response = await fetch(`${serverUrl}/api/upload-video/${videoId}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Length': String(totalBytes),
-      'X-TrackAI-Client': 'desktop',
-    },
-    body: webStream,
-    duplex: 'half',
-    signal,
-  });
-  signal?.removeEventListener('abort', abort);
+  let response;
+  try {
+    response = await fetch(`${serverUrl}/api/upload-video/${videoId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(totalBytes),
+        'X-TrackAI-Client': 'desktop',
+      },
+      body: webStream,
+      duplex: 'half',
+      signal,
+    });
+  } finally {
+    signal?.removeEventListener('abort', abort);
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -74,8 +125,16 @@ async function uploadFileFromPath({
   signal,
 }) {
   const filename = path.basename(filePath);
-  const init = await initUpload(serverUrl, filename, employeeName, signal);
-  await uploadVideoStream(serverUrl, init.video_id, filePath, onProgress, signal);
+  const init = await withUploadRetry(
+    'Init upload',
+    () => initUpload(serverUrl, filename, employeeName, signal),
+    { signal, attempts: 3 },
+  );
+  await withUploadRetry(
+    'Video upload',
+    () => uploadVideoStream(serverUrl, init.video_id, filePath, onProgress, signal),
+    { signal, attempts: 5 },
+  );
   return {
     video_id: init.video_id,
     filename,

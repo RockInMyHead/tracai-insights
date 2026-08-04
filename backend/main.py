@@ -4133,15 +4133,30 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
                 send_desktop_upload_notification(video_id, original_filename, file_size, gpu_url, upload_source)
             )
 
-        # Запускаем SLAM обработку (с video_path=None — use_uploaded на GPU)
-        logger.info(f"[{video_id}] Starting GPU processing")
-        _schedule_process_video_background(
-            background_tasks,
-            video_id,
-            None,
-            original_filename,
-            12.306, True, 3, 3, True, None,
-        )
+        if is_desktop_upload:
+            # Desktop starts the explicit R3 analysis after upload. Avoid the legacy
+            # auto-run here: it competes for the same GPU job/status and can leave
+            # the client stuck at the first processing stage.
+            processing_status[video_id] = {
+                "status": "uploaded",
+                "progress": 0,
+                "message": "Видео загружено, ожидает запуска R3",
+                "start_time": time.time(),
+                "stage": "queued",
+                "suppress_disk_completion": True,
+            }
+            _update_task_status(video_id, "uploaded", 0)
+            logger.info(f"[{video_id}] Desktop upload completed; waiting for explicit R3 analysis")
+        else:
+            # Запускаем SLAM обработку (с video_path=None — use_uploaded на GPU)
+            logger.info(f"[{video_id}] Starting GPU processing")
+            _schedule_process_video_background(
+                background_tasks,
+                video_id,
+                None,
+                original_filename,
+                12.306, True, 3, 3, True, None,
+            )
 
         # Notify subscribers
         if background_tasks is not None:
@@ -4155,7 +4170,7 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
             "filename": video_info,
             "original_filename": original_filename,
             "file_size": file_size,
-            "message": "Видео отправлено на обработку на GPU-сервер"
+            "message": "Видео загружено на GPU-сервер" if is_desktop_upload else "Видео отправлено на обработку на GPU-сервер"
         }
     except HTTPException:
         raise

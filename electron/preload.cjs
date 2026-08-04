@@ -7,7 +7,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
 contextBridge.exposeInMainWorld('trackai', {
   isDesktop: true,
-  version: process.env.npm_package_version || '1.18.5',
+  version: process.env.npm_package_version || '1.18.6',
   serverUrl: 'http://93.189.231.189',
   processing: {
     resolveMode: () => ipcRenderer.invoke('processing:resolve-mode'),
