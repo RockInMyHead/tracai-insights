@@ -87,6 +87,7 @@ export default function WindowsCameraDesktop() {
   const [planPickMode, setPlanPickMode] = useState<"start" | "direction">("start");
   const processingModeRef = useRef<ProcessingMode>("online");
   const analysisQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const enqueuedVideoIdsRef = useRef<Set<string>>(new Set());
 
   const upsertProcessingProgress = useCallback((next: VideoProcessingProgress) => {
     setProcessingProgress((current) => {
@@ -344,10 +345,15 @@ export default function WindowsCameraDesktop() {
   }, [directionPoint, referencePoint, refreshHistory, upsertProcessingProgress]);
 
   const enqueueImportedVideos = useCallback((videos: CameraImportedVideo[]) => {
-    if (!videos.length) return;
+    const freshVideos = videos.filter((video) => {
+      if (enqueuedVideoIdsRef.current.has(video.video_id)) return false;
+      enqueuedVideoIdsRef.current.add(video.video_id);
+      return true;
+    });
+    if (!freshVideos.length) return;
     analysisQueueRef.current = analysisQueueRef.current
       .catch(() => undefined)
-      .then(() => processImportedVideos(videos));
+      .then(() => processImportedVideos(freshVideos));
   }, [processImportedVideos]);
 
   useEffect(() => {
@@ -360,8 +366,9 @@ export default function WindowsCameraDesktop() {
     const unsubscribeFileImported = cameraImport.onFileImported((video) => {
       enqueueImportedVideos([video as CameraImportedVideo]);
     });
-    const unsubscribeComplete = cameraImport.onComplete(() => {
+    const unsubscribeComplete = cameraImport.onComplete((videos) => {
       setProgress(null);
+      enqueueImportedVideos((videos || []) as CameraImportedVideo[]);
     });
     const unsubscribeError = cameraImport.onError((error) => {
       const text = error.message || "Не удалось загрузить видео с камеры";

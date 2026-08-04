@@ -4048,6 +4048,24 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
     try:
         video_info = UPLOADED_VIDEOS.get(video_id)
         if not video_info:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT video_filename, original_filename FROM tracking_tasks WHERE id = ?",
+                    (video_id,),
+                ).fetchone()
+                conn.close()
+                if row:
+                    video_filename, original_filename = row
+                    video_info = video_filename or (
+                        f"{video_id}_{original_filename}" if original_filename else None
+                    )
+                    if video_info:
+                        UPLOADED_VIDEOS[video_id] = video_info
+                        logger.info(f"[{video_id}] Restored upload registration from DB: {video_info}")
+            except Exception as restore_err:
+                logger.warning(f"[{video_id}] Failed to restore upload registration from DB: {restore_err}")
+        if not video_info:
             raise HTTPException(status_code=404, detail=f"Video {video_id} not registered")
         
         original_filename = video_info[len(video_id)+1:] if '_' in video_info else "video.avi"
