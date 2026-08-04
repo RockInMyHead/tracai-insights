@@ -3550,13 +3550,22 @@ async def process_video_background(
         logger.info(f"[{video_id}] GPU Worker completed in {processing_time}s")
 
         # ─── Сохраняем результат (общая часть) ─────────────────────
+        saved_video_path = video_path if video_path and video_path.exists() else _find_uploaded_video_path(video_id)
+        saved_video_filename = (
+            saved_video_path.name
+            if saved_video_path and saved_video_path.exists()
+            else f"{video_id}_{original_filename}"
+        )
+        uploaded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        if saved_video_path and saved_video_path.exists():
+            uploaded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(saved_video_path.stat().st_mtime))
         analysis_data = {
             "video_id": video_id,
-            "video_filename": video_path.name,
+            "video_filename": saved_video_filename,
             "original_filename": original_filename,
             "scale_factor": scale_factor,
             "stabilized": stabilize,
-            "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(video_path.stat().st_mtime)),
+            "uploaded_at": uploaded_at,
             "analysis_result": result
         }
 
