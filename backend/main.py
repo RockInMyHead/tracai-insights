@@ -4916,6 +4916,11 @@ async def get_processing_status(video_id: str):
         return payload
     raise HTTPException(status_code=404, detail="Video processing not found")
 
+@app.get("/api/status/{video_id}")
+async def get_processing_status_compat(video_id: str):
+    """Backward-compatible status endpoint used by older desktop builds."""
+    return await get_processing_status(video_id)
+
 @app.get("/api/test")
 async def test_endpoint():
     """Test endpoint"""
