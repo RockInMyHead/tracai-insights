@@ -27,6 +27,27 @@ function getDesktopBridge() {
   return (window as unknown as { trackai?: Window["trackai"] }).trackai;
 }
 
+async function getDesktopUploadedVideosList() {
+  const bridge = getDesktopBridge();
+  const fromMain = await bridge?.desktopApi?.getUploadedVideos?.();
+  if (fromMain) return fromMain as Awaited<ReturnType<typeof apiClient.getUploadedVideosList>>;
+  return apiClient.getUploadedVideosList();
+}
+
+async function getDesktopVideoAnalysis(videoId: string) {
+  const bridge = getDesktopBridge();
+  const fromMain = await bridge?.desktopApi?.getVideoAnalysis?.(videoId);
+  if (fromMain) return fromMain as VideoAnalysisResult;
+  return apiClient.getVideoAnalysis(videoId);
+}
+
+async function getDesktopProcessingStatus(videoId: string) {
+  const bridge = getDesktopBridge();
+  const fromMain = await bridge?.desktopApi?.getProcessingStatus?.(videoId);
+  if (fromMain) return fromMain as Awaited<ReturnType<typeof apiClient.getProcessingStatus>>;
+  return apiClient.getProcessingStatus(videoId);
+}
+
 function getDesktopTrajectory(data: VideoAnalysisResult["data"], videoId: string): TrajectoryData[] {
   if (!data) return [];
   const graphFirst = data.graph_first_trajectory?.length
@@ -102,10 +123,11 @@ export default function WindowsCameraDesktop() {
     if (hydratedVideoIdsRef.current.has(videoId)) return;
     hydratedVideoIdsRef.current.add(videoId);
     try {
-      const analysis = await apiClient.getVideoAnalysis(videoId);
+      const analysis = await getDesktopVideoAnalysis(videoId);
       const nextTrajectory = getDesktopTrajectory(analysis.data, videoId);
       if (!nextTrajectory.length) {
         hydratedVideoIdsRef.current.delete(videoId);
+        setMessage("Готовый анализ найден, но сервер не вернул точки траектории для карты.");
         return;
       }
       setTrajectories((current) => (
@@ -166,7 +188,7 @@ export default function WindowsCameraDesktop() {
           : await getDesktopBridge()?.localCpu?.history?.();
         setHistory((items || []) as VideoListItem[]);
       } else {
-        const response = await apiClient.getUploadedVideosList();
+        const response = await getDesktopUploadedVideosList();
         const videos = response.videos || [];
         setHistory(videos);
         videos
@@ -323,7 +345,7 @@ export default function WindowsCameraDesktop() {
             message: "Ждет сервер",
           });
           for (let attempt = 0; attempt < 1800; attempt += 1) {
-            const status = await apiClient.getProcessingStatus(video.video_id);
+            const status = await getDesktopProcessingStatus(video.video_id);
             setMessage(status.message || `Обрабатываем ${index + 1} из ${videos.length}`);
             const percent = Number((status as { progress?: unknown }).progress);
             if (["registered", "uploading"].includes(String(status.status || "").toLowerCase())) {
@@ -354,7 +376,7 @@ export default function WindowsCameraDesktop() {
             }
             const sameRun = !expectedRunId || !status.analysis_run_id || status.analysis_run_id === expectedRunId;
             if (sameRun && ["completed", "done", "success"].includes(status.status)) {
-              result = status.result || (await apiClient.getVideoAnalysis(video.video_id)).data;
+              result = status.result || (await getDesktopVideoAnalysis(video.video_id)).data;
               break;
             }
             await new Promise((resolve) => window.setTimeout(resolve, 2000));
@@ -438,7 +460,7 @@ export default function WindowsCameraDesktop() {
     const syncServerProgress = async () => {
       if (processingModeRef.current !== "online") return;
       try {
-        const response = await apiClient.getUploadedVideosList();
+        const response = await getDesktopUploadedVideosList();
         if (cancelled) return;
         const activeVideos = (response.videos || []).filter((video) => {
           const status = String(video.status || "").toLowerCase();
@@ -544,7 +566,7 @@ export default function WindowsCameraDesktop() {
         ? processingModeRef.current === "local_gpu"
           ? await getDesktopBridge()?.localGpu?.analysis(video.video_id) as { data?: VideoAnalysisResult["data"] }
           : await getDesktopBridge()?.localCpu?.analysis(video.video_id) as { data?: VideoAnalysisResult["data"] }
-        : await apiClient.getVideoAnalysis(video.video_id);
+        : await getDesktopVideoAnalysis(video.video_id);
       if (!result) throw new Error("Результат анализа не найден");
       const next = getDesktopTrajectory(result.data, video.video_id);
       if (!next.length) throw new Error("Для этого видео ещё нет готовой траектории");

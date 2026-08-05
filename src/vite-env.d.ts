@@ -3,10 +3,13 @@
 interface TrackAICameraImportBridge {
   getSettings: () => Promise<{ enabled: boolean; ownerName: string }>;
   setSettings: (settings: Partial<{ enabled: boolean; ownerName: string }>) => Promise<{ enabled: boolean; ownerName: string }>;
-  scanNow: (options?: { forceImport?: boolean; ignoreImported?: boolean }) => Promise<unknown>;
+  scanNow: (options?: { forceImport?: boolean; ignoreImported?: boolean; analysisContext?: Record<string, unknown> }) => Promise<unknown>;
+  cancel: () => Promise<{ cancelled: boolean }>;
+  resetImportedState: () => Promise<{ reset: boolean; removed: number }>;
   getStatus: () => Promise<unknown>;
   onStatus: (callback: (status: unknown) => void) => () => void;
   onProgress: (callback: (progress: unknown) => void) => () => void;
+  onFileImported: (callback: (video: unknown) => void) => () => void;
   onComplete: (callback: (videos: unknown[]) => void) => () => void;
   onError: (callback: (error: { message: string }) => void) => () => void;
 }
@@ -52,6 +55,11 @@ interface TrackAIWindowBridge {
       fileCount?: number;
       archiveBytes?: number;
     }>;
+  };
+  desktopApi?: {
+    getUploadedVideos: () => Promise<unknown>;
+    getVideoAnalysis: (videoId: string) => Promise<unknown>;
+    getProcessingStatus: (videoId: string) => Promise<unknown>;
   };
   localCpu?: {
     process: (video: unknown) => Promise<unknown>;

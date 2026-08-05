@@ -15,6 +15,11 @@ contextBridge.exposeInMainWorld('trackai', {
   logs: {
     download: () => ipcRenderer.invoke('logs:download'),
   },
+  desktopApi: {
+    getUploadedVideos: () => ipcRenderer.invoke('desktop-api:get-uploaded-videos'),
+    getVideoAnalysis: (videoId) => ipcRenderer.invoke('desktop-api:get-video-analysis', videoId),
+    getProcessingStatus: (videoId) => ipcRenderer.invoke('desktop-api:get-processing-status', videoId),
+  },
   localCpu: {
     process: (video) => ipcRenderer.invoke('local-cpu:process', video),
     history: () => ipcRenderer.invoke('local-cpu:history'),

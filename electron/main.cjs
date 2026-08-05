@@ -27,6 +27,19 @@ function broadcastToRenderer(channel, payload) {
   }
 }
 
+async function fetchDesktopJson(pathname) {
+  const response = await fetch(`${APP_URL}${pathname}`, {
+    headers: {
+      'X-TrackAI-Client': 'desktop',
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Desktop API failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  return response.json();
+}
+
 function setupCameraImport() {
   cameraImportService = createCameraImportService({
     serverUrl: APP_URL,
@@ -103,6 +116,15 @@ function setupCameraImport() {
   ipcMain.handle('camera-import:get-status', () => cameraImportService.getStatus());
   ipcMain.handle('camera-import:cancel', () => cameraImportService.cancelImport());
   ipcMain.handle('camera-import:reset-imported-state', () => cameraImportService.resetImportedState());
+  ipcMain.handle('desktop-api:get-uploaded-videos', async () => {
+    return fetchDesktopJson('/api/uploaded-videos');
+  });
+  ipcMain.handle('desktop-api:get-video-analysis', async (_event, videoId) => {
+    return fetchDesktopJson(`/api/video/${encodeURIComponent(String(videoId))}`);
+  });
+  ipcMain.handle('desktop-api:get-processing-status', async (_event, videoId) => {
+    return fetchDesktopJson(`/api/processing-status/${encodeURIComponent(String(videoId))}`);
+  });
 
   ipcMain.handle('processing:resolve-mode', async () => {
     const gpu = await localGpuRuntime.start((level, event, data) => desktopLogs?.log(level, event, data));
