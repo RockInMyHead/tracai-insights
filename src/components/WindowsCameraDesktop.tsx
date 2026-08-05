@@ -98,6 +98,29 @@ export default function WindowsCameraDesktop() {
     });
   }, []);
 
+  const hydrateCompletedVideo = useCallback(async (videoId: string) => {
+    if (hydratedVideoIdsRef.current.has(videoId)) return;
+    hydratedVideoIdsRef.current.add(videoId);
+    try {
+      const analysis = await apiClient.getVideoAnalysis(videoId);
+      const nextTrajectory = getDesktopTrajectory(analysis.data, videoId);
+      if (!nextTrajectory.length) {
+        hydratedVideoIdsRef.current.delete(videoId);
+        return;
+      }
+      setTrajectories((current) => (
+        current.some((item) => item.videoId === videoId)
+          ? current
+          : [...current, ...nextTrajectory]
+      ));
+      setStats((analysis.data?.processing_stats || {}) as Record<string, unknown>);
+      setState("done");
+      setMessage("Готово. Траектория показана на плане Kerama Marazzi.");
+    } catch {
+      hydratedVideoIdsRef.current.delete(videoId);
+    }
+  }, []);
+
   const resolveProcessingMode = useCallback(async () => {
     const bridge = getDesktopBridge();
     const next = await bridge?.processing?.resolveMode?.();
@@ -144,12 +167,19 @@ export default function WindowsCameraDesktop() {
         setHistory((items || []) as VideoListItem[]);
       } else {
         const response = await apiClient.getUploadedVideosList();
-        setHistory(response.videos || []);
+        const videos = response.videos || [];
+        setHistory(videos);
+        videos
+          .filter((video) => ["completed", "done", "success"].includes(String(video.status || "").toLowerCase()))
+          .slice(0, 6)
+          .forEach((video) => {
+            void hydrateCompletedVideo(video.video_id);
+          });
       }
     } catch {
       setHistory([]);
     }
-  }, []);
+  }, [hydrateCompletedVideo]);
 
   useEffect(() => {
     void resolveProcessingMode().then(() => refreshHistory());
@@ -445,25 +475,8 @@ export default function WindowsCameraDesktop() {
             status: ["error", "failed"].includes(status) ? "error" : ["completed", "done", "success"].includes(status) ? "done" : "processing",
             message: video.message || (status ? `Сервер: ${status}` : "Сервер обрабатывает"),
           });
-          if (["completed", "done", "success"].includes(status) && !hydratedVideoIdsRef.current.has(video.video_id)) {
-            hydratedVideoIdsRef.current.add(video.video_id);
-            void apiClient.getVideoAnalysis(video.video_id)
-              .then((analysis) => {
-                if (cancelled) return;
-                const nextTrajectory = getDesktopTrajectory(analysis.data, video.video_id);
-                if (!nextTrajectory.length) return;
-                setTrajectories((current) => (
-                  current.some((item) => item.videoId === video.video_id)
-                    ? current
-                    : [...current, ...nextTrajectory]
-                ));
-                setStats((analysis.data?.processing_stats || {}) as Record<string, unknown>);
-                setState("done");
-                setMessage("Готово. Траектория показана на плане Kerama Marazzi.");
-              })
-              .catch(() => {
-                hydratedVideoIdsRef.current.delete(video.video_id);
-              });
+          if (["completed", "done", "success"].includes(status) && !cancelled) {
+            void hydrateCompletedVideo(video.video_id);
           }
         });
       } catch {
@@ -478,7 +491,7 @@ export default function WindowsCameraDesktop() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [cameraImport, upsertProcessingProgress]);
+  }, [cameraImport, hydrateCompletedVideo, upsertProcessingProgress]);
 
   const handleUpload = async () => {
     if (!cameraImport) {
