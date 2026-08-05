@@ -88,6 +88,7 @@ export default function WindowsCameraDesktop() {
   const processingModeRef = useRef<ProcessingMode>("online");
   const analysisQueueRef = useRef<Promise<void>>(Promise.resolve());
   const enqueuedVideoIdsRef = useRef<Set<string>>(new Set());
+  const hydratedVideoIdsRef = useRef<Set<string>>(new Set());
 
   const upsertProcessingProgress = useCallback((next: VideoProcessingProgress) => {
     setProcessingProgress((current) => {
@@ -415,7 +416,7 @@ export default function WindowsCameraDesktop() {
           const isDesktop = video.client_source === "desktop" || /VID\d+\.(avi|mp4|mov|mkv)$/i.test(video.original_filename || video.filename);
           if (!isDesktop) return false;
           return (
-            ["registered", "uploading", "uploaded", "queued", "processing", "running", "gpu_processing", "error", "failed"].includes(status)
+            ["registered", "uploading", "uploaded", "queued", "processing", "running", "gpu_processing", "completed", "done", "success", "error", "failed"].includes(status)
             || (progressValue > 0 && progressValue < 100)
           );
         }).slice(0, 8);
@@ -441,9 +442,29 @@ export default function WindowsCameraDesktop() {
             index: index + 1,
             total: activeVideos.length,
             percent: Number.isFinite(progressValue) ? Math.max(0, Math.min(99, progressValue)) : 0,
-            status: ["error", "failed"].includes(status) ? "error" : status === "completed" ? "done" : "processing",
+            status: ["error", "failed"].includes(status) ? "error" : ["completed", "done", "success"].includes(status) ? "done" : "processing",
             message: video.message || (status ? `Сервер: ${status}` : "Сервер обрабатывает"),
           });
+          if (["completed", "done", "success"].includes(status) && !hydratedVideoIdsRef.current.has(video.video_id)) {
+            hydratedVideoIdsRef.current.add(video.video_id);
+            void apiClient.getVideoAnalysis(video.video_id)
+              .then((analysis) => {
+                if (cancelled) return;
+                const nextTrajectory = getDesktopTrajectory(analysis.data, video.video_id);
+                if (!nextTrajectory.length) return;
+                setTrajectories((current) => (
+                  current.some((item) => item.videoId === video.video_id)
+                    ? current
+                    : [...current, ...nextTrajectory]
+                ));
+                setStats((analysis.data?.processing_stats || {}) as Record<string, unknown>);
+                setState("done");
+                setMessage("Готово. Траектория показана на плане Kerama Marazzi.");
+              })
+              .catch(() => {
+                hydratedVideoIdsRef.current.delete(video.video_id);
+              });
+          }
         });
       } catch {
         // The import flow still reports hard errors; this poller is only a UI recovery path.
