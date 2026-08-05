@@ -4950,6 +4950,47 @@ async def get_processing_status(video_id: str):
         if live_busy:
             payload.pop("result", None)
         return payload
+    completed = _load_completed_analysis_status(video_id)
+    if completed:
+        return completed
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT video_filename, original_filename, status, progress, updated_at FROM tracking_tasks WHERE id = ?",
+            (video_id,),
+        ).fetchone()
+        conn.close()
+        if row:
+            status = str(row["status"] or "registered").lower()
+            progress_value = row["progress"] if row["progress"] is not None else 0
+            try:
+                progress = int(float(progress_value))
+            except Exception:
+                progress = 0
+            if status == "registered":
+                upload_name = row["video_filename"] or f"{video_id}_{row['original_filename'] or 'video.avi'}"
+                suffix = Path(upload_name).suffix or ".avi"
+                temp_upload = VIDEOS_DIR / f".{video_id}_uploading{suffix}"
+                saved_upload = VIDEOS_DIR / upload_name
+                uploading = temp_upload.exists()
+                return {
+                    "status": "uploading" if uploading else "registered",
+                    "progress": max(1 if uploading else 0, min(99, progress)),
+                    "message": "Выгружается на сервер" if uploading else "Видео зарегистрировано, ждём файл",
+                    "stage": "upload",
+                    "uploaded_bytes": temp_upload.stat().st_size if uploading else (saved_upload.stat().st_size if saved_upload.exists() else 0),
+                    "updated_at": str(row["updated_at"] or ""),
+                }
+            return {
+                "status": status,
+                "progress": max(0, min(100, progress)),
+                "message": "Статус восстановлен из базы",
+                "stage": status,
+                "updated_at": str(row["updated_at"] or ""),
+            }
+    except Exception as db_err:
+        logger.warning(f"[{video_id}] Failed to load DB processing status fallback: {db_err}")
     raise HTTPException(status_code=404, detail="Video processing not found")
 
 @app.get("/api/status/{video_id}")

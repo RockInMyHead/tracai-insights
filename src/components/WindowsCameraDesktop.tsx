@@ -295,6 +295,20 @@ export default function WindowsCameraDesktop() {
             const status = await apiClient.getProcessingStatus(video.video_id);
             setMessage(status.message || `Обрабатываем ${index + 1} из ${videos.length}`);
             const percent = Number((status as { progress?: unknown }).progress);
+            if (["registered", "uploading"].includes(String(status.status || "").toLowerCase())) {
+              setProgress({
+                index: index + 1,
+                total: videos.length,
+                fileName,
+                filePath: "",
+                percent: Number.isFinite(percent) ? Math.max(1, Math.min(99, percent)) : 1,
+                phase: "uploading",
+              });
+              setProcessingProgress((current) => current.filter((item) => item.videoId !== video.video_id));
+              await new Promise((resolve) => window.setTimeout(resolve, 2000));
+              continue;
+            }
+            setProgress(null);
             upsertProcessingProgress({
               videoId: video.video_id,
               fileName,
@@ -361,7 +375,7 @@ export default function WindowsCameraDesktop() {
     const unsubscribeProgress = cameraImport.onProgress((next) => {
       setState("copying");
       setProgress(next);
-      setMessage(`Копируем видео ${next.index + 1} из ${next.total}: ${next.fileName}`);
+      setMessage(`Загрузка ${next.index} из ${next.total}: ${next.fileName}`);
     });
     const unsubscribeFileImported = cameraImport.onFileImported((video) => {
       enqueueImportedVideos([video as CameraImportedVideo]);
@@ -401,13 +415,26 @@ export default function WindowsCameraDesktop() {
           const isDesktop = video.client_source === "desktop" || /VID\d+\.(avi|mp4|mov|mkv)$/i.test(video.original_filename || video.filename);
           if (!isDesktop) return false;
           return (
-            ["uploaded", "queued", "processing", "running", "gpu_processing", "error", "failed"].includes(status)
+            ["registered", "uploading", "uploaded", "queued", "processing", "running", "gpu_processing", "error", "failed"].includes(status)
             || (progressValue > 0 && progressValue < 100)
           );
         }).slice(0, 8);
         activeVideos.forEach((video, index) => {
           const progressValue = Number(video.progress || 0);
           const status = String(video.status || "").toLowerCase();
+          if (["registered", "uploading"].includes(status)) {
+            setProgress({
+              index: index + 1,
+              total: activeVideos.length,
+              fileName: video.original_filename || video.filename,
+              filePath: "",
+              percent: Number.isFinite(progressValue) ? Math.max(1, Math.min(99, progressValue)) : 1,
+              phase: "uploading",
+            });
+            setProcessingProgress((current) => current.filter((item) => item.videoId !== video.video_id));
+            return;
+          }
+          setProgress((current) => current?.fileName === (video.original_filename || video.filename) ? null : current);
           upsertProcessingProgress({
             videoId: video.video_id,
             fileName: video.original_filename || video.filename,
@@ -597,13 +624,14 @@ export default function WindowsCameraDesktop() {
           <p className={`mt-4 text-sm ${state === "error" ? "text-rose-700" : state === "needs_camera" ? "text-amber-700" : "text-slate-600"}`}>{message}</p>
           {progress && <div className="mt-3">
             <div className="mb-1 flex items-center justify-between gap-3 text-xs font-medium text-slate-600">
-              <span className="truncate">{progress.fileName}</span>
+              <span className="shrink-0 font-semibold text-slate-700">Загрузка</span>
+              <span className="min-w-0 flex-1 truncate text-slate-500">{progress.fileName}</span>
               <span className="shrink-0">{Math.round(progress.percent)}%</span>
             </div>
             <div className="h-2.5 overflow-hidden rounded-full bg-slate-200">
               <div className="h-full rounded-full bg-teal-600 transition-all" style={{ width: `${Math.max(0, Math.min(100, progress.percent))}%` }} />
             </div>
-            <p className="mt-1 text-xs text-teal-700">Выгрузка с камеры: {progress.index} из {progress.total}</p>
+            <p className="mt-1 text-xs text-teal-700">На сервер: {progress.index} из {progress.total}</p>
           </div>}
           {processingProgress.length > 0 && <div className="mt-4 space-y-2">
             <div className="flex items-center justify-between text-xs font-semibold uppercase tracking-wide text-slate-500">

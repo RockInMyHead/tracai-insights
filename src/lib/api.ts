@@ -756,8 +756,22 @@ export class ApiClient {
   }> {
     const response = await agentFetch(`${this.baseUrl}/api/processing-status/${videoId}`);
     if (!response.ok) {
-      // If status endpoint returns 404 or other error, return default unknown status
-      return { status: "unknown", progress: 0, message: "Status not available" };
+      try {
+        const list = await this.getUploadedVideosList();
+        const video = (list.videos || []).find((item) => item.video_id === videoId);
+        if (video) {
+          const status = String(video.status || "registered");
+          const progress = Number(video.progress || 0);
+          return {
+            status,
+            progress: Number.isFinite(progress) ? progress : 0,
+            message: video.message || (status === "registered" ? "Выгружается на сервер" : `Сервер: ${status}`),
+          };
+        }
+      } catch {
+        // Fall through to a neutral status below.
+      }
+      return { status: "registered", progress: 0, message: "Выгружается на сервер" };
     }
     return response.json();
   }
