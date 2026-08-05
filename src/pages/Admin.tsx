@@ -9,6 +9,7 @@ import {
     useRef,
     useState,
 } from "react";
+import { Link } from "react-router-dom";
 import Navbar from "@/components/Navbar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -35,6 +36,7 @@ import {
     Trash2,
     Download,
     Copy,
+    Network,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
@@ -774,6 +776,16 @@ const Admin = () => {
                                     <p className="text-slate-400">Управление задачами трассировки в реальном времени</p>
                                 </div>
                                 <div className="flex flex-wrap gap-3">
+                                    <Button
+                                        asChild
+                                        variant="outline"
+                                        className="bg-slate-800/50 border-slate-700 hover:bg-slate-700 transition-all gap-2"
+                                    >
+                                        <Link to="/admin/graph-editor">
+                                            <Network className="h-4 w-4" />
+                                            Чертёж
+                                        </Link>
+                                    </Button>
                                     <Button 
                                         variant="outline" 
                                         onClick={loadAdminData} 

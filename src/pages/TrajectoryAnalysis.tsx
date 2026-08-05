@@ -481,9 +481,12 @@ const LegacyTrajectoryAnalysisPage = () => {
       newStats?.floorplan_constraint && typeof newStats.floorplan_constraint === "object"
         ? newStats.floorplan_constraint as Record<string, unknown>
         : undefined;
+    const looksLikePlanPixels = converted.some((point) => point.x > 800 || point.y > 600);
     const mapAligned =
       Boolean(newStats?.map_matching_applied)
       || Boolean(floorplanConstraint?.accepted)
+      || Boolean(floorplanConstraint?.graph_first_output_published)
+      || looksLikePlanPixels
       || manualOverride;
     const isR3 = method.toLowerCase().startsWith("r3")
       || coordinateConvention === "x_forward_y_left_z_up";

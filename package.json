@@ -1,14 +1,15 @@
 {
   "name": "trackai",
   "private": true,
-  "version": "1.18.1",
+  "version": "1.18.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "build:desktop": "vite build --mode desktop && npx electron-builder",
-    "build:desktop:win": "vite build --mode desktop && npx electron-builder --win --x64",
+    "validate:windows-gpu-runtime": "node scripts/validate-windows-gpu-runtime.cjs",
+    "build:desktop:win": "npm run validate:windows-gpu-runtime && vite build --mode desktop && npx electron-builder --win --x64",
     "build:desktop:mac": "vite build --mode desktop && npx electron-builder --mac --universal",
     "preview": "vite preview",
     "lint": "eslint .",
@@ -100,11 +101,19 @@
       {
         "from": "node_modules/ffmpeg-static/ffmpeg.exe",
         "to": "ffmpeg/ffmpeg.exe"
+      },
+      {
+        "from": "windows-runtime/dist",
+        "to": "local-gpu",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "files": [
       "dist/**/*",
-      "electron/**/*"
+      "electron/**/*",
+      "!electron/**/*.test.cjs"
     ],
     "win": {
       "target": [
@@ -115,10 +124,13 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "perMachine": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "differentialPackage": false,
       "useZip": true,
+      "include": "installer/windows-prerequisites.nsh",
       "artifactName": "TrackAI-Setup-${version}.${ext}"
     },
     "mac": {

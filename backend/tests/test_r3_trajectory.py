@@ -567,6 +567,22 @@ class R3TrajectoryTests(unittest.TestCase):
         self.assertEqual(diagnostics["runs"][0]["reason"], "not_confidently_straight")
         self.assertGreater(diagnostics["runs"][0]["heading_spread_degrees"], 15.0)
 
+    def test_heading_spread_is_circular_across_pi_boundary(self) -> None:
+        poses = []
+        for index in range(80):
+            # A nearly straight westbound run alternates around +pi/-pi.
+            lateral = 0.03 * math.sin(index * 0.9)
+            poses.append(make_pose(index, -float(index), 0.0, lateral))
+
+        result = build_r3_trajectory(poses, [2.0] * len(poses))
+        diagnostics = result["trajectory_quality"]["structural_regularization"]
+
+        self.assertTrue(diagnostics["runs"])
+        self.assertLess(
+            diagnostics["runs"][0]["heading_spread_degrees"],
+            15.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

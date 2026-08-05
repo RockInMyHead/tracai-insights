@@ -30,6 +30,12 @@ const CAMERA_VOLUME_HINTS = [
   'dcim',
 ];
 
+function createAbortError() {
+  const error = new Error('Импорт с камеры остановлен пользователем');
+  error.name = 'AbortError';
+  return error;
+}
+
 function getStatePath() {
   return path.join(app.getPath('userData'), 'camera-import-state.json');
 }
@@ -252,6 +258,7 @@ function createCameraImportService(options) {
     isEnabled,
     onStatus,
     onProgress,
+    onFileImported,
     onBatchComplete,
     onError,
     manualOnly = false,
@@ -259,6 +266,7 @@ function createCameraImportService(options) {
 
   let pollTimer = null;
   let importInProgress = false;
+  let importAbortController = null;
   let currentStatus = {
     enabled: false,
     scanning: false,
@@ -274,12 +282,12 @@ function createCameraImportService(options) {
     }
   };
 
-  const getPendingFiles = (volumes, state) => {
+  const getPendingFiles = (volumes, state, { ignoreImported = false } = {}) => {
     const imported = new Set(state.imported);
     const pending = [];
     for (const volume of volumes) {
       for (const file of volume.files) {
-        if (!imported.has(file.fingerprint)) {
+        if (ignoreImported || !imported.has(file.fingerprint)) {
           pending.push({ ...file, volumeName: volume.name });
         }
       }
@@ -287,7 +295,7 @@ function createCameraImportService(options) {
     return pending;
   };
 
-  const importFiles = async (files, ownerName) => {
+  const importFiles = async (files, ownerName, analysisContext = null) => {
     if (!files.length || importInProgress) return [];
     if (!ownerName?.trim()) {
       const error = new Error('Укажите имя сотрудника для автоимпорта с камеры');
@@ -298,6 +306,7 @@ function createCameraImportService(options) {
     }
 
     importInProgress = true;
+    importAbortController = new AbortController();
     currentStatus.importing = true;
     currentStatus.lastError = null;
     emitStatus();
@@ -307,10 +316,13 @@ function createCameraImportService(options) {
 
     try {
       for (let index = 0; index < files.length; index += 1) {
+        if (importAbortController.signal.aborted) {
+          break;
+        }
         const file = files[index];
         if (typeof onProgress === 'function') {
           onProgress({
-            index,
+            index: index + 1,
             total: files.length,
             fileName: file.name,
             filePath: file.path,
@@ -324,10 +336,12 @@ function createCameraImportService(options) {
           filePath: file.path,
           fileName: file.name,
           employeeName: ownerName.trim(),
+          analysisContext,
+          signal: importAbortController.signal,
           onProgress: (percent) => {
             if (typeof onProgress === 'function') {
               onProgress({
-                index,
+                index: index + 1,
                 total: files.length,
                 fileName: file.name,
                 filePath: file.path,
@@ -347,6 +361,9 @@ function createCameraImportService(options) {
           sourcePath: file.path,
           volumeName: file.volumeName || null,
         });
+        if (typeof onFileImported === 'function') {
+          onFileImported(uploaded[uploaded.length - 1]);
+        }
       }
 
       if (typeof onBatchComplete === 'function' && uploaded.length > 0) {
@@ -354,18 +371,44 @@ function createCameraImportService(options) {
       }
       return uploaded;
     } catch (error) {
+      if (error?.name === 'AbortError') {
+        currentStatus.lastError = null;
+        emitStatus();
+        return uploaded;
+      }
       currentStatus.lastError = error instanceof Error ? error.message : String(error);
       emitStatus();
       if (typeof onError === 'function') onError(error);
       throw error;
     } finally {
       importInProgress = false;
+      importAbortController = null;
       currentStatus.importing = false;
       emitStatus();
     }
   };
 
-  const scanNow = async ({ forceImport = false } = {}) => {
+  const cancelImport = () => {
+    if (!importInProgress || !importAbortController) {
+      return { cancelled: false };
+    }
+    importAbortController.abort(createAbortError());
+    currentStatus.lastError = null;
+    emitStatus();
+    return { cancelled: true };
+  };
+
+  const resetImportedState = () => {
+    const state = loadState();
+    const removed = state.imported.length;
+    saveState({ ...state, imported: [] });
+    currentStatus.pendingFiles = [];
+    currentStatus.lastError = null;
+    emitStatus();
+    return { reset: true, removed };
+  };
+
+  const scanNow = async ({ forceImport = false, ignoreImported = false, analysisContext = null } = {}) => {
     if (currentStatus.scanning) return currentStatus;
     currentStatus.scanning = true;
     currentStatus.enabled = isEnabled();
@@ -374,7 +417,7 @@ function createCameraImportService(options) {
     try {
       const volumes = scanConnectedCameraVolumes();
       const state = loadState();
-      const pendingFiles = getPendingFiles(volumes, state);
+      const pendingFiles = getPendingFiles(volumes, state, { ignoreImported });
 
       currentStatus.volumes = volumes.map(({ files, ...rest }) => rest);
       currentStatus.pendingFiles = pendingFiles;
@@ -384,7 +427,7 @@ function createCameraImportService(options) {
       if (isEnabled() && pendingFiles.length > 0 && (forceImport || !importInProgress)) {
         const ownerName = getOwnerName();
         if (ownerName?.trim()) {
-          await importFiles(pendingFiles, ownerName);
+          await importFiles(pendingFiles, ownerName, analysisContext);
         }
       }
 
@@ -431,6 +474,8 @@ function createCameraImportService(options) {
     stop,
     scanNow,
     importFiles,
+    cancelImport,
+    resetImportedState,
     setEnabled,
     getStatus: () => ({ ...currentStatus }),
   };

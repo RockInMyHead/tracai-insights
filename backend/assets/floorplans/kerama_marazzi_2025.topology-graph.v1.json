@@ -1,0 +1,5471 @@
+{
+  "schema_version": "trackai.floorplan_graph.v1",
+  "map_id": "kerama_marazzi_2025",
+  "coordinate_system": "plan_pixels_x_right_y_down",
+  "width": 5298,
+  "height": 3743,
+  "meters_per_pixel": 0.049629166698546515,
+  "source": {
+    "support_mask_file": "kerama_marazzi_2025_support.png",
+    "support_mask_sha256": "cb8f0e32afa6b7f02a9582d8b2a754427c47fb787489afbd3f2f0a499389e564",
+    "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
+    "obstacle_mask_sha256": "986fc267622c9aadf387d3e2cb727721935e633f9dd7b6dda38f52696156a106",
+    "graph_scale_pixels": 8,
+    "minimum_edge_meters": 1.5,
+    "normalization": "preserve_ids_explicit_turn_nodes_v3",
+    "geometry_sha256": "c7dac5db7ee383b7bf3fa6328d8ac9fedb667e17395a613db2c9720df7f7f9ab",
+    "saved_from_admin": true,
+    "saved_at_unix": 1785573765.75
+  },
+  "nodes": [
+    {
+      "id": "node_0003",
+      "kind": "junction",
+      "x": 2426.231689453125,
+      "y": 578.5812377929688,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0004",
+      "kind": "junction",
+      "x": 880.1619873046875,
+      "y": 703.9078369140625,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0005",
+      "kind": "junction",
+      "x": 1608,
+      "y": 592,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0006",
+      "kind": "junction",
+      "x": 1480,
+      "y": 600,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0007",
+      "kind": "junction",
+      "x": 2187.453857421875,
+      "y": 704.2354125976562,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0008",
+      "kind": "junction",
+      "x": 2228.279052734375,
+      "y": 686.2078247070312,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0009",
+      "kind": "junction",
+      "x": 1096,
+      "y": 624,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0010",
+      "kind": "junction",
+      "x": 1328,
+      "y": 632,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0011",
+      "kind": "junction",
+      "x": 1316.0703125,
+      "y": 713.7823486328125,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0012",
+      "kind": "junction",
+      "x": 1637.349365234375,
+      "y": 668.8585205078125,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0013",
+      "kind": "junction",
+      "x": 2343.016845703125,
+      "y": 702.2505493164062,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0014",
+      "kind": "junction",
+      "x": 722.2225341796875,
+      "y": 768.4797973632812,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0015",
+      "kind": "junction",
+      "x": 1000.4302368164062,
+      "y": 710.5858154296875,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0016",
+      "kind": "junction",
+      "x": 1154.7662353515625,
+      "y": 713.1249389648438,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0017",
+      "kind": "junction",
+      "x": 1492.3294677734375,
+      "y": 714.01416015625,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0018",
+      "kind": "junction",
+      "x": 1368,
+      "y": 712,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0019",
+      "kind": "junction",
+      "x": 1607.165283203125,
+      "y": 734.2720336914062,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0020",
+      "kind": "junction",
+      "x": 1491.5316162109375,
+      "y": 800.9011840820312,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0021",
+      "kind": "junction",
+      "x": 1233.228515625,
+      "y": 760.8511962890625,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0022",
+      "kind": "junction",
+      "x": 1400.82861328125,
+      "y": 777.61767578125,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0024",
+      "kind": "junction",
+      "x": 2363.0966796875,
+      "y": 809.9456787109375,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0025",
+      "kind": "junction",
+      "x": 866.9423828125,
+      "y": 875.560546875,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0026",
+      "kind": "junction",
+      "x": 1123.328857421875,
+      "y": 868.3096313476562,
+      "degree": 6,
+      "enabled": true
+    },
+    {
+      "id": "node_0028",
+      "kind": "junction",
+      "x": 1488.6883544921875,
+      "y": 862.3745727539062,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0029",
+      "kind": "junction",
+      "x": 1064.2984619140625,
+      "y": 832.811279296875,
+      "degree": 5,
+      "enabled": true
+    },
+    {
+      "id": "node_0030",
+      "kind": "junction",
+      "x": 1552.3687744140625,
+      "y": 798.9494018554688,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0032",
+      "kind": "junction",
+      "x": 661.2100830078125,
+      "y": 881.276611328125,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0034",
+      "kind": "junction",
+      "x": 2306.29052734375,
+      "y": 832.0798950195312,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0036",
+      "kind": "junction",
+      "x": 1096,
+      "y": 920,
+      "degree": 7,
+      "enabled": true
+    },
+    {
+      "id": "node_0037",
+      "kind": "junction",
+      "x": 2172.338134765625,
+      "y": 910.5582885742188,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0038",
+      "kind": "junction",
+      "x": 698.6090087890625,
+      "y": 959.0928955078125,
+      "degree": 6,
+      "enabled": true
+    },
+    {
+      "id": "node_0039",
+      "kind": "junction",
+      "x": 1440,
+      "y": 936,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0043",
+      "kind": "junction",
+      "x": 1485.9080810546875,
+      "y": 927.7318115234375,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0044",
+      "kind": "junction",
+      "x": 1352,
+      "y": 968,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0045",
+      "kind": "junction",
+      "x": 1563.61083984375,
+      "y": 949.9835205078125,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0047",
+      "kind": "junction",
+      "x": 1522.0556640625,
+      "y": 984.2012329101562,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0048",
+      "kind": "junction",
+      "x": 863.7003784179688,
+      "y": 984.9196166992188,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0050",
+      "kind": "junction",
+      "x": 2562.53466796875,
+      "y": 968.0130615234375,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0053",
+      "kind": "junction",
+      "x": 2668.424560546875,
+      "y": 1081.6129150390625,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0054",
+      "kind": "junction",
+      "x": 2848,
+      "y": 1088,
+      "degree": 6,
+      "enabled": true
+    },
+    {
+      "id": "node_0055",
+      "kind": "junction",
+      "x": 2840,
+      "y": 1504,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0056",
+      "kind": "junction",
+      "x": 2904,
+      "y": 1560,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0057",
+      "kind": "junction",
+      "x": 3016,
+      "y": 1560,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0058",
+      "kind": "junction",
+      "x": 2979.887451171875,
+      "y": 1600.8232421875,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0059",
+      "kind": "junction",
+      "x": 3009.52490234375,
+      "y": 1687.229736328125,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0060",
+      "kind": "junction",
+      "x": 2846.925048828125,
+      "y": 1682.8367919921875,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0062",
+      "kind": "junction",
+      "x": 3047.87451171875,
+      "y": 1714.4385986328125,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0064",
+      "kind": "junction",
+      "x": 3051.748779296875,
+      "y": 1782.01904296875,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0065",
+      "kind": "junction",
+      "x": 3051.100830078125,
+      "y": 1835.066162109375,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0066",
+      "kind": "junction",
+      "x": 3106.04150390625,
+      "y": 1886.619140625,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0067",
+      "kind": "junction",
+      "x": 3179.318115234375,
+      "y": 1848.473388671875,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0068",
+      "kind": "junction",
+      "x": 3015.39404296875,
+      "y": 1856.5157470703125,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0069",
+      "kind": "junction",
+      "x": 3175.512939453125,
+      "y": 1726.785888671875,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0070",
+      "kind": "junction",
+      "x": 3161.558349609375,
+      "y": 2015.112060546875,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0071",
+      "kind": "junction",
+      "x": 2845.812744140625,
+      "y": 1996.384765625,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0072",
+      "kind": "junction",
+      "x": 3074.505859375,
+      "y": 2036.26220703125,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0073",
+      "kind": "junction",
+      "x": 3184.024658203125,
+      "y": 1957.16552734375,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0076",
+      "kind": "junction",
+      "x": 3153.176513671875,
+      "y": 2098.1611328125,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0077",
+      "kind": "junction",
+      "x": 2866.14306640625,
+      "y": 2067.290283203125,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0078",
+      "kind": "junction",
+      "x": 2942.138671875,
+      "y": 2103.095458984375,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0081",
+      "kind": "endpoint",
+      "x": 827.4965209960938,
+      "y": 689.7552490234375,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0083",
+      "kind": "endpoint",
+      "x": 2572.896728515625,
+      "y": 597.3651733398438,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0084",
+      "kind": "endpoint",
+      "x": 840.5137939453125,
+      "y": 766.7282104492188,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0089",
+      "kind": "endpoint",
+      "x": 2960,
+      "y": 1080,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0090",
+      "kind": "endpoint",
+      "x": 1597.703857421875,
+      "y": 935.4310302734375,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0091",
+      "kind": "endpoint",
+      "x": 599.3663330078125,
+      "y": 1200.2392578125,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0092",
+      "kind": "endpoint",
+      "x": 2752,
+      "y": 1512,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0093",
+      "kind": "endpoint",
+      "x": 3072,
+      "y": 1640,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0096",
+      "kind": "endpoint",
+      "x": 3226.714111328125,
+      "y": 1666.7606201171875,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0100",
+      "kind": "endpoint",
+      "x": 2945.880126953125,
+      "y": 1757.2841796875,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0101",
+      "kind": "endpoint",
+      "x": 2776,
+      "y": 1944,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0102",
+      "kind": "endpoint",
+      "x": 3077.260498046875,
+      "y": 1940.0660400390625,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0103",
+      "kind": "endpoint",
+      "x": 2476.436279296875,
+      "y": 2117.0517578125,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0104",
+      "kind": "manual",
+      "x": 2176.376923828125,
+      "y": 574.8446782226563,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0105",
+      "kind": "manual",
+      "x": 2182.679224609375,
+      "y": 702.1917426757813,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0106",
+      "kind": "manual",
+      "x": 2364.600546875,
+      "y": 923.8781264648437,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0107",
+      "kind": "manual",
+      "x": 2409.081943359375,
+      "y": 965.563341796875,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0108",
+      "kind": "manual",
+      "x": 2021.0479814453124,
+      "y": 900.4580708007812,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0109",
+      "kind": "manual",
+      "x": 2309.0741552734376,
+      "y": 885.4761362304688,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0110",
+      "kind": "manual",
+      "x": 2079.790021484375,
+      "y": 845.0687260742187,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0111",
+      "kind": "manual",
+      "x": 2231.937595703125,
+      "y": 847.3836938476562,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0112",
+      "kind": "manual",
+      "x": 2251.155353515625,
+      "y": 877.7756923828125,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "turn__edge_00002__p001",
+      "kind": "turn",
+      "x": 2552,
+      "y": 544,
+      "degree": 1,
+      "enabled": true,
+      "source_edge_id": "edge_00002",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00006__p001",
+      "kind": "turn",
+      "x": 2352,
+      "y": 568,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00006",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00007__p001",
+      "kind": "turn",
+      "x": 2512,
+      "y": 616,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00007",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00007__p002",
+      "kind": "turn",
+      "x": 2512,
+      "y": 664,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00007",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00009__p001",
+      "kind": "turn",
+      "x": 715.4266357421875,
+      "y": 703.8157958984375,
+      "degree": 3,
+      "enabled": true,
+      "source_edge_id": "edge_00009",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00010__p001",
+      "kind": "turn",
+      "x": 948.1109619140625,
+      "y": 700.5755615234375,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00010",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00012__p001",
+      "kind": "turn",
+      "x": 1736,
+      "y": 576,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00012",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00012__p002",
+      "kind": "turn",
+      "x": 2173.81494140625,
+      "y": 574.8366088867188,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00012",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00014__p001",
+      "kind": "turn",
+      "x": 1368,
+      "y": 600,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00014",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00017__p001",
+      "kind": "turn",
+      "x": 2120.7734375,
+      "y": 702.0615844726562,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00017",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00017__p002",
+      "kind": "turn",
+      "x": 1721.7371826171875,
+      "y": 707.9100952148438,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00017",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00019__p001",
+      "kind": "turn",
+      "x": 1072,
+      "y": 624,
+      "degree": 1,
+      "enabled": true,
+      "source_edge_id": "edge_00019",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00020__p001",
+      "kind": "turn",
+      "x": 1120,
+      "y": 600,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00020",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00020__p002",
+      "kind": "turn",
+      "x": 1280,
+      "y": 600,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00020",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00021__p001",
+      "kind": "turn",
+      "x": 1147.020751953125,
+      "y": 672.3488159179688,
+      "degree": 1,
+      "enabled": true,
+      "source_edge_id": "edge_00021",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00037__p001",
+      "kind": "turn",
+      "x": 1604.5977783203125,
+      "y": 770.7832641601562,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00037",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00037__p002",
+      "kind": "turn",
+      "x": 1613.8634033203125,
+      "y": 798.4033813476562,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00037",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00039__p001",
+      "kind": "turn",
+      "x": 1150.12255859375,
+      "y": 763.1654663085938,
+      "degree": 3,
+      "enabled": true,
+      "source_edge_id": "edge_00039",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00040__p001",
+      "kind": "turn",
+      "x": 1304.80908203125,
+      "y": 780.0032958984375,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00040",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00040__p002",
+      "kind": "turn",
+      "x": 1361.451904296875,
+      "y": 776.1798095703125,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00040",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00048__p001",
+      "kind": "turn",
+      "x": 1184.1328125,
+      "y": 871.6792602539062,
+      "degree": 4,
+      "enabled": true,
+      "source_edge_id": "edge_00048",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00048__p002",
+      "kind": "turn",
+      "x": 1289.7005615234375,
+      "y": 887.187255859375,
+      "degree": 1,
+      "enabled": true,
+      "source_edge_id": "edge_00048",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00052__p001",
+      "kind": "turn",
+      "x": 1650.670166015625,
+      "y": 822.9953002929688,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00052",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00052__p002",
+      "kind": "turn",
+      "x": 1646.497314453125,
+      "y": 848.0810546875,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00052",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00054__p001",
+      "kind": "turn",
+      "x": 1562.359375,
+      "y": 869.9442749023438,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00054",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00059__p001",
+      "kind": "turn",
+      "x": 1701.08056640625,
+      "y": 856.1964111328125,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00059",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00064__p001",
+      "kind": "turn",
+      "x": 1048,
+      "y": 976,
+      "degree": 5,
+      "enabled": true,
+      "source_edge_id": "edge_00064",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00065__p001",
+      "kind": "turn",
+      "x": 1136,
+      "y": 952,
+      "degree": 3,
+      "enabled": true,
+      "source_edge_id": "edge_00065",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00066__p001",
+      "kind": "turn",
+      "x": 601.1474609375,
+      "y": 979.3023681640625,
+      "degree": 3,
+      "enabled": true,
+      "source_edge_id": "edge_00066",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00075__p001",
+      "kind": "turn",
+      "x": 1444.4598388671875,
+      "y": 977.677978515625,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00075",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00075__p002",
+      "kind": "turn",
+      "x": 1489.0858154296875,
+      "y": 1030.2447509765625,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00075",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00081__p001",
+      "kind": "turn",
+      "x": 683.90966796875,
+      "y": 984.6773071289062,
+      "degree": 4,
+      "enabled": true,
+      "source_edge_id": "edge_00081",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00082__p001",
+      "kind": "turn",
+      "x": 2675.1875,
+      "y": 1029.0413818359375,
+      "degree": 3,
+      "enabled": true,
+      "source_edge_id": "edge_00082",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00083__p001",
+      "kind": "turn",
+      "x": 597.9309692382812,
+      "y": 1125.247314453125,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00083",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00084__p001",
+      "kind": "turn",
+      "x": 2824,
+      "y": 1064,
+      "degree": 4,
+      "enabled": true,
+      "source_edge_id": "edge_00084",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00088__p001",
+      "kind": "turn",
+      "x": 2880,
+      "y": 1520,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00088",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00091__p001",
+      "kind": "turn",
+      "x": 3040,
+      "y": 1536,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00091__p002",
+      "kind": "turn",
+      "x": 3152,
+      "y": 1536,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00091__p003",
+      "kind": "turn",
+      "x": 3184,
+      "y": 1560,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_point_index": 3
+    },
+    {
+      "id": "turn__edge_00091__p004",
+      "kind": "turn",
+      "x": 3296,
+      "y": 1576,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_point_index": 4
+    },
+    {
+      "id": "turn__edge_00091__p005",
+      "kind": "turn",
+      "x": 3352.57275390625,
+      "y": 1583.421630859375,
+      "degree": 1,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_point_index": 5
+    },
+    {
+      "id": "turn__edge_00091__p008",
+      "kind": "turn",
+      "x": 3201.3408203125,
+      "y": 2098.616943359375,
+      "degree": 1,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_point_index": 8
+    },
+    {
+      "id": "turn__edge_00096__p001",
+      "kind": "turn",
+      "x": 2847.791748046875,
+      "y": 1754.7215576171875,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00096__p002",
+      "kind": "turn",
+      "x": 2843.224853515625,
+      "y": 1810.962158203125,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_point_index": 2
+    },
+    {
+      "id": "turn__edge_00096__p003",
+      "kind": "turn",
+      "x": 2836.88720703125,
+      "y": 1902.5118408203125,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_point_index": 3
+    },
+    {
+      "id": "turn__edge_00101__p001",
+      "kind": "turn",
+      "x": 3054.393310546875,
+      "y": 1876.8973388671875,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00101",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00107__p001",
+      "kind": "turn",
+      "x": 3184.12060546875,
+      "y": 1664.86962890625,
+      "degree": 2,
+      "enabled": true,
+      "source_edge_id": "edge_00107",
+      "source_point_index": 1
+    },
+    {
+      "id": "turn__edge_00113__p001",
+      "kind": "turn",
+      "x": 3188.83203125,
+      "y": 1905.6943359375,
+      "degree": 3,
+      "enabled": true,
+      "source_edge_id": "edge_00113",
+      "source_point_index": 1
+    },
+    {
+      "id": "node_0113",
+      "kind": "manual",
+      "x": 1642.5337705078125,
+      "y": 702.2879169921875,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0114",
+      "kind": "manual",
+      "x": 1449.495,
+      "y": 709.086,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0115",
+      "kind": "manual",
+      "x": 1600.1850029296875,
+      "y": 682.2827241210938,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0116",
+      "kind": "manual",
+      "x": 1590.6262314453124,
+      "y": 715.4312958984375,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0117",
+      "kind": "manual",
+      "x": 1055.9019267578126,
+      "y": 753.8112880859375,
+      "degree": 5,
+      "enabled": true
+    },
+    {
+      "id": "node_0118",
+      "kind": "manual",
+      "x": 1155.47765625,
+      "y": 811.4092153320313,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0119",
+      "kind": "manual",
+      "x": 1104.344072265625,
+      "y": 809.5730014648437,
+      "degree": 7,
+      "enabled": true
+    },
+    {
+      "id": "node_0120",
+      "kind": "manual",
+      "x": 812.8366318359375,
+      "y": 734.8567060546875,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0121",
+      "kind": "manual",
+      "x": 732.9442568359375,
+      "y": 885.9499555664063,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0122",
+      "kind": "manual",
+      "x": 702.4884204101562,
+      "y": 845.463,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0125",
+      "kind": "manual",
+      "x": 2707.902470703125,
+      "y": 1080.09092578125,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0126",
+      "kind": "manual",
+      "x": 1817.7563681640625,
+      "y": 856.78228125,
+      "degree": 1,
+      "enabled": true
+    },
+    {
+      "id": "node_0127",
+      "kind": "manual",
+      "x": 2641.1892109375,
+      "y": 988.8271518554687,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0128",
+      "kind": "manual",
+      "x": 2832.923943359375,
+      "y": 1233.64953515625,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0129",
+      "kind": "manual",
+      "x": 2696.933123046875,
+      "y": 2120.6685625,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0130",
+      "kind": "manual",
+      "x": 3152.289416015625,
+      "y": 1906.719388671875,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0131",
+      "kind": "manual",
+      "x": 3035.70955078125,
+      "y": 2016.26416796875,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0132",
+      "kind": "manual",
+      "x": 3030.662732421875,
+      "y": 2071.4816767578122,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0133",
+      "kind": "manual",
+      "x": 2997.310404296875,
+      "y": 2030.7169052734375,
+      "degree": 3,
+      "enabled": true
+    },
+    {
+      "id": "node_0134",
+      "kind": "manual",
+      "x": 3006.95861328125,
+      "y": 1934.5738583984376,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0135",
+      "kind": "manual",
+      "x": 3029.503533203125,
+      "y": 2107.899494140625,
+      "degree": 4,
+      "enabled": true
+    },
+    {
+      "id": "node_0136",
+      "kind": "manual",
+      "x": 2959.928591796875,
+      "y": 1984.6563056640625,
+      "degree": 2,
+      "enabled": true
+    },
+    {
+      "id": "node_0137",
+      "kind": "manual",
+      "x": 2940.3615078125,
+      "y": 1913.4573544921875,
+      "degree": 2,
+      "enabled": true
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge_00002__s002",
+      "from": "turn__edge_00002__p001",
+      "to": "node_0003",
+      "points": [
+        [
+          2552,
+          544
+        ],
+        [
+          2426.231689453125,
+          578.5812377929688
+        ]
+      ],
+      "length_meters": 6.4734,
+      "minimum_width_meters": 2.863,
+      "median_width_meters": 3.761,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00002",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00006",
+      "from": "node_0003",
+      "to": "turn__edge_00006__p001",
+      "points": [
+        [
+          2426.231689453125,
+          578.5812377929688
+        ],
+        [
+          2352,
+          568
+        ]
+      ],
+      "length_meters": 3.7213,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00006",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00006__s002",
+      "from": "turn__edge_00006__p001",
+      "to": "node_0104",
+      "points": [
+        [
+          2352,
+          568
+        ],
+        [
+          2176.376923828125,
+          574.8446782226563
+        ]
+      ],
+      "length_meters": 8.7226,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00006",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00007",
+      "from": "node_0003",
+      "to": "turn__edge_00007__p001",
+      "points": [
+        [
+          2426.231689453125,
+          578.5812377929688
+        ],
+        [
+          2512,
+          616
+        ]
+      ],
+      "length_meters": 4.6441,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.011,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00007",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00007__s002",
+      "from": "turn__edge_00007__p001",
+      "to": "turn__edge_00007__p002",
+      "points": [
+        [
+          2512,
+          616
+        ],
+        [
+          2512,
+          664
+        ]
+      ],
+      "length_meters": 2.3822,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.011,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00007",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00007__s003",
+      "from": "turn__edge_00007__p002",
+      "to": "node_0083",
+      "points": [
+        [
+          2512,
+          664
+        ],
+        [
+          2572.896728515625,
+          597.3651733398438
+        ]
+      ],
+      "length_meters": 4.48,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.011,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00007",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00008",
+      "from": "node_0004",
+      "to": "node_0081",
+      "points": [
+        [
+          880.1619873046875,
+          703.9078369140625
+        ],
+        [
+          827.4965209960938,
+          689.7552490234375
+        ]
+      ],
+      "length_meters": 2.7064723943608153,
+      "minimum_width_meters": 4.83,
+      "median_width_meters": 5.587,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00008",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00009",
+      "from": "node_0004",
+      "to": "turn__edge_00009__p001",
+      "points": [
+        [
+          880.1619873046875,
+          703.9078369140625
+        ],
+        [
+          715.4266357421875,
+          703.8157958984375
+        ]
+      ],
+      "length_meters": 8.175679499933814,
+      "minimum_width_meters": 4.276,
+      "median_width_meters": 4.83,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00009",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00009__s002",
+      "from": "turn__edge_00009__p001",
+      "to": "node_0014",
+      "points": [
+        [
+          715.4266357421875,
+          703.8157958984375
+        ],
+        [
+          722.2225341796875,
+          768.4797973632812
+        ]
+      ],
+      "length_meters": 3.22689487656162,
+      "minimum_width_meters": 4.276,
+      "median_width_meters": 4.83,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00009",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00010",
+      "from": "node_0004",
+      "to": "turn__edge_00010__p001",
+      "points": [
+        [
+          880.1619873046875,
+          703.9078369140625
+        ],
+        [
+          948.1109619140625,
+          700.5755615234375
+        ]
+      ],
+      "length_meters": 3.376303692647677,
+      "minimum_width_meters": 7.941,
+      "median_width_meters": 8.552,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00010",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00010__s002",
+      "from": "turn__edge_00010__p001",
+      "to": "node_0015",
+      "points": [
+        [
+          948.1109619140625,
+          700.5755615234375
+        ],
+        [
+          1000.4302368164062,
+          710.5858154296875
+        ]
+      ],
+      "length_meters": 2.643661305363153,
+      "minimum_width_meters": 7.941,
+      "median_width_meters": 8.552,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00010",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00011",
+      "from": "node_0005",
+      "to": "node_0006",
+      "points": [
+        [
+          1608,
+          592
+        ],
+        [
+          1480,
+          600
+        ]
+      ],
+      "length_meters": 6.3649,
+      "minimum_width_meters": 5.558,
+      "median_width_meters": 6.353,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00011",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00012",
+      "from": "node_0005",
+      "to": "turn__edge_00012__p001",
+      "points": [
+        [
+          1608,
+          592
+        ],
+        [
+          1736,
+          576
+        ]
+      ],
+      "length_meters": 6.402,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 5.558,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00012",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00012__s002",
+      "from": "turn__edge_00012__p001",
+      "to": "turn__edge_00012__p002",
+      "points": [
+        [
+          1736,
+          576
+        ],
+        [
+          2173.81494140625,
+          574.8366088867188
+        ]
+      ],
+      "length_meters": 21.728467422840023,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 5.558,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00012",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00012__s003",
+      "from": "turn__edge_00012__p002",
+      "to": "node_0007",
+      "points": [
+        [
+          2173.81494140625,
+          574.8366088867188
+        ],
+        [
+          2187.453857421875,
+          704.2354125976562
+        ]
+      ],
+      "length_meters": 6.457529006265181,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 5.558,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00012",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00014",
+      "from": "node_0006",
+      "to": "turn__edge_00014__p001",
+      "points": [
+        [
+          1480,
+          600
+        ],
+        [
+          1368,
+          600
+        ]
+      ],
+      "length_meters": 5.5585,
+      "minimum_width_meters": 5.558,
+      "median_width_meters": 6.353,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00014",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00014__s002",
+      "from": "turn__edge_00014__p001",
+      "to": "node_0010",
+      "points": [
+        [
+          1368,
+          600
+        ],
+        [
+          1328,
+          632
+        ]
+      ],
+      "length_meters": 2.5423,
+      "minimum_width_meters": 5.558,
+      "median_width_meters": 6.353,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00014",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00016",
+      "from": "node_0007",
+      "to": "node_0008",
+      "points": [
+        [
+          2187.453857421875,
+          704.2354125976562
+        ],
+        [
+          2228.279052734375,
+          686.2078247070312
+        ]
+      ],
+      "length_meters": 2.2148683074518525,
+      "minimum_width_meters": 9.529,
+      "median_width_meters": 9.529,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00016",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00017",
+      "from": "node_0007",
+      "to": "turn__edge_00017__p001",
+      "points": [
+        [
+          2187.453857421875,
+          704.2354125976562
+        ],
+        [
+          2120.7734375,
+          702.0615844726562
+        ]
+      ],
+      "length_meters": 3.3110517764290033,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00017",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00017__s002",
+      "from": "turn__edge_00017__p001",
+      "to": "turn__edge_00017__p002",
+      "points": [
+        [
+          2120.7734375,
+          702.0615844726562
+        ],
+        [
+          1721.7371826171875,
+          707.9100952148438
+        ]
+      ],
+      "length_meters": 19.805963784937408,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00017",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00017__s003",
+      "from": "turn__edge_00017__p002",
+      "to": "node_0113",
+      "points": [
+        [
+          1721.7371826171875,
+          707.9100952148438
+        ],
+        [
+          1642.5337705078125,
+          702.2879169921875
+        ]
+      ],
+      "length_meters": 3.9406900253882045,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00017",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00019",
+      "from": "node_0009",
+      "to": "turn__edge_00019__p001",
+      "points": [
+        [
+          1096,
+          624
+        ],
+        [
+          1072,
+          624
+        ]
+      ],
+      "length_meters": 1.1911,
+      "minimum_width_meters": 9.562,
+      "median_width_meters": 14.577,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00019",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00020",
+      "from": "node_0009",
+      "to": "turn__edge_00020__p001",
+      "points": [
+        [
+          1096,
+          624
+        ],
+        [
+          1120,
+          600
+        ]
+      ],
+      "length_meters": 1.6845,
+      "minimum_width_meters": 6.353,
+      "median_width_meters": 7.147,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00020",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00020__s002",
+      "from": "turn__edge_00020__p001",
+      "to": "turn__edge_00020__p002",
+      "points": [
+        [
+          1120,
+          600
+        ],
+        [
+          1280,
+          600
+        ]
+      ],
+      "length_meters": 7.9407,
+      "minimum_width_meters": 6.353,
+      "median_width_meters": 7.147,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00020",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00020__s003",
+      "from": "turn__edge_00020__p002",
+      "to": "node_0010",
+      "points": [
+        [
+          1280,
+          600
+        ],
+        [
+          1328,
+          632
+        ]
+      ],
+      "length_meters": 2.863,
+      "minimum_width_meters": 6.353,
+      "median_width_meters": 7.147,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00020",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00021__s002",
+      "from": "turn__edge_00021__p001",
+      "to": "node_0016",
+      "points": [
+        [
+          1147.020751953125,
+          672.3488159179688
+        ],
+        [
+          1154.7662353515625,
+          713.1249389648438
+        ]
+      ],
+      "length_meters": 2.0598703411114365,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 3.274,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00021",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00023",
+      "from": "node_0011",
+      "to": "node_0016",
+      "points": [
+        [
+          1316.0703125,
+          713.7823486328125
+        ],
+        [
+          1154.7662353515625,
+          713.1249389648438
+        ]
+      ],
+      "length_meters": 8.005453420231678,
+      "minimum_width_meters": 6.785,
+      "median_width_meters": 7.98,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00023",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00024",
+      "from": "node_0011",
+      "to": "node_0018",
+      "points": [
+        [
+          1316.0703125,
+          713.7823486328125
+        ],
+        [
+          1368,
+          712
+        ]
+      ],
+      "length_meters": 2.5787446875921227,
+      "minimum_width_meters": 6.402,
+      "median_width_meters": 7.651,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00024",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00025",
+      "from": "node_0012",
+      "to": "node_0019",
+      "points": [
+        [
+          1637.349365234375,
+          668.8585205078125
+        ],
+        [
+          1607.165283203125,
+          734.2720336914062
+        ]
+      ],
+      "length_meters": 3.5753695303486293,
+      "minimum_width_meters": 3.369,
+      "median_width_meters": 3.8,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00025",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00027",
+      "from": "node_0013",
+      "to": "node_0024",
+      "points": [
+        [
+          2343.016845703125,
+          702.2505493164062
+        ],
+        [
+          2363.0966796875,
+          809.9456787109375
+        ]
+      ],
+      "length_meters": 5.4369,
+      "minimum_width_meters": 5.327,
+      "median_width_meters": 5.753,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00027",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00029",
+      "from": "node_0014",
+      "to": "node_0084",
+      "points": [
+        [
+          722.2225341796875,
+          768.4797973632812
+        ],
+        [
+          840.5137939453125,
+          766.7282104492188
+        ]
+      ],
+      "length_meters": 5.871340217102542,
+      "minimum_width_meters": 1.776,
+      "median_width_meters": 4.123,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00029",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00031",
+      "from": "node_0015",
+      "to": "node_0117",
+      "points": [
+        [
+          1000.4302368164062,
+          710.5858154296875
+        ],
+        [
+          1055.9019267578126,
+          753.8112880859375
+        ]
+      ],
+      "length_meters": 3.490151475008185,
+      "minimum_width_meters": 11.286,
+      "median_width_meters": 13.82,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00031",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00034",
+      "from": "node_0017",
+      "to": "node_0114",
+      "points": [
+        [
+          1492.3294677734375,
+          714.01416015625
+        ],
+        [
+          1449.495,
+          709.086
+        ]
+      ],
+      "length_meters": 2.1398623361407574,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.555,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00034",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00035",
+      "from": "node_0017",
+      "to": "node_0020",
+      "points": [
+        [
+          1492.3294677734375,
+          714.01416015625
+        ],
+        [
+          1491.5316162109375,
+          800.9011840820312
+        ]
+      ],
+      "length_meters": 4.312312391519986,
+      "minimum_width_meters": 3.369,
+      "median_width_meters": 4.407,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00035",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00037",
+      "from": "node_0019",
+      "to": "turn__edge_00037__p001",
+      "points": [
+        [
+          1607.165283203125,
+          734.2720336914062
+        ],
+        [
+          1604.5977783203125,
+          770.7832641601562
+        ]
+      ],
+      "length_meters": 1.8164966767147892,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.079,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00037",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00037__s002",
+      "from": "turn__edge_00037__p001",
+      "to": "turn__edge_00037__p002",
+      "points": [
+        [
+          1604.5977783203125,
+          770.7832641601562
+        ],
+        [
+          1613.8634033203125,
+          798.4033813476562
+        ]
+      ],
+      "length_meters": 1.4458388399006188,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.079,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00037",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00037__s003",
+      "from": "turn__edge_00037__p002",
+      "to": "node_0030",
+      "points": [
+        [
+          1613.8634033203125,
+          798.4033813476562
+        ],
+        [
+          1552.3687744140625,
+          798.9494018554688
+        ]
+      ],
+      "length_meters": 3.052047492799921,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.079,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00037",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00038",
+      "from": "node_0020",
+      "to": "node_0028",
+      "points": [
+        [
+          1491.5316162109375,
+          800.9011840820312
+        ],
+        [
+          1488.6883544921875,
+          862.3745727539062
+        ]
+      ],
+      "length_meters": 3.0541345843176138,
+      "minimum_width_meters": 5.558,
+      "median_width_meters": 6.047,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00038",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00039",
+      "from": "node_0021",
+      "to": "turn__edge_00039__p001",
+      "points": [
+        [
+          1233.228515625,
+          760.8511962890625
+        ],
+        [
+          1150.12255859375,
+          763.1654663085938
+        ]
+      ],
+      "length_meters": 4.126078285638783,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.163,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00039",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00039__s002",
+      "from": "turn__edge_00039__p001",
+      "to": "node_0118",
+      "points": [
+        [
+          1150.12255859375,
+          763.1654663085938
+        ],
+        [
+          1155.47765625,
+          811.4092153320313
+        ]
+      ],
+      "length_meters": 2.4090022006670595,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.163,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00039",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00040",
+      "from": "node_0021",
+      "to": "turn__edge_00040__p001",
+      "points": [
+        [
+          1233.228515625,
+          760.8511962890625
+        ],
+        [
+          1304.80908203125,
+          780.0032958984375
+        ]
+      ],
+      "length_meters": 3.6774443653592885,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 1.588,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00040",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00040__s002",
+      "from": "turn__edge_00040__p001",
+      "to": "turn__edge_00040__p002",
+      "points": [
+        [
+          1304.80908203125,
+          780.0032958984375
+        ],
+        [
+          1361.451904296875,
+          776.1798095703125
+        ]
+      ],
+      "length_meters": 2.8175332300183245,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 1.588,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00040",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00040__s003",
+      "from": "turn__edge_00040__p002",
+      "to": "node_0022",
+      "points": [
+        [
+          1361.451904296875,
+          776.1798095703125
+        ],
+        [
+          1400.82861328125,
+          777.61767578125
+        ]
+      ],
+      "length_meters": 1.9555357005334557,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 1.588,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00040",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00047",
+      "from": "node_0026",
+      "to": "node_0119",
+      "points": [
+        [
+          1123.328857421875,
+          868.3096313476562
+        ],
+        [
+          1104.344072265625,
+          809.5730014648437
+        ]
+      ],
+      "length_meters": 3.063536446681593,
+      "minimum_width_meters": 7.821,
+      "median_width_meters": 9.141,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00047",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00048",
+      "from": "node_0026",
+      "to": "turn__edge_00048__p001",
+      "points": [
+        [
+          1123.328857421875,
+          868.3096313476562
+        ],
+        [
+          1184.1328125,
+          871.6792602539062
+        ]
+      ],
+      "length_meters": 3.0222798917554865,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 1.588,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00048",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00048__s002",
+      "from": "turn__edge_00048__p001",
+      "to": "turn__edge_00048__p002",
+      "points": [
+        [
+          1184.1328125,
+          871.6792602539062
+        ],
+        [
+          1289.7005615234375,
+          887.187255859375
+        ]
+      ],
+      "length_meters": 5.295468729764916,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 1.588,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00048",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00050",
+      "from": "node_0028",
+      "to": "node_0043",
+      "points": [
+        [
+          1488.6883544921875,
+          862.3745727539062
+        ],
+        [
+          1485.9080810546875,
+          927.7318115234375
+        ]
+      ],
+      "length_meters": 3.246558837542846,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 5.726,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00050",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00051",
+      "from": "node_0029",
+      "to": "node_0036",
+      "points": [
+        [
+          1064.2984619140625,
+          832.811279296875
+        ],
+        [
+          1096,
+          920
+        ]
+      ],
+      "length_meters": 4.604254975451475,
+      "minimum_width_meters": 8.098,
+      "median_width_meters": 9.174,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00051",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00052",
+      "from": "node_0030",
+      "to": "turn__edge_00052__p001",
+      "points": [
+        [
+          1552.3687744140625,
+          798.9494018554688
+        ],
+        [
+          1650.670166015625,
+          822.9953002929688
+        ]
+      ],
+      "length_meters": 5.022454216890813,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00052",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00052__s002",
+      "from": "turn__edge_00052__p001",
+      "to": "turn__edge_00052__p002",
+      "points": [
+        [
+          1650.670166015625,
+          822.9953002929688
+        ],
+        [
+          1646.497314453125,
+          848.0810546875
+        ]
+      ],
+      "length_meters": 1.2620920193410001,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00052",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00054",
+      "from": "node_0030",
+      "to": "turn__edge_00054__p001",
+      "points": [
+        [
+          1552.3687744140625,
+          798.9494018554688
+        ],
+        [
+          1562.359375,
+          869.9442749023438
+        ]
+      ],
+      "length_meters": 3.5581323278632158,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00054",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00054__s002",
+      "from": "turn__edge_00054__p001",
+      "to": "node_0045",
+      "points": [
+        [
+          1562.359375,
+          869.9442749023438
+        ],
+        [
+          1563.61083984375,
+          949.9835205078125
+        ]
+      ],
+      "length_meters": 3.9727665911246146,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00054",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00058",
+      "from": "node_0032",
+      "to": "node_0038",
+      "points": [
+        [
+          661.2100830078125,
+          881.276611328125
+        ],
+        [
+          698.6090087890625,
+          959.0928955078125
+        ]
+      ],
+      "length_meters": 4.284826514449492,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.276,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00058",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00064",
+      "from": "node_0036",
+      "to": "turn__edge_00064__p001",
+      "points": [
+        [
+          1096,
+          920
+        ],
+        [
+          1048,
+          976
+        ]
+      ],
+      "length_meters": 3.6605,
+      "minimum_width_meters": 3.176,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00064",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00064__s002",
+      "from": "turn__edge_00064__p001",
+      "to": "node_0048",
+      "points": [
+        [
+          1048,
+          976
+        ],
+        [
+          863.7003784179688,
+          984.9196166992188
+        ]
+      ],
+      "length_meters": 9.157342484190533,
+      "minimum_width_meters": 3.176,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00064",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00065",
+      "from": "node_0036",
+      "to": "turn__edge_00065__p001",
+      "points": [
+        [
+          1096,
+          920
+        ],
+        [
+          1136,
+          952
+        ]
+      ],
+      "length_meters": 2.5423,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00065",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00065__s002",
+      "from": "turn__edge_00065__p001",
+      "to": "node_0044",
+      "points": [
+        [
+          1136,
+          952
+        ],
+        [
+          1352,
+          968
+        ]
+      ],
+      "length_meters": 10.7493,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00065",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00066",
+      "from": "node_0038",
+      "to": "turn__edge_00066__p001",
+      "points": [
+        [
+          698.6090087890625,
+          959.0928955078125
+        ],
+        [
+          601.1474609375,
+          979.3023681640625
+        ]
+      ],
+      "length_meters": 4.939829102632706,
+      "minimum_width_meters": 3.274,
+      "median_width_meters": 3.761,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00066",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00067",
+      "from": "node_0038",
+      "to": "node_0048",
+      "points": [
+        [
+          698.6090087890625,
+          959.0928955078125
+        ],
+        [
+          863.7003784179688,
+          984.9196166992188
+        ]
+      ],
+      "length_meters": 8.292999578172154,
+      "minimum_width_meters": 2.863,
+      "median_width_meters": 3.67,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00067",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00068",
+      "from": "node_0039",
+      "to": "node_0043",
+      "points": [
+        [
+          1440,
+          936
+        ],
+        [
+          1485.9080810546875,
+          927.7318115234375
+        ]
+      ],
+      "length_meters": 2.3150369704182365,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 4.83,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00068",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00069",
+      "from": "node_0039",
+      "to": "node_0044",
+      "points": [
+        [
+          1440,
+          936
+        ],
+        [
+          1352,
+          968
+        ]
+      ],
+      "length_meters": 4.6472,
+      "minimum_width_meters": 3.274,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00069",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00075",
+      "from": "node_0044",
+      "to": "turn__edge_00075__p001",
+      "points": [
+        [
+          1352,
+          968
+        ],
+        [
+          1444.4598388671875,
+          977.677978515625
+        ]
+      ],
+      "length_meters": 4.61377383961238,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00075",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00075__s002",
+      "from": "turn__edge_00075__p001",
+      "to": "turn__edge_00075__p002",
+      "points": [
+        [
+          1444.4598388671875,
+          977.677978515625
+        ],
+        [
+          1489.0858154296875,
+          1030.2447509765625
+        ]
+      ],
+      "length_meters": 3.4221616735613267,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00075",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00075__s003",
+      "from": "turn__edge_00075__p002",
+      "to": "node_0047",
+      "points": [
+        [
+          1489.0858154296875,
+          1030.2447509765625
+        ],
+        [
+          1522.0556640625,
+          984.2012329101562
+        ]
+      ],
+      "length_meters": 2.810525814977562,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00075",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00076",
+      "from": "node_0045",
+      "to": "node_0047",
+      "points": [
+        [
+          1563.61083984375,
+          949.9835205078125
+        ],
+        [
+          1522.0556640625,
+          984.2012329101562
+        ]
+      ],
+      "length_meters": 2.6715452237261545,
+      "minimum_width_meters": 6.548,
+      "median_width_meters": 7.191,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00076",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00077",
+      "from": "node_0045",
+      "to": "node_0090",
+      "points": [
+        [
+          1563.61083984375,
+          949.9835205078125
+        ],
+        [
+          1597.703857421875,
+          935.4310302734375
+        ]
+      ],
+      "length_meters": 1.8397022807462773,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 4.163,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00077",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00081",
+      "from": "node_0048",
+      "to": "turn__edge_00081__p001",
+      "points": [
+        [
+          863.7003784179688,
+          984.9196166992188
+        ],
+        [
+          683.90966796875,
+          984.6773071289062
+        ]
+      ],
+      "length_meters": 8.92287124338441,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00081",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00083__s002",
+      "from": "turn__edge_00083__p001",
+      "to": "node_0091",
+      "points": [
+        [
+          597.9309692382812,
+          1125.247314453125
+        ],
+        [
+          599.3663330078125,
+          1200.2392578125
+        ]
+      ],
+      "length_meters": 3.7224693317777766,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.697,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00083",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00084",
+      "from": "node_0053",
+      "to": "node_0125",
+      "points": [
+        [
+          2668.424560546875,
+          1081.6129150390625
+        ],
+        [
+          2707.902470703125,
+          1080.09092578125
+        ]
+      ],
+      "length_meters": 1.9607112924722407,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00084",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00084__s002",
+      "from": "turn__edge_00084__p001",
+      "to": "node_0054",
+      "points": [
+        [
+          2824,
+          1064
+        ],
+        [
+          2848,
+          1088
+        ]
+      ],
+      "length_meters": 1.6845,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00084",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00085",
+      "from": "node_0054",
+      "to": "node_0089",
+      "points": [
+        [
+          2848,
+          1088
+        ],
+        [
+          2960,
+          1080
+        ]
+      ],
+      "length_meters": 5.5726,
+      "minimum_width_meters": 3.176,
+      "median_width_meters": 3.176,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00085",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00086",
+      "from": "node_0054",
+      "to": "node_0128",
+      "points": [
+        [
+          2848,
+          1088
+        ],
+        [
+          2832.923943359375,
+          1233.64953515625
+        ]
+      ],
+      "length_meters": 7.267085282973328,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00086",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00087",
+      "from": "node_0055",
+      "to": "node_0092",
+      "points": [
+        [
+          2840,
+          1504
+        ],
+        [
+          2752,
+          1512
+        ]
+      ],
+      "length_meters": 4.3854,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00087",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00088",
+      "from": "node_0055",
+      "to": "turn__edge_00088__p001",
+      "points": [
+        [
+          2840,
+          1504
+        ],
+        [
+          2880,
+          1520
+        ]
+      ],
+      "length_meters": 2.1381,
+      "minimum_width_meters": 4.276,
+      "median_width_meters": 4.73,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00088",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00088__s002",
+      "from": "turn__edge_00088__p001",
+      "to": "node_0056",
+      "points": [
+        [
+          2880,
+          1520
+        ],
+        [
+          2904,
+          1560
+        ]
+      ],
+      "length_meters": 2.3151,
+      "minimum_width_meters": 4.276,
+      "median_width_meters": 4.73,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00088",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00089",
+      "from": "node_0056",
+      "to": "node_0060",
+      "points": [
+        [
+          2904,
+          1560
+        ],
+        [
+          2846.925048828125,
+          1682.8367919921875
+        ]
+      ],
+      "length_meters": 6.722220252173289,
+      "minimum_width_meters": 2.863,
+      "median_width_meters": 4.01,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00089",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00090",
+      "from": "node_0056",
+      "to": "node_0057",
+      "points": [
+        [
+          2904,
+          1560
+        ],
+        [
+          3016,
+          1560
+        ]
+      ],
+      "length_meters": 5.5585,
+      "minimum_width_meters": 7.102,
+      "median_width_meters": 7.147,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00090",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00091",
+      "from": "node_0057",
+      "to": "turn__edge_00091__p001",
+      "points": [
+        [
+          3016,
+          1560
+        ],
+        [
+          3040,
+          1536
+        ]
+      ],
+      "length_meters": 1.6845,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00091__s002",
+      "from": "turn__edge_00091__p001",
+      "to": "turn__edge_00091__p002",
+      "points": [
+        [
+          3040,
+          1536
+        ],
+        [
+          3152,
+          1536
+        ]
+      ],
+      "length_meters": 5.5585,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00091__s003",
+      "from": "turn__edge_00091__p002",
+      "to": "turn__edge_00091__p003",
+      "points": [
+        [
+          3152,
+          1536
+        ],
+        [
+          3184,
+          1560
+        ]
+      ],
+      "length_meters": 1.9852,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00091__s004",
+      "from": "turn__edge_00091__p003",
+      "to": "turn__edge_00091__p004",
+      "points": [
+        [
+          3184,
+          1560
+        ],
+        [
+          3296,
+          1576
+        ]
+      ],
+      "length_meters": 5.6149,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_segment_index": 3
+    },
+    {
+      "id": "edge_00091__s005",
+      "from": "turn__edge_00091__p004",
+      "to": "turn__edge_00091__p005",
+      "points": [
+        [
+          3296,
+          1576
+        ],
+        [
+          3352.57275390625,
+          1583.421630859375
+        ]
+      ],
+      "length_meters": 2.8317156495795572,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_segment_index": 4
+    },
+    {
+      "id": "edge_00091__s009",
+      "from": "turn__edge_00091__p008",
+      "to": "node_0076",
+      "points": [
+        [
+          3201.3408203125,
+          2098.616943359375
+        ],
+        [
+          3153.176513671875,
+          2098.1611328125
+        ]
+      ],
+      "length_meters": 2.3904614418542938,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00091",
+      "source_segment_index": 8
+    },
+    {
+      "id": "edge_00092",
+      "from": "node_0057",
+      "to": "node_0058",
+      "points": [
+        [
+          3016,
+          1560
+        ],
+        [
+          2979.887451171875,
+          1600.8232421875
+        ]
+      ],
+      "length_meters": 2.705,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 5.781,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00092",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00093",
+      "from": "node_0058",
+      "to": "node_0093",
+      "points": [
+        [
+          2979.887451171875,
+          1600.8232421875
+        ],
+        [
+          3072,
+          1640
+        ]
+      ],
+      "length_meters": 4.9678,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 4.123,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00093",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00094",
+      "from": "node_0058",
+      "to": "node_0059",
+      "points": [
+        [
+          2979.887451171875,
+          1600.8232421875
+        ],
+        [
+          3009.52490234375,
+          1687.229736328125
+        ]
+      ],
+      "length_meters": 4.533526107739375,
+      "minimum_width_meters": 3.176,
+      "median_width_meters": 3.274,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00094",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00096",
+      "from": "node_0060",
+      "to": "turn__edge_00096__p001",
+      "points": [
+        [
+          2846.925048828125,
+          1682.8367919921875
+        ],
+        [
+          2847.791748046875,
+          1754.7215576171875
+        ]
+      ],
+      "length_meters": 3.5678403095052404,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 3.274,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00096__s002",
+      "from": "turn__edge_00096__p001",
+      "to": "turn__edge_00096__p002",
+      "points": [
+        [
+          2847.791748046875,
+          1754.7215576171875
+        ],
+        [
+          2843.224853515625,
+          1810.962158203125
+        ]
+      ],
+      "length_meters": 2.8003613770696694,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 3.274,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00096__s003",
+      "from": "turn__edge_00096__p002",
+      "to": "turn__edge_00096__p003",
+      "points": [
+        [
+          2843.224853515625,
+          1810.962158203125
+        ],
+        [
+          2836.88720703125,
+          1902.5118408203125
+        ]
+      ],
+      "length_meters": 4.55440839605982,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 3.274,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00096__s004",
+      "from": "turn__edge_00096__p003",
+      "to": "node_0071",
+      "points": [
+        [
+          2836.88720703125,
+          1902.5118408203125
+        ],
+        [
+          2845.812744140625,
+          1996.384765625
+        ]
+      ],
+      "length_meters": 4.67984653659731,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 3.274,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00096",
+      "source_segment_index": 3
+    },
+    {
+      "id": "edge_00098",
+      "from": "node_0062",
+      "to": "node_0064",
+      "points": [
+        [
+          3047.87451171875,
+          1714.4385986328125
+        ],
+        [
+          3051.748779296875,
+          1782.01904296875
+        ]
+      ],
+      "length_meters": 3.359468057642364,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 2.447,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00098",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00100",
+      "from": "node_0064",
+      "to": "node_0065",
+      "points": [
+        [
+          3051.748779296875,
+          1782.01904296875
+        ],
+        [
+          3051.100830078125,
+          1835.066162109375
+        ]
+      ],
+      "length_meters": 2.6328807048899177,
+      "minimum_width_meters": 1.776,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00100",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00101",
+      "from": "node_0065",
+      "to": "turn__edge_00101__p001",
+      "points": [
+        [
+          3051.100830078125,
+          1835.066162109375
+        ],
+        [
+          3054.393310546875,
+          1876.8973388671875
+        ]
+      ],
+      "length_meters": 2.0824671427046493,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.176,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00101",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00101__s002",
+      "from": "turn__edge_00101__p001",
+      "to": "node_0066",
+      "points": [
+        [
+          3054.393310546875,
+          1876.8973388671875
+        ],
+        [
+          3106.04150390625,
+          1886.619140625
+        ]
+      ],
+      "length_meters": 2.6082709042797494,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 3.176,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00101",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00102",
+      "from": "node_0066",
+      "to": "node_0130",
+      "points": [
+        [
+          3106.04150390625,
+          1886.619140625
+        ],
+        [
+          3152.289416015625,
+          1906.719388671875
+        ]
+      ],
+      "length_meters": 2.502653442106337,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00102",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00104",
+      "from": "node_0067",
+      "to": "node_0069",
+      "points": [
+        [
+          3179.318115234375,
+          1848.473388671875
+        ],
+        [
+          3175.512939453125,
+          1726.785888671875
+        ]
+      ],
+      "length_meters": 6.042201140976707,
+      "minimum_width_meters": 4.049,
+      "median_width_meters": 5.194,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00104",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00106",
+      "from": "node_0068",
+      "to": "node_0134",
+      "points": [
+        [
+          3015.39404296875,
+          1856.5157470703125
+        ],
+        [
+          3006.95861328125,
+          1934.5738583984376
+        ]
+      ],
+      "length_meters": 3.8965139207119823,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 2.447,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00106",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00107",
+      "from": "node_0069",
+      "to": "turn__edge_00107__p001",
+      "points": [
+        [
+          3175.512939453125,
+          1726.785888671875
+        ],
+        [
+          3184.12060546875,
+          1664.86962890625
+        ]
+      ],
+      "length_meters": 3.1024045725891263,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 4.536,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00107",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00107__s002",
+      "from": "turn__edge_00107__p001",
+      "to": "node_0096",
+      "points": [
+        [
+          3184.12060546875,
+          1664.86962890625
+        ],
+        [
+          3226.714111328125,
+          1666.7606201171875
+        ]
+      ],
+      "length_meters": 2.115962432940832,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 4.536,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00107",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00108",
+      "from": "node_0070",
+      "to": "node_0073",
+      "points": [
+        [
+          3161.558349609375,
+          2015.112060546875
+        ],
+        [
+          3184.024658203125,
+          1957.16552734375
+        ]
+      ],
+      "length_meters": 3.0844180663626997,
+      "minimum_width_meters": 2.246,
+      "median_width_meters": 3.369,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00108",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00109",
+      "from": "node_0070",
+      "to": "node_0076",
+      "points": [
+        [
+          3161.558349609375,
+          2015.112060546875
+        ],
+        [
+          3153.176513671875,
+          2098.1611328125
+        ]
+      ],
+      "length_meters": 4.142594906132591,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 5.615,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00109",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00110",
+      "from": "node_0071",
+      "to": "node_0101",
+      "points": [
+        [
+          2845.812744140625,
+          1996.384765625
+        ],
+        [
+          2776,
+          1944
+        ]
+      ],
+      "length_meters": 4.3316861283293555,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 2.511,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00110",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00111",
+      "from": "node_0071",
+      "to": "node_0077",
+      "points": [
+        [
+          2845.812744140625,
+          1996.384765625
+        ],
+        [
+          2866.14306640625,
+          2067.290283203125
+        ]
+      ],
+      "length_meters": 3.6607741066899675,
+      "minimum_width_meters": 3.551,
+      "median_width_meters": 4.049,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00111",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00112",
+      "from": "node_0072",
+      "to": "node_0102",
+      "points": [
+        [
+          3074.505859375,
+          2036.26220703125
+        ],
+        [
+          3077.260498046875,
+          1940.0660400390625
+        ]
+      ],
+      "length_meters": 4.776092601430788,
+      "minimum_width_meters": 1.123,
+      "median_width_meters": 2.143,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00112",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00113",
+      "from": "node_0073",
+      "to": "turn__edge_00113__p001",
+      "points": [
+        [
+          3184.024658203125,
+          1957.16552734375
+        ],
+        [
+          3188.83203125,
+          1905.6943359375
+        ]
+      ],
+      "length_meters": 2.565590023454617,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 1.588,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00113",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00116",
+      "from": "node_0076",
+      "to": "node_0135",
+      "points": [
+        [
+          3153.176513671875,
+          2098.1611328125
+        ],
+        [
+          3029.503533203125,
+          2107.899494140625
+        ]
+      ],
+      "length_meters": 6.156786031277077,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00116",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00117",
+      "from": "node_0077",
+      "to": "node_0129",
+      "points": [
+        [
+          2866.14306640625,
+          2067.290283203125
+        ],
+        [
+          2696.933123046875,
+          2120.6685625
+        ]
+      ],
+      "length_meters": 8.805680772822297,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00117",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00118",
+      "from": "node_0077",
+      "to": "node_0078",
+      "points": [
+        [
+          2866.14306640625,
+          2067.290283203125
+        ],
+        [
+          2942.138671875,
+          2103.095458984375
+        ]
+      ],
+      "length_meters": 4.1692466222641915,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00118",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00119",
+      "from": "node_0104",
+      "to": "node_0105",
+      "points": [
+        [
+          2176.376923828125,
+          574.8446782226563
+        ],
+        [
+          2182.679224609375,
+          702.1917426757813
+        ]
+      ],
+      "length_meters": 6.3279,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00119",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00120",
+      "from": "node_0105",
+      "to": "node_0008",
+      "points": [
+        [
+          2182.679224609375,
+          702.1917426757813
+        ],
+        [
+          2228.279052734375,
+          686.2078247070312
+        ]
+      ],
+      "length_meters": 2.3981,
+      "minimum_width_meters": 4.764,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00120",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00121",
+      "from": "node_0013",
+      "to": "node_0008",
+      "points": [
+        [
+          2343.016845703125,
+          702.2505493164062
+        ],
+        [
+          2228.279052734375,
+          686.2078247070312
+        ]
+      ],
+      "length_meters": 5.7497,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00121",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00122",
+      "from": "node_0024",
+      "to": "node_0106",
+      "points": [
+        [
+          2363.0966796875,
+          809.9456787109375
+        ],
+        [
+          2364.600546875,
+          923.8781264648437
+        ]
+      ],
+      "length_meters": 5.6549,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00122",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00123",
+      "from": "node_0106",
+      "to": "node_0107",
+      "points": [
+        [
+          2364.600546875,
+          923.8781264648437
+        ],
+        [
+          2409.081943359375,
+          965.563341796875
+        ]
+      ],
+      "length_meters": 3.0254,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00123",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00124",
+      "from": "node_0107",
+      "to": "node_0050",
+      "points": [
+        [
+          2409.081943359375,
+          965.563341796875
+        ],
+        [
+          2562.53466796875,
+          968.0130615234375
+        ]
+      ],
+      "length_meters": 7.616701220328397,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00124",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00127",
+      "from": "node_0034",
+      "to": "node_0024",
+      "points": [
+        [
+          2306.29052734375,
+          832.0798950195312
+        ],
+        [
+          2363.0966796875,
+          809.9456787109375
+        ]
+      ],
+      "length_meters": 3.0257,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00127",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00128",
+      "from": "node_0024",
+      "to": "node_0034",
+      "points": [
+        [
+          2363.0966796875,
+          809.9456787109375
+        ],
+        [
+          2306.29052734375,
+          832.0798950195312
+        ]
+      ],
+      "length_meters": 3.0257,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00128",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00129",
+      "from": "node_0037",
+      "to": "node_0108",
+      "points": [
+        [
+          2172.338134765625,
+          910.5582885742188
+        ],
+        [
+          2021.0479814453124,
+          900.4580708007812
+        ]
+      ],
+      "length_meters": 7.5251,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00129",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00131",
+      "from": "node_0109",
+      "to": "node_0112",
+      "points": [
+        [
+          2309.0741552734376,
+          885.4761362304688
+        ],
+        [
+          2251.155353515625,
+          877.7756923828125
+        ]
+      ],
+      "length_meters": 2.8998,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00131",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00134",
+      "from": "node_0111",
+      "to": "node_0110",
+      "points": [
+        [
+          2231.937595703125,
+          847.3836938476562
+        ],
+        [
+          2079.790021484375,
+          845.0687260742187
+        ]
+      ],
+      "length_meters": 7.5518,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00134",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00135",
+      "from": "node_0112",
+      "to": "node_0111",
+      "points": [
+        [
+          2251.155353515625,
+          877.7756923828125
+        ],
+        [
+          2231.937595703125,
+          847.3836938476562
+        ]
+      ],
+      "length_meters": 1.7846,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00135",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00136",
+      "from": "node_0034",
+      "to": "node_0109",
+      "points": [
+        [
+          2306.29052734375,
+          832.0798950195312
+        ],
+        [
+          2309.0741552734376,
+          885.4761362304688
+        ]
+      ],
+      "length_meters": 2.6536,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00136",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00137",
+      "from": "node_0012",
+      "to": "node_0115",
+      "points": [
+        [
+          1637.349365234375,
+          668.8585205078125
+        ],
+        [
+          1600.1850029296875,
+          682.2827241210938
+        ]
+      ],
+      "length_meters": 1.961073816234734,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00138",
+      "from": "node_0016",
+      "to": "turn__edge_00039__p001",
+      "points": [
+        [
+          1154.7662353515625,
+          713.1249389648438
+        ],
+        [
+          1150.12255859375,
+          763.1654663085938
+        ]
+      ],
+      "length_meters": 2.494139984591488,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00139",
+      "from": "node_0113",
+      "to": "node_0012",
+      "points": [
+        [
+          1642.5337705078125,
+          702.2879169921875
+        ],
+        [
+          1637.349365234375,
+          668.8585205078125
+        ]
+      ],
+      "length_meters": 1.678906082502539,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.382,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00017",
+      "source_segment_index": 2
+    },
+    {
+      "id": "edge_00140",
+      "from": "node_0114",
+      "to": "node_0018",
+      "points": [
+        [
+          1449.495,
+          709.086
+        ],
+        [
+          1368,
+          712
+        ]
+      ],
+      "length_meters": 4.04711367714863,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.555,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00034",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00141",
+      "from": "node_0115",
+      "to": "node_0116",
+      "points": [
+        [
+          1600.1850029296875,
+          682.2827241210938
+        ],
+        [
+          1590.6262314453124,
+          715.4312958984375
+        ]
+      ],
+      "length_meters": 1.712168793737002,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00142",
+      "from": "node_0116",
+      "to": "node_0017",
+      "points": [
+        [
+          1590.6262314453124,
+          715.4312958984375
+        ],
+        [
+          1492.3294677734375,
+          714.01416015625
+        ]
+      ],
+      "length_meters": 4.878893423676787,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00143",
+      "from": "node_0116",
+      "to": "node_0019",
+      "points": [
+        [
+          1590.6262314453124,
+          715.4312958984375
+        ],
+        [
+          1607.165283203125,
+          734.2720336914062
+        ]
+      ],
+      "length_meters": 1.2442118537540852,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00144",
+      "from": "node_0019",
+      "to": "node_0116",
+      "points": [
+        [
+          1607.165283203125,
+          734.2720336914062
+        ],
+        [
+          1590.6262314453124,
+          715.4312958984375
+        ]
+      ],
+      "length_meters": 1.2442118537540852,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00145",
+      "from": "node_0117",
+      "to": "node_0029",
+      "points": [
+        [
+          1055.9019267578126,
+          753.8112880859375
+        ],
+        [
+          1064.2984619140625,
+          832.811279296875
+        ]
+      ],
+      "length_meters": 3.94278677106243,
+      "minimum_width_meters": 11.286,
+      "median_width_meters": 13.82,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00031",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00146",
+      "from": "node_0026",
+      "to": "node_0036",
+      "points": [
+        [
+          1123.328857421875,
+          868.3096313476562
+        ],
+        [
+          1096,
+          920
+        ]
+      ],
+      "length_meters": 2.9018257627128095,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00147",
+      "from": "turn__edge_00064__p001",
+      "to": "turn__edge_00065__p001",
+      "points": [
+        [
+          1048,
+          976
+        ],
+        [
+          1136,
+          952
+        ]
+      ],
+      "length_meters": 4.5268764990265,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00148",
+      "from": "node_0029",
+      "to": "turn__edge_00064__p001",
+      "points": [
+        [
+          1064.2984619140625,
+          832.811279296875
+        ],
+        [
+          1048,
+          976
+        ]
+      ],
+      "length_meters": 7.152224084374566,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00149",
+      "from": "node_0036",
+      "to": "turn__edge_00048__p001",
+      "points": [
+        [
+          1096,
+          920
+        ],
+        [
+          1184.1328125,
+          871.6792602539062
+        ]
+      ],
+      "length_meters": 4.988234069778721,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00150",
+      "from": "node_0118",
+      "to": "node_0026",
+      "points": [
+        [
+          1155.47765625,
+          811.4092153320313
+        ],
+        [
+          1123.328857421875,
+          868.3096313476562
+        ]
+      ],
+      "length_meters": 3.2434863141464447,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.163,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00039",
+      "source_segment_index": 1
+    },
+    {
+      "id": "edge_00151",
+      "from": "node_0119",
+      "to": "node_0029",
+      "points": [
+        [
+          1104.344072265625,
+          809.5730014648437
+        ],
+        [
+          1064.2984619140625,
+          832.811279296875
+        ]
+      ],
+      "length_meters": 2.2978188763996497,
+      "minimum_width_meters": 7.821,
+      "median_width_meters": 9.141,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00047",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00152",
+      "from": "node_0029",
+      "to": "node_0026",
+      "points": [
+        [
+          1064.2984619140625,
+          832.811279296875
+        ],
+        [
+          1123.328857421875,
+          868.3096313476562
+        ]
+      ],
+      "length_meters": 3.418552898742742,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00153",
+      "from": "node_0119",
+      "to": "node_0036",
+      "points": [
+        [
+          1104.344072265625,
+          809.5730014648437
+        ],
+        [
+          1096,
+          920
+        ]
+      ],
+      "length_meters": 5.49602309141106,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00154",
+      "from": "node_0119",
+      "to": "turn__edge_00064__p001",
+      "points": [
+        [
+          1104.344072265625,
+          809.5730014648437
+        ],
+        [
+          1048,
+          976
+        ]
+      ],
+      "length_meters": 8.720142630134491,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00155",
+      "from": "node_0119",
+      "to": "turn__edge_00048__p001",
+      "points": [
+        [
+          1104.344072265625,
+          809.5730014648437
+        ],
+        [
+          1184.1328125,
+          871.6792602539062
+        ]
+      ],
+      "length_meters": 5.018053723784217,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00156",
+      "from": "node_0120",
+      "to": "node_0015",
+      "points": [
+        [
+          812.8366318359375,
+          734.8567060546875
+        ],
+        [
+          1000.4302368164062,
+          710.5858154296875
+        ]
+      ],
+      "length_meters": 9.387712958142679,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 5.405,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00028",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00157",
+      "from": "node_0032",
+      "to": "node_0122",
+      "points": [
+        [
+          661.2100830078125,
+          881.276611328125
+        ],
+        [
+          702.4884204101562,
+          845.463
+        ]
+      ],
+      "length_meters": 2.7121855542076294,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00158",
+      "from": "node_0032",
+      "to": "node_0121",
+      "points": [
+        [
+          661.2100830078125,
+          881.276611328125
+        ],
+        [
+          732.9442568359375,
+          885.9499555664063
+        ]
+      ],
+      "length_meters": 3.567654305600361,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00159",
+      "from": "turn__edge_00066__p001",
+      "to": "turn__edge_00083__p001",
+      "points": [
+        [
+          601.1474609375,
+          979.3023681640625
+        ],
+        [
+          597.9309692382812,
+          1125.247314453125
+        ]
+      ],
+      "length_meters": 7.244884923319288,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00160",
+      "from": "turn__edge_00081__p001",
+      "to": "turn__edge_00066__p001",
+      "points": [
+        [
+          683.90966796875,
+          984.6773071289062
+        ],
+        [
+          601.1474609375,
+          979.3023681640625
+        ]
+      ],
+      "length_meters": 4.116072330804212,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00161",
+      "from": "node_0121",
+      "to": "node_0025",
+      "points": [
+        [
+          732.9442568359375,
+          885.9499555664063
+        ],
+        [
+          866.9423828125,
+          875.560546875
+        ]
+      ],
+      "length_meters": 6.670174327709801,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00162",
+      "from": "node_0122",
+      "to": "node_0014",
+      "points": [
+        [
+          702.4884204101562,
+          845.463
+        ],
+        [
+          722.2225341796875,
+          768.4797973632812
+        ]
+      ],
+      "length_meters": 3.944144732526995,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00163",
+      "from": "node_0117",
+      "to": "node_0119",
+      "points": [
+        [
+          1055.9019267578126,
+          753.8112880859375
+        ],
+        [
+          1104.344072265625,
+          809.5730014648437
+        ]
+      ],
+      "length_meters": 3.6658489632764613,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00164",
+      "from": "node_0118",
+      "to": "node_0119",
+      "points": [
+        [
+          1155.47765625,
+          811.4092153320313
+        ],
+        [
+          1104.344072265625,
+          809.5730014648437
+        ]
+      ],
+      "length_meters": 2.5393528773289824,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00165",
+      "from": "node_0120",
+      "to": "node_0004",
+      "points": [
+        [
+          812.8366318359375,
+          734.8567060546875
+        ],
+        [
+          880.1619873046875,
+          703.9078369140625
+        ]
+      ],
+      "length_meters": 3.677429490865645,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00166",
+      "from": "turn__edge_00009__p001",
+      "to": "node_0120",
+      "points": [
+        [
+          715.4266357421875,
+          703.8157958984375
+        ],
+        [
+          812.8366318359375,
+          734.8567060546875
+        ]
+      ],
+      "length_meters": 5.073898590063485,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00167",
+      "from": "node_0122",
+      "to": "node_0121",
+      "points": [
+        [
+          702.4884204101562,
+          845.463
+        ],
+        [
+          732.9442568359375,
+          885.9499555664063
+        ]
+      ],
+      "length_meters": 2.514368337481077,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00168",
+      "from": "node_0038",
+      "to": "node_0121",
+      "points": [
+        [
+          698.6090087890625,
+          959.0928955078125
+        ],
+        [
+          732.9442568359375,
+          885.9499555664063
+        ]
+      ],
+      "length_meters": 4.010085475580238,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00169",
+      "from": "node_0122",
+      "to": "node_0038",
+      "points": [
+        [
+          702.4884204101562,
+          845.463
+        ],
+        [
+          698.6090087890625,
+          959.0928955078125
+        ]
+      ],
+      "length_meters": 5.642642663302354,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00170",
+      "from": "node_0032",
+      "to": "turn__edge_00081__p001",
+      "points": [
+        [
+          661.2100830078125,
+          881.276611328125
+        ],
+        [
+          683.90966796875,
+          984.6773071289062
+        ]
+      ],
+      "length_meters": 5.2538925399545855,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00171",
+      "from": "node_0038",
+      "to": "turn__edge_00081__p001",
+      "points": [
+        [
+          698.6090087890625,
+          959.0928955078125
+        ],
+        [
+          683.90966796875,
+          984.6773071289062
+        ]
+      ],
+      "length_meters": 1.4643823312886226,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00172",
+      "from": "node_0117",
+      "to": "node_0036",
+      "points": [
+        [
+          1055.9019267578126,
+          753.8112880859375
+        ],
+        [
+          1096,
+          920
+        ]
+      ],
+      "length_meters": 8.48448939007663,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00173",
+      "from": "node_0117",
+      "to": "node_0026",
+      "points": [
+        [
+          1055.9019267578126,
+          753.8112880859375
+        ],
+        [
+          1123.328857421875,
+          868.3096313476562
+        ]
+      ],
+      "length_meters": 6.5945681462551144,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00176",
+      "from": "node_0050",
+      "to": "node_0127",
+      "points": [
+        [
+          2562.53466796875,
+          968.0130615234375
+        ],
+        [
+          2641.1892109375,
+          988.8271518554687
+        ]
+      ],
+      "length_meters": 4.037924735844761,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00177",
+      "from": "node_0053",
+      "to": "turn__edge_00082__p001",
+      "points": [
+        [
+          2668.424560546875,
+          1081.6129150390625
+        ],
+        [
+          2675.1875,
+          1029.0413818359375
+        ]
+      ],
+      "length_meters": 2.6305815411736093,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00179",
+      "from": "node_0125",
+      "to": "turn__edge_00084__p001",
+      "points": [
+        [
+          2707.902470703125,
+          1080.09092578125
+        ],
+        [
+          2824,
+          1064
+        ]
+      ],
+      "length_meters": 5.816901271070403,
+      "minimum_width_meters": 1.588,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00084",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00181",
+      "from": "node_0125",
+      "to": "node_0054",
+      "points": [
+        [
+          2707.902470703125,
+          1080.09092578125
+        ],
+        [
+          2848,
+          1088
+        ]
+      ],
+      "length_meters": 6.963994516852728,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00183",
+      "from": "turn__edge_00084__p001",
+      "to": "node_0054",
+      "points": [
+        [
+          2824,
+          1064
+        ],
+        [
+          2848,
+          1088
+        ]
+      ],
+      "length_meters": 1.6844697752246314,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00184",
+      "from": "node_0126",
+      "to": "turn__edge_00059__p001",
+      "points": [
+        [
+          1817.7563681640625,
+          856.78228125
+        ],
+        [
+          1701.08056640625,
+          856.1964111328125
+        ]
+      ],
+      "length_meters": 5.790595815678055,
+      "minimum_width_meters": 3.176,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00059",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00185",
+      "from": "turn__edge_00052__p002",
+      "to": "turn__edge_00059__p001",
+      "points": [
+        [
+          1646.497314453125,
+          848.0810546875
+        ],
+        [
+          1701.08056640625,
+          856.1964111328125
+        ]
+      ],
+      "length_meters": 2.738698408989384,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00186",
+      "from": "node_0127",
+      "to": "turn__edge_00082__p001",
+      "points": [
+        [
+          2641.1892109375,
+          988.8271518554687
+        ],
+        [
+          2675.1875,
+          1029.0413818359375
+        ]
+      ],
+      "length_meters": 2.613468314479166,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00187",
+      "from": "turn__edge_00082__p001",
+      "to": "node_0125",
+      "points": [
+        [
+          2675.1875,
+          1029.0413818359375
+        ],
+        [
+          2707.902470703125,
+          1080.09092578125
+        ]
+      ],
+      "length_meters": 3.0091507586857946,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00188",
+      "from": "node_0128",
+      "to": "node_0055",
+      "points": [
+        [
+          2832.923943359375,
+          1233.64953515625
+        ],
+        [
+          2840,
+          1504
+        ]
+      ],
+      "length_meters": 13.421863314184904,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 3.97,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00086",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00189",
+      "from": "turn__edge_00084__p001",
+      "to": "node_0128",
+      "points": [
+        [
+          2824,
+          1064
+        ],
+        [
+          2832.923943359375,
+          1233.64953515625
+        ]
+      ],
+      "length_meters": 8.431205458140138,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00190",
+      "from": "node_0054",
+      "to": "node_0055",
+      "points": [
+        [
+          2848,
+          1088
+        ],
+        [
+          2840,
+          1504
+        ]
+      ],
+      "length_meters": 20.649550621906993,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00191",
+      "from": "node_0056",
+      "to": "node_0058",
+      "points": [
+        [
+          2904,
+          1560
+        ],
+        [
+          2979.887451171875,
+          1600.8232421875
+        ]
+      ],
+      "length_meters": 4.276595242380348,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00192",
+      "from": "node_0059",
+      "to": "node_0062",
+      "points": [
+        [
+          3009.52490234375,
+          1687.229736328125
+        ],
+        [
+          3047.87451171875,
+          1714.4385986328125
+        ]
+      ],
+      "length_meters": 2.3336343075988357,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00193",
+      "from": "node_0129",
+      "to": "node_0103",
+      "points": [
+        [
+          2696.933123046875,
+          2120.6685625
+        ],
+        [
+          2476.436279296875,
+          2117.0517578125
+        ]
+      ],
+      "length_meters": 10.944546674980934,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00117",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00194",
+      "from": "node_0130",
+      "to": "node_0067",
+      "points": [
+        [
+          3152.289416015625,
+          1906.719388671875
+        ],
+        [
+          3179.318115234375,
+          1848.473388671875
+        ]
+      ],
+      "length_meters": 3.186774972099868,
+      "minimum_width_meters": 0.794,
+      "median_width_meters": 2.246,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00102",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00195",
+      "from": "turn__edge_00113__p001",
+      "to": "node_0067",
+      "points": [
+        [
+          3188.83203125,
+          1905.6943359375
+        ],
+        [
+          3179.318115234375,
+          1848.473388671875
+        ]
+      ],
+      "length_meters": 2.8788131294519506,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00196",
+      "from": "node_0130",
+      "to": "node_0073",
+      "points": [
+        [
+          3152.289416015625,
+          1906.719388671875
+        ],
+        [
+          3184.024658203125,
+          1957.16552734375
+        ]
+      ],
+      "length_meters": 2.9578061133117046,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00197",
+      "from": "turn__edge_00113__p001",
+      "to": "node_0130",
+      "points": [
+        [
+          3188.83203125,
+          1905.6943359375
+        ],
+        [
+          3152.289416015625,
+          1906.719388671875
+        ]
+      ],
+      "length_meters": 1.8142929122981493,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00198",
+      "from": "node_0102",
+      "to": "node_0072",
+      "points": [
+        [
+          3077.260498046875,
+          1940.0660400390625
+        ],
+        [
+          3074.505859375,
+          2036.26220703125
+        ]
+      ],
+      "length_meters": 4.776092601430788,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00199",
+      "from": "node_0068",
+      "to": "node_0065",
+      "points": [
+        [
+          3015.39404296875,
+          1856.5157470703125
+        ],
+        [
+          3051.100830078125,
+          1835.066162109375
+        ]
+      ],
+      "length_meters": 2.067255468989204,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00200",
+      "from": "node_0131",
+      "to": "node_0132",
+      "points": [
+        [
+          3035.70955078125,
+          2016.26416796875
+        ],
+        [
+          3030.662732421875,
+          2071.4816767578122
+        ]
+      ],
+      "length_meters": 2.751821453398815,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 2.447,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00106",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00201",
+      "from": "node_0133",
+      "to": "node_0131",
+      "points": [
+        [
+          2997.310404296875,
+          2030.7169052734375
+        ],
+        [
+          3035.70955078125,
+          2016.26416796875
+        ]
+      ],
+      "length_meters": 2.0362334023351214,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 2.447,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00106",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00202",
+      "from": "node_0134",
+      "to": "node_0133",
+      "points": [
+        [
+          3006.95861328125,
+          1934.5738583984376
+        ],
+        [
+          2997.310404296875,
+          2030.7169052734375
+        ]
+      ],
+      "length_meters": 4.795465170811849,
+      "minimum_width_meters": 2.382,
+      "median_width_meters": 2.447,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00106",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00203",
+      "from": "node_0135",
+      "to": "node_0078",
+      "points": [
+        [
+          3029.503533203125,
+          2107.899494140625
+        ],
+        [
+          2942.138671875,
+          2103.095458984375
+        ]
+      ],
+      "length_meters": 4.342395467449562,
+      "minimum_width_meters": 3.97,
+      "median_width_meters": 4.764,
+      "bidirectional": true,
+      "enabled": true,
+      "source_edge_id": "edge_00116",
+      "source_segment_index": 0
+    },
+    {
+      "id": "edge_00204",
+      "from": "node_0132",
+      "to": "node_0135",
+      "points": [
+        [
+          3030.662732421875,
+          2071.4816767578122
+        ],
+        [
+          3029.503533203125,
+          2107.899494140625
+        ]
+      ],
+      "length_meters": 1.80830130515853,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00205",
+      "from": "node_0072",
+      "to": "node_0131",
+      "points": [
+        [
+          3074.505859375,
+          2036.26220703125
+        ],
+        [
+          3035.70955078125,
+          2016.26416796875
+        ]
+      ],
+      "length_meters": 2.166172492691995,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00206",
+      "from": "node_0133",
+      "to": "node_0136",
+      "points": [
+        [
+          2997.310404296875,
+          2030.7169052734375
+        ],
+        [
+          2959.928591796875,
+          1984.6563056640625
+        ]
+      ],
+      "length_meters": 2.9440508360960713,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00207",
+      "from": "node_0136",
+      "to": "node_0137",
+      "points": [
+        [
+          2959.928591796875,
+          1984.6563056640625
+        ],
+        [
+          2940.3615078125,
+          1913.4573544921875
+        ]
+      ],
+      "length_meters": 3.664555774403075,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00208",
+      "from": "node_0137",
+      "to": "node_0100",
+      "points": [
+        [
+          2940.3615078125,
+          1913.4573544921875
+        ],
+        [
+          2945.880126953125,
+          1757.2841796875
+        ]
+      ],
+      "length_meters": 7.755582080881329,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00209",
+      "from": "node_0078",
+      "to": "node_0132",
+      "points": [
+        [
+          2942.138671875,
+          2103.095458984375
+        ],
+        [
+          3030.662732421875,
+          2071.4816767578122
+        ]
+      ],
+      "length_meters": 4.6651259684404,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00210",
+      "from": "node_0076",
+      "to": "node_0132",
+      "points": [
+        [
+          3153.176513671875,
+          2098.1611328125
+        ],
+        [
+          3030.662732421875,
+          2071.4816767578122
+        ]
+      ],
+      "length_meters": 6.222757370292082,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00211",
+      "from": "node_0077",
+      "to": "node_0135",
+      "points": [
+        [
+          2866.14306640625,
+          2067.290283203125
+        ],
+        [
+          3029.503533203125,
+          2107.899494140625
+        ]
+      ],
+      "length_meters": 8.354189846583367,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    },
+    {
+      "id": "edge_00212",
+      "from": "node_0071",
+      "to": "node_0078",
+      "points": [
+        [
+          2845.812744140625,
+          1996.384765625
+        ],
+        [
+          2942.138671875,
+          2103.095458984375
+        ]
+      ],
+      "length_meters": 7.1345023803063885,
+      "minimum_width_meters": null,
+      "median_width_meters": null,
+      "bidirectional": true,
+      "enabled": true
+    }
+  ],
+  "validation": {
+    "node_count": 153,
+    "edge_count": 192,
+    "disabled_nodes": 0,
+    "disabled_edges": 0,
+    "invalid_edges": 0,
+    "endpoint_mismatches": 0
+  },
+  "production_validation": {
+    "file_sha256": "0be1a502e7e70179ea2cd3c6ea10bed191982b22f4f402f364f8479956c19fb6",
+    "expected_file_sha256": "0be1a502e7e70179ea2cd3c6ea10bed191982b22f4f402f364f8479956c19fb6",
+    "file_sha256_matches": true,
+    "geometry_sha256": "c7dac5db7ee383b7bf3fa6328d8ac9fedb667e17395a613db2c9720df7f7f9ab",
+    "embedded_geometry_sha256": "c7dac5db7ee383b7bf3fa6328d8ac9fedb667e17395a613db2c9720df7f7f9ab"
+  }
+}

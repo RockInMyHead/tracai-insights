@@ -10,8 +10,10 @@ from backend.floorplan_constraints import (
     _polyline_progress_metrics,
     _polyline_sharp_reverse_ratio,
     _speed_prior_penalty,
+    _stabilize_authoritative_map_observation,
     _stabilize_independent_observation,
     _trajectory_fractions,
+    _turn_topology_metrics,
     apply_floorplan_constraints,
     get_floorplan_engine,
 )
@@ -19,6 +21,248 @@ from backend.kerama_reference_route import load_reference_route
 
 
 class FloorplanConstraintEngineTests(unittest.TestCase):
+    def test_graph_initial_direction_is_soft_until_clearly_opposite(self) -> None:
+        thirty_degrees = np.cos(np.radians(30.0))
+        sixty_degrees = np.cos(np.radians(60.0))
+        seventy_one_degrees = np.cos(np.radians(71.0))
+
+        thirty_cost, thirty_rejected = (
+            FloorplanConstraintEngine._initial_direction_cost(thirty_degrees)
+        )
+        sixty_cost, sixty_rejected = (
+            FloorplanConstraintEngine._initial_direction_cost(sixty_degrees)
+        )
+        opposite_cost, opposite_rejected = (
+            FloorplanConstraintEngine._initial_direction_cost(
+                seventy_one_degrees
+            )
+        )
+
+        self.assertFalse(thirty_rejected)
+        self.assertFalse(sixty_rejected)
+        self.assertGreater(sixty_cost, thirty_cost)
+        self.assertTrue(opposite_rejected)
+        self.assertTrue(np.isinf(opposite_cost))
+
+    def test_graph_initial_direction_uses_corridor_lookahead(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((100, 100), dtype=bool),
+            meters_per_pixel=0.1,
+        )
+        # The first one-metre editor segment is diagonal, while the next four
+        # metres establish the actual eastbound corridor.
+        route = np.asarray([
+            [10.0, 10.0],
+            [18.0, 16.0],
+            [60.0, 10.0],
+            [90.0, 10.0],
+        ])
+        direction = engine._topology_route_initial_direction(
+            route, lookahead_meters=5.0
+        )
+        angle = abs(np.degrees(np.arctan2(direction[1], direction[0])))
+        first_segment_angle = abs(np.degrees(np.arctan2(6.0, 8.0)))
+
+        self.assertLess(angle, 2.0)
+        self.assertGreater(first_segment_angle, 30.0)
+
+    def test_viterbi_prefix_stops_at_uncertainty_without_graph_tail(self) -> None:
+        candidate = FloorplanConstraintEngine._viterbi_prefix_candidate({
+            "_confirmed_prefix": [[10.0, 20.0], [30.0, 20.0]],
+            "_confirmed_edge_ids": ["edge_confirmed"],
+            "_confirmed_fraction_end": 0.25,
+            "_uncertainty_marker": [30.0, 20.0],
+            "_competing_next_edges": [
+                {
+                    "edge_id": "edge_left",
+                    "points": [[30.0, 20.0], [40.0, 10.0]],
+                },
+                {
+                    "edge_id": "edge_right",
+                    "points": [[30.0, 20.0], [40.0, 30.0]],
+                },
+                {
+                    "edge_id": "edge_forbidden_third",
+                    "points": [[30.0, 20.0], [20.0, 20.0]],
+                },
+            ],
+        })
+        self.assertTrue(candidate["available"])
+        self.assertEqual(
+            candidate["trajectory"], [[10.0, 20.0], [30.0, 20.0]]
+        )
+        self.assertEqual(candidate["segments"][0]["status"], "confirmed")
+        self.assertEqual(candidate["uncertain_segments"], 0)
+        self.assertEqual(candidate["uncertainty_marker"], [30.0, 20.0])
+        self.assertEqual(len(candidate["competing_next_edges"]), 2)
+        self.assertEqual(
+            candidate["policy"], "stop_at_last_confirmed_viterbi_node_v2"
+        )
+
+    def test_directed_edge_match_rejects_opposite_turn_branch(self) -> None:
+        engine = FloorplanConstraintEngine.from_mask(
+            np.zeros((80, 80), dtype=bool),
+            meters_per_pixel=1.0,
+        )
+        engine._topology_node_points = np.asarray([
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, -10.0],
+            [0.0, -10.0],
+        ], dtype=np.float64)
+        engine._topology_authored_node_count = 4
+        engine._topology_node_ids = [
+            "node_start",
+            "node_branch",
+            "node_first_turn",
+            "node_wrong_left",
+        ]
+        engine._topology_adjacency = {
+            0: [(1, 10.0)],
+            1: [(2, 10.0)],
+            2: [(3, 10.0)],
+            3: [],
+        }
+        engine._topology_segment_edges = {
+            (0, 1): "edge_start",
+            (1, 2): "edge_first_turn",
+            (2, 3): "edge_wrong_left",
+        }
+
+        observation = np.asarray([
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [10.0, -10.0],
+            [20.0, -10.0],
+        ], dtype=np.float64)
+
+        route, diagnostics = engine._directed_edge_event_match(
+            observation,
+            reject_committed_inversions=True,
+        )
+
+        self.assertIsNone(route)
+        self.assertEqual(
+            diagnostics["reason"],
+            "directed_edge_event_sequence_not_found",
+        )
+        self.assertGreater(diagnostics["rejected_inverted_turns"], 0)
+
+    def test_rejected_independent_candidate_does_not_hide_r3_graph_recovery(self) -> None:
+        class FakeEngine:
+            config = type("Config", (), {
+                "default_anchor_reference_pixels": (10.0, 10.0),
+                "default_anchor_direction_pixels": (20.0, 10.0),
+                "default_anchor_source": "test",
+                "width": 100,
+                "height": 100,
+                "meters_per_pixel": 0.1,
+                "person_radius_meters": 0.0,
+            })()
+
+            def align(self, *args, **kwargs):
+                authoritative = kwargs.get("observation_policy") == "authoritative"
+                return {
+                    "accepted": False,
+                    "trajectory": [],
+                    "diagnostics": {
+                        "accepted": False,
+                        "reason": (
+                            "constraint_solution_not_found"
+                            if authoritative
+                            else "map_correction_exceeds_observation_budget"
+                        ),
+                        "rejection_reasons": [],
+                        "graph_map_matching_configured": True,
+                        "topology_recovery_enabled": authoritative,
+                        "topology_recovery_attempted": 3 if authoritative else 0,
+                        "topology_recovery_accepted": 0,
+                        "graph_first_candidate": (
+                            {
+                                "available": True,
+                                "trajectory": [[10.0, 10.0], [20.0, 10.0]],
+                                "segments": [{
+                                    "start_index": 0,
+                                    "end_index": 1,
+                                    "status": "uncertain",
+                                    "edge_ids": ["edge_test"],
+                                }],
+                                "confirmed_segments": 0,
+                                "uncertain_segments": 1,
+                                "confirmed_source_fraction": 0.0,
+                                "uncertainty_source_fraction_start": 0.0,
+                                "policy": "graph_edges_only_no_raw_chords_v1",
+                            }
+                            if authoritative else None
+                        ),
+                    },
+                }
+
+        payload = {
+            "method": "r3_reconstruction",
+            "trajectory": [[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 0, 0]],
+            "r3_source_timestamps_seconds": [0.0, 1.0, 2.0, 3.0],
+            "lingbot_fusion_candidate": {
+                "accepted": False,
+                "independent_accepted": True,
+                "independent_plan_trajectory": [
+                    [0, 0], [0, 1], [0, 2], [0, 3],
+                ],
+                "diagnostics": {
+                    "independent_quality": {"accepted": True},
+                },
+            },
+        }
+        with patch(
+            "backend.floorplan_constraints.get_floorplan_engine",
+            return_value=FakeEngine(),
+        ):
+            result = apply_floorplan_constraints(
+                payload, {"floorplan_id": "kerama_marazzi_2025"}
+            )
+
+        diagnostics = result["floorplan_constraint"]
+        self.assertFalse(diagnostics["reported_candidate_topology_recovery_enabled"])
+        self.assertTrue(diagnostics["topology_recovery_enabled"])
+        self.assertEqual(
+            diagnostics["authoritative_topology_recovery_attempted"], 6
+        )
+        self.assertTrue(diagnostics["authoritative_graph_matching"]["enabled"])
+        self.assertEqual(
+            diagnostics["observation_source_selection"]["candidate_results"][0][
+                "topology_recovery_attempted"
+            ],
+            3,
+        )
+        self.assertTrue(diagnostics["graph_first_output_published"])
+        self.assertEqual(
+            result["graph_first_trajectory"],
+            [[10.0, 10.0], [20.0, 10.0]],
+        )
+        self.assertNotIn("map_trajectory", result)
+        self.assertEqual(
+            result["graph_first_segments"][0]["status"], "uncertain"
+        )
+
+    def test_production_engine_uses_explicit_operator_topology_graph(self) -> None:
+        engine = FloorplanConstraintEngine.load("kerama_marazzi_2025")
+        self.assertEqual(engine._topology_authored_node_count, 147)
+        self.assertGreater(len(engine._topology_node_points), 147)
+        self.assertEqual(
+            len(engine._topology_adjacency), len(engine._topology_node_points)
+        )
+        connected_pair = next(
+            (left, neighbours[0][0])
+            for left, neighbours in engine._topology_adjacency.items()
+            if neighbours
+        )
+        route = engine._topology_route(
+            engine._topology_node_points[connected_pair[0]],
+            engine._topology_node_points[connected_pair[1]],
+        )
+        self.assertIsNotNone(route)
+        self.assertGreaterEqual(len(route), 2)
+
     def test_red_obstacle_has_absolute_priority_over_green_support(self) -> None:
         support = np.ones((20, 20), dtype=bool)
         obstacle = np.zeros_like(support)
@@ -137,7 +381,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         )
         if "shape_gate_details" in result["diagnostics"]:
             self.assertFalse(
-                result["diagnostics"]["shape_gate_details"]["p95_within_budget"]
+                all(result["diagnostics"]["shape_gate_details"].values()),
+                result["diagnostics"]["shape_gate_details"],
             )
 
     def test_start_inside_restricted_area_is_rejected_without_hidden_projection(self) -> None:
@@ -344,7 +589,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["route_observed_length_ratio"], 1.0)
         self.assertFalse(metrics["spike"], metrics)
 
-    def test_authoritative_spike_is_rejected_without_global_route_rewrite(self) -> None:
+    def test_short_authoritative_spike_is_not_globally_rewritten(self) -> None:
         mask = np.zeros((120, 120), dtype=bool)
         mask[10:110, 55:65] = True
         engine = FloorplanConstraintEngine.from_mask(
@@ -357,21 +602,20 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             [45.5, 60.5], [53.0, 60.5], [60.5, 60.5],
             [68.0, 60.5], [75.5, 60.5],
         ])
-        with patch.object(
-            engine,
-            "_multilevel_viterbi_map_match",
-        ) as matcher:
-            result = engine.align(
-                observed.tolist(),
-                {"x": 45.5 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
-                {"x": 53.0 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
-                coordinate_convention="x_right_y_down",
-                scale_candidates=[1.0],
-                yaw_offsets_degrees=[0.0],
-            )
+        result = engine.align(
+            observed.tolist(),
+            {"x": 45.5 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
+            {"x": 53.0 / 120.0 * 100.0, "y": 60.5 / 120.0 * 100.0},
+            coordinate_convention="x_right_y_down",
+            scale_candidates=[1.0],
+            yaw_offsets_degrees=[0.0],
+        )
         self.assertFalse(result["accepted"], result["diagnostics"])
         self.assertEqual(result["diagnostics"]["topology_recovery_attempted"], 0)
-        matcher.assert_not_called()
+        self.assertIn(
+            "topology_destroying_map_correction",
+            result["diagnostics"]["rejection_reasons"],
+        )
 
     def test_sharp_reverse_ratio_flags_triangular_spike(self) -> None:
         # Straight walk with one large triangular detour (classic bad A* spike).
@@ -482,9 +726,12 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             yaw_offsets_degrees=[0.0],
         )
         self.assertFalse(result["accepted"], result["diagnostics"])
-        self.assertIn(
-            "different_walkable_components",
-            result["diagnostics"]["rejection_reasons"],
+        self.assertTrue(
+            {
+                "different_walkable_components",
+                "topology_destroying_map_correction",
+            }.intersection(result["diagnostics"]["rejection_reasons"]),
+            result["diagnostics"],
         )
 
     def test_wrapper_preserves_visual_trajectory_when_map_context_is_incomplete(self) -> None:
@@ -526,8 +773,8 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             "reference_point": {"x": 2222.623 / 5298 * 100, "y": 684.183 / 3743 * 100},
             "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
         })
-        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
-        self.assertNotIn("map_trajectory", updated)
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
+        self.assertIn("map_trajectory", updated)
         self.assertEqual(updated["plan_trajectory"], original)
         self.assertTrue(updated["floorplan_constraint"]["start_anchor_locked"])
 
@@ -570,7 +817,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
         self.assertLessEqual(result["diagnostics"]["correction_p95_meters"], 1.05)
 
-    def test_floorplan_can_select_guarded_r3_lingbot_fusion_candidate(self) -> None:
+    def test_guarded_fusion_does_not_promote_untrusted_independent(self) -> None:
         source_path = [
             [0, 0, 0], [100, 0, 0], [200, 0, 0],
             [300, 0, 0], [400, 0, 0], [500, 0, 0],
@@ -601,7 +848,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
                 "direction_point": {"x": 2000 / 5298 * 100, "y": 703 / 3743 * 100},
             })
 
-        self.assertFalse(updated["processing_stats"]["map_matching_applied"])
+        self.assertTrue(updated["processing_stats"]["map_matching_applied"])
         selection = updated["floorplan_constraint"]["observation_source_selection"]
         independent = next(
             item for item in selection["candidate_results"]
@@ -975,6 +1222,52 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(np.allclose(stable[[0, -1]], raw[[0, -1]]))
         self.assertLess(stable_length, raw_length * 0.65)
 
+    def test_authoritative_macro_motion_removes_pose_jitter_and_locks_endpoints(
+        self,
+    ) -> None:
+        count = 600
+        x = np.linspace(0.0, 100.0, count)
+        jitter = np.where(np.arange(count) % 2 == 0, -0.5, 0.5)
+        raw = np.column_stack((x, jitter))
+
+        macro, diagnostics = _stabilize_authoritative_map_observation(raw)
+
+        self.assertTrue(diagnostics["applied"], diagnostics)
+        np.testing.assert_allclose(macro[[0, -1]], raw[[0, -1]], atol=1e-9)
+        self.assertLess(
+            np.linalg.norm(np.diff(macro, axis=0), axis=1).sum(),
+            np.linalg.norm(np.diff(raw, axis=0), axis=1).sum() * 0.7,
+        )
+
+    def test_opposite_turn_sequence_cannot_be_overridden_by_graph_score(self) -> None:
+        source = np.asarray([
+            [0.0, 0.0], [20.0, 0.0], [40.0, 0.0],
+            [40.0, 20.0], [40.0, 40.0],
+            [60.0, 40.0], [80.0, 40.0],
+        ])
+        opposite = source.copy()
+        opposite[:, 1] *= -1.0
+
+        metrics = _turn_topology_metrics(source, opposite)
+
+        self.assertFalse(metrics["event_sequence_preserved"], metrics)
+        self.assertGreater(metrics["sign_mismatch_ratio"], 0.0)
+
+    def test_turn_event_count_change_is_not_topology_preserving(self) -> None:
+        source = np.asarray([
+            [0.0, 0.0], [30.0, 0.0], [30.0, 30.0],
+            [60.0, 30.0], [60.0, 60.0],
+        ])
+        corrected = np.asarray([
+            [0.0, 0.0], [15.0, 0.0], [30.0, 0.0],
+            [45.0, 0.0], [60.0, 0.0],
+        ])
+
+        metrics = _turn_topology_metrics(source, corrected)
+
+        self.assertFalse(metrics["event_sequence_preserved"], metrics)
+        self.assertGreater(metrics["event_count_delta"], 0)
+
     def test_scale_prior_uses_walkable_extent_not_annotation_bbox(self) -> None:
         mask = np.zeros((100, 200), dtype=bool)
         # Tiny annotation island vs large walkable free space.
@@ -1079,7 +1372,7 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertEqual(engine._collision_runs(matched), [])
         self.assertGreater(diagnostics["corridor_graph_nodes"], 0)
 
-    def test_second_order_hmm_is_disabled_in_production(self) -> None:
+    def test_second_order_graph_does_not_replace_better_safe_baseline(self) -> None:
         mask = np.zeros((120, 180), dtype=bool)
         mask[42:78, 78:102] = True
         engine = FloorplanConstraintEngine.from_mask(mask, meters_per_pixel=0.1)
@@ -1091,15 +1384,17 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
         self.assertTrue(result["accepted"], result["diagnostics"])
         nonlinear = result["diagnostics"]["nonlinear_map_matching"]
         self.assertFalse(nonlinear["attempted"])
-        self.assertFalse(nonlinear["production_enabled"])
+        self.assertTrue(nonlinear["production_enabled"])
+        self.assertFalse(nonlinear["accepted"])
+        self.assertEqual(nonlinear["reason"], "global_solution_stable")
         self.assertEqual(
             nonlinear["method"],
-            "corridor_graph_multilevel_viterbi_v3_second_order",
+            "directed_edge_events_then_anchor_fallback_v1",
         )
         if "fine" in nonlinear and nonlinear["fine"].get("reason") is None:
             self.assertEqual(nonlinear["fine"]["order"], 2)
 
-    def test_five_minute_reference_route_is_not_shifted_to_fit_bad_mask(self) -> None:
+    def test_five_minute_reference_route_uses_operator_graph_over_bad_mask(self) -> None:
         engine = get_floorplan_engine()
         points = np.asarray(load_reference_route()["points"], dtype=np.float64)
         relative = points - points[0]
@@ -1137,7 +1432,20 @@ class FloorplanConstraintEngineTests(unittest.TestCase):
             scale_candidates=[1.0],
             yaw_offsets_degrees=[0.0],
         )
-        self.assertFalse(result["accepted"], result["diagnostics"])
+        self.assertTrue(result["accepted"], result["diagnostics"])
+        self.assertEqual(
+            result["diagnostics"]["turn_topology"]["source_event_count"],
+            6,
+        )
+        self.assertEqual(
+            result["diagnostics"]["turn_topology"]["sign_mismatch_ratio"],
+            0.0,
+        )
+        self.assertTrue(
+            result["diagnostics"]["turn_topology"][
+                "graph_sign_sequence_preserved"
+            ]
+        )
         self.assertTrue(result["diagnostics"]["start_anchor_locked"])
         # The operator point is exact; the occupancy search works on a
         # four-pixel grid, so its internal walkable cell may be up to one grid

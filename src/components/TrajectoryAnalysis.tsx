@@ -138,6 +138,9 @@ interface TrajectoryData {
   r3CameraPoints?: number[][];  // все позиции камер R³
   mapScaleFactor?: number;
   r3AutoFitToPlan?: boolean;
+  uncertain?: boolean;
+  uncertaintyMarker?: { x: number; y: number; z?: number };
+  competingNextEdges?: { x: number; y: number; z?: number }[][];
 }
 
 type R3TrajectoryResponse = Awaited<ReturnType<typeof apiClient.getR3Trajectory>>;
@@ -182,6 +185,10 @@ const mergeR3TrajectoryResponse = (
     trajectory: displayTrajectory,
     plan_trajectory: planTrajectory,
     map_trajectory: mapTrajectory.length >= 2 ? mapTrajectory : undefined,
+    graph_first_trajectory: response.graph_first_trajectory,
+    graph_first_segments: response.graph_first_segments,
+    graph_first_metadata: response.graph_first_metadata,
+    graph_first_uncertainty: response.graph_first_uncertainty,
     raw_trajectory_3d: mergedRawTrajectory,
     r3_camera_points: mergedRawTrajectory,
     r3_source_frame_indices: response.source_frame_indices ?? [],
@@ -226,7 +233,7 @@ const mergeR3TrajectoryResponse = (
   } as AnalysisData;
 };
 
-const trajectoryDataFromVideo = (video: VideoWithOwner): TrajectoryData => {
+const trajectoryDataFromVideo = (video: VideoWithOwner): TrajectoryData[] => {
   const result = video.analysisResult as AnalysisData;
   const stats = result.processing_stats as Record<string, unknown> | undefined;
   const manualOverride = Boolean(stats?.manual_override);
@@ -239,26 +246,97 @@ const trajectoryDataFromVideo = (video: VideoWithOwner): TrajectoryData => {
     result.floorplan_constraint || stats?.floorplan_constraint || {}
   ) as Record<string, unknown>;
   const mapRejected = isR3 && floorplanConstraint.accepted === false;
+  const graphFirst = Array.isArray(result.graph_first_trajectory)
+    ? result.graph_first_trajectory
+    : [];
+  const graphSegments = Array.isArray(result.graph_first_segments)
+    ? result.graph_first_segments
+    : [];
   const r3Quality = stats?.r3_trajectory_quality as Record<string, unknown> | undefined;
   const r3Projection = r3Quality?.projection as Record<string, unknown> | undefined;
-  return {
+  const base: Omit<TrajectoryData, "trajectory" | "turnPoints" | "ownerName" | "color"> = {
+    videoId: video.video_id,
+    method: result.method,
+    coordinateConvention: String(r3Projection?.plan_coordinate_convention || "") || undefined,
+    mapAligned: isAlreadyInPlanSpace,
+    manualPlanSpace: manualOverride,
+    mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(stats?.scale_factor, 1),
+    r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace && !mapRejected,
+  };
+  if (
+    mapRejected
+    && graphFirst.length >= 1
+    && (
+      graphSegments.length > 0
+      || Array.isArray(result.graph_first_uncertainty?.marker)
+    )
+  ) {
+    const firstUncertain = graphSegments.find(
+      (segment) => segment.status === "uncertain",
+    );
+    const splitIndex = firstUncertain
+      ? Math.max(0, Number(firstUncertain.start_index) || 0)
+      : graphFirst.length - 1;
+    const confirmed = graphFirst.slice(0, splitIndex + 1);
+    const uncertain = firstUncertain
+      ? graphFirst.slice(splitIndex)
+      : [];
+    const uncertaintyMarkerRaw = result.graph_first_uncertainty?.marker;
+    const uncertaintyMarker = Array.isArray(uncertaintyMarkerRaw)
+      ? convertTrajectory([uncertaintyMarkerRaw])[0]
+      : undefined;
+    const competingNextEdges = (
+      result.graph_first_uncertainty?.competing_next_edges || []
+    ).map((edge) => convertTrajectory(edge.points)).filter(
+      (edge) => edge.length >= 2,
+    );
+    return [
+      ...(confirmed.length < 2 && uncertaintyMarker ? [{
+        ...base,
+        trajectory: [uncertaintyMarker],
+        turnPoints: [],
+        ownerName: `${video.ownerName} · маршрут не определён`,
+        color: "#f59e0b",
+        mapAligned: true,
+        r3AutoFitToPlan: false,
+        uncertaintyMarker,
+        competingNextEdges,
+      }] : []),
+      ...(confirmed.length >= 2 ? [{
+        ...base,
+        trajectory: convertTrajectory(confirmed),
+        turnPoints: [],
+        ownerName: `${video.ownerName} · подтверждено графом`,
+        color: "#2563eb",
+        mapAligned: true,
+        r3AutoFitToPlan: false,
+        uncertaintyMarker,
+        competingNextEdges,
+      }] : []),
+      ...(uncertain.length >= 2 ? [{
+        ...base,
+        trajectory: convertTrajectory(uncertain),
+        turnPoints: [],
+        ownerName: `${video.ownerName} · неопределённый graph-route`,
+        color: "#f59e0b",
+        mapAligned: true,
+        r3AutoFitToPlan: false,
+        uncertain: true,
+      }] : []),
+    ];
+  }
+  return [{
+    ...base,
     trajectory: convertTrajectory(
       mapRejected ? [] : (result.map_trajectory || result.plan_trajectory || result.trajectory),
     ),
     turnPoints: result.map_turn_points || result.turn_points || [],
     ownerName: video.ownerName,
     color: video.color,
-    videoId: video.video_id,
-    method: result.method,
-    coordinateConvention: String(r3Projection?.plan_coordinate_convention || "") || undefined,
-    mapAligned: isAlreadyInPlanSpace,
-    manualPlanSpace: manualOverride,
     r3CameraPoints: isR3 && Array.isArray(result.plan_trajectory || result.trajectory)
       ? (result.plan_trajectory || result.trajectory)
       : undefined,
-    mapScaleFactor: (isR3 || isLingBot) ? 1 : finiteNum(stats?.scale_factor, 1),
-    r3AutoFitToPlan: (isR3 || isLingBot) && !isAlreadyInPlanSpace && !mapRejected,
-  };
+  }];
 };
 
 type ProcessingStatus = Awaited<ReturnType<typeof apiClient.getProcessingStatus>>;
@@ -1133,7 +1211,7 @@ const TrajectoryAnalysis = ({ onTrajectoryAnalyzed, floorPlan: externalFloorPlan
       const finalAnalyzedVideos = finalizedVideos.filter(v => v.analysisResult);
 
       if (finalAnalyzedVideos.length > 0 && onTrajectoryAnalyzed) {
-        const trajectoriesData = finalAnalyzedVideos.map(trajectoryDataFromVideo);
+        const trajectoriesData = finalAnalyzedVideos.flatMap(trajectoryDataFromVideo);
 
         const totalPoints = trajectoriesData.reduce((sum, t) => sum + t.trajectory.length, 0);
         if (totalPoints === 0) {

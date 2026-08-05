@@ -1,7 +1,10 @@
 const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const path = require('path');
 const { createCameraImportService } = require('./cameraImport.cjs');
+const { createDesktopLogService } = require('./desktopLogs.cjs');
 const localCpuTracker = require('./localCpuTracker.cjs');
+const localGpuRuntime = require('./localGpuRuntime.cjs');
+const adminMirror = require('./adminMirror.cjs');
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 const APP_URL = 'http://93.189.231.189';
@@ -9,7 +12,9 @@ const DESKTOP_APP_URL = `${APP_URL}/trajectory?desktop=1`;
 
 let mainWindow = null;
 let cameraImportService = null;
+let desktopLogs = null;
 let processingMode = 'online';
+let processingModeDetails = {};
 
 const cameraImportSettings = {
   enabled: false,
@@ -22,18 +27,56 @@ function broadcastToRenderer(channel, payload) {
   }
 }
 
+async function fetchDesktopJson(pathname) {
+  const response = await fetch(`${APP_URL}${pathname}`, {
+    headers: {
+      'X-TrackAI-Client': 'desktop',
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Desktop API failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  return response.json();
+}
+
 function setupCameraImport() {
   cameraImportService = createCameraImportService({
     serverUrl: APP_URL,
-    importFile: (input) => processingMode === 'local'
-      ? localCpuTracker.copyToLocal(input)
-      : require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input }),
+    importFile: async (input) => {
+      if (processingMode === 'online') {
+        try {
+          return await require('./uploadFromPath.cjs').uploadFileFromPath({ serverUrl: APP_URL, ...input });
+        } catch (error) {
+          desktopLogs?.log('error', 'camera-import:online-upload-failed', {
+            fileName: input.fileName,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
+      }
+      const copied = await localCpuTracker.copyToLocal(input);
+      adminMirror.enqueueVideo(copied);
+      void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
+      return copied;
+    },
     getOwnerName: () => cameraImportSettings.ownerName,
     isEnabled: () => cameraImportSettings.enabled,
     onStatus: (status) => broadcastToRenderer('camera-import:status', status),
     onProgress: (progress) => broadcastToRenderer('camera-import:progress', progress),
-    onBatchComplete: (uploaded) => broadcastToRenderer('camera-import:complete', uploaded),
+    onFileImported: (uploaded) => {
+      desktopLogs?.log('info', 'camera-import:file-imported', {
+        video_id: uploaded.video_id,
+        filename: uploaded.original_filename || uploaded.filename,
+      });
+      broadcastToRenderer('camera-import:file-imported', uploaded);
+    },
+    onBatchComplete: (uploaded) => {
+      desktopLogs?.log('info', 'camera-import:batch-complete', { count: uploaded.length });
+      broadcastToRenderer('camera-import:complete', uploaded);
+    },
     onError: (error) => {
+      desktopLogs?.log('error', 'camera-import:error', error);
       broadcastToRenderer('camera-import:error', {
         message: error instanceof Error ? error.message : String(error),
       });
@@ -63,25 +106,77 @@ function setupCameraImport() {
   ipcMain.handle('camera-import:scan-now', async (_event, options = {}) => {
     return cameraImportService.scanNow({
       forceImport: Boolean(options.forceImport),
+      ignoreImported: Boolean(options.ignoreImported),
+      analysisContext: options.analysisContext && typeof options.analysisContext === 'object'
+        ? options.analysisContext
+        : null,
     });
   });
 
   ipcMain.handle('camera-import:get-status', () => cameraImportService.getStatus());
+  ipcMain.handle('camera-import:cancel', () => cameraImportService.cancelImport());
+  ipcMain.handle('camera-import:reset-imported-state', () => cameraImportService.resetImportedState());
+  ipcMain.handle('desktop-api:get-uploaded-videos', async () => {
+    return fetchDesktopJson('/api/uploaded-videos');
+  });
+  ipcMain.handle('desktop-api:get-video-analysis', async (_event, videoId) => {
+    return fetchDesktopJson(`/api/video/${encodeURIComponent(String(videoId))}`);
+  });
+  ipcMain.handle('desktop-api:get-processing-status', async (_event, videoId) => {
+    return fetchDesktopJson(`/api/processing-status/${encodeURIComponent(String(videoId))}`);
+  });
 
   ipcMain.handle('processing:resolve-mode', async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    try {
-      const response = await fetch(`${APP_URL}/api/health`, { signal: controller.signal });
-      processingMode = response.ok ? 'online' : 'local';
-    } catch {
-      processingMode = 'local';
-    } finally {
-      clearTimeout(timer);
+    const gpu = await localGpuRuntime.start((level, event, data) => desktopLogs?.log(level, event, data));
+    if (gpu.ready) {
+      processingMode = 'local_gpu';
+      processingModeDetails = {
+        mode: processingMode,
+        label: 'Локально',
+        reason: null,
+        gpu: gpu.gpu,
+        minimumDriver: gpu.manifest?.minimum_nvidia_driver_windows,
+      };
+      desktopLogs?.log('info', 'processing:mode-resolved', {
+        mode: processingMode,
+        gpu_memory_mb: gpu.gpu?.memoryMb,
+        cuda_runtime: gpu.health?.cuda_runtime,
+      });
+      return processingModeDetails;
     }
-    return { mode: processingMode, label: processingMode === 'online' ? 'RTX 3090' : 'Локально (CPU)' };
+    processingMode = 'online';
+    processingModeDetails = {
+      mode: processingMode,
+      label: 'Серверная GPU',
+      reason: 'server_gpu_fallback',
+    };
+    desktopLogs?.log('info', 'processing:mode-resolved', {
+      ...processingModeDetails,
+      localGpuReason: gpu.reason,
+      localGpuRoot: gpu.root,
+    });
+    return processingModeDetails;
   });
-  ipcMain.handle('local-cpu:process', (_event, video) => localCpuTracker.processLocalVideo(video));
+  ipcMain.handle('local-gpu:process', async (_event, video) => {
+    const result = await localGpuRuntime.processVideo(video);
+    adminMirror.enqueueResult(video.video_id, result.data);
+    void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
+    return result;
+  });
+  ipcMain.handle('local-gpu:history', () => localGpuRuntime.getHistory());
+  ipcMain.handle('local-gpu:analysis', (_event, videoId) => localGpuRuntime.getAnalysis(videoId));
+  ipcMain.handle('local-cpu:process', async (_event, video) => {
+    const result = await localCpuTracker.processLocalVideo(video, (progress) => {
+      broadcastToRenderer('local-cpu:progress', {
+        video_id: video.video_id,
+        filename: video.original_filename || video.filename,
+        ...progress,
+      });
+    });
+    adminMirror.enqueueResult(video.video_id, result.data);
+    void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
+    return result;
+  });
   ipcMain.handle('local-cpu:history', () => localCpuTracker.getHistory());
   ipcMain.handle('local-cpu:analysis', (_event, videoId) => localCpuTracker.getAnalysis(videoId));
 
@@ -145,8 +240,12 @@ function createWindow() {
     show: false,
     backgroundColor: '#07111f',
   });
+  desktopLogs?.attachWindow(mainWindow);
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => {
+    desktopLogs?.log('info', 'window:ready-to-show');
+    mainWindow.show();
+  });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (!url.startsWith(APP_URL)) {
@@ -165,6 +264,11 @@ function createWindow() {
 
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, url, isMainFrame) => {
     if (!isMainFrame || errorCode === -3) return;
+    desktopLogs?.log('error', 'window:did-fail-load', {
+      errorCode,
+      errorDescription,
+      url,
+    });
     dialog.showMessageBox(mainWindow, {
       type: 'error',
       title: 'TrackAI недоступен',
@@ -190,7 +294,14 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  desktopLogs = createDesktopLogService({
+    app,
+    dialog,
+    getProcessingMode: () => processingMode,
+  });
+  ipcMain.handle('logs:download', () => desktopLogs.download(mainWindow));
   setupCameraImport();
+  void adminMirror.flush(APP_URL, (level, event, data) => desktopLogs?.log(level, event, data));
   createWindow();
 });
 
@@ -198,6 +309,7 @@ app.on('window-all-closed', () => {
   if (cameraImportService) {
     cameraImportService.stop();
   }
+  localGpuRuntime.stop();
   if (process.platform !== 'darwin') {
     app.quit();
   }

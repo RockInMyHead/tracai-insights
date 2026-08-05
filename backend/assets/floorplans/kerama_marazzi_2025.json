@@ -1,13 +1,11 @@
 {
   "map_id": "kerama_marazzi_2025",
-  "display_name": "Маска 2",
-  "mask_version": 2,
   "width": 5298,
   "height": 3743,
   "meters_per_pixel": 0.049629166698546515,
   "scale_calibration": {
     "source": "office_area",
-    "office_area_m2": 10.0,
+    "office_area_m2": 10,
     "office_interior_bbox_pixels": [
       2190,
       662,
@@ -29,30 +27,40 @@
       1997.346,
       699.941
     ],
-    "trajectory_points_used": false,
     "coordinate_system": "plan_percent",
-    "reference_percent": [41.9, 18.1],
-    "direction_percent": [37.7, 18.7]
+    "reference_percent": [
+      41.9,
+      18.1
+    ],
+    "direction_percent": [
+      37.7,
+      18.7
+    ],
+    "trajectory_points_used": false
   },
-  "obstacle_mask_file": "kerama_marazzi_2025_mask_2_obstacles.png",
-  "obstacle_mask_sha256": "96e2bc23bcb60d8145126d902096da809b03a7669d496cc965260a4bbf807e52",
-  "support_mask_file": "kerama_marazzi_2025_mask_2_support.png",
-  "support_mask_sha256": "33d89f59e943c8c24eaa5540eb577dc1707dddea2398f264ddbd3ea873ade8c7",
+  "obstacle_mask_file": "kerama_marazzi_2025_obstacles.png",
+  "obstacle_mask_sha256": "986fc267622c9aadf387d3e2cb727721935e633f9dd7b6dda38f52696156a106",
+  "support_mask_file": "kerama_marazzi_2025_support.png",
+  "support_mask_sha256": "cb8f0e32afa6b7f02a9582d8b2a754427c47fb787489afbd3f2f0a499389e564",
+  "topology_graph_file": "kerama_marazzi_2025.topology-graph.v1.json",
+  "topology_graph_sha256": "b3a1f382d4a8b385701ea3fc440aa01246c40da90537a60f1454985fd3ecb2b3",
   "support_mask_generation": {
     "method": "positive_green_corridors_only",
     "ink_threshold": 242,
     "barrier_dilation_pixels": 2,
-    "coverage_ratio": 0.07011870755698797,
+    "coverage_ratio": 0.05659478415327083,
     "green_corridor_margin_pixels": 24
   },
-  "source_pdf_sha256": "014c0e24b8f4e213f72dde8b161f055ae5d8cb209e9896b2dea2f26544d23094",
-  "display_image_sha256": "43cc32dd4ac5949b69c5c83d08b69df7deee7013b10a6d1a3def6a01e05df4b4",
+  "source_pdf_sha256": "b35db14b1f3a647975d14677f74c586d7cb08b89879de6eab7d21aec294fc1e6",
+  "mask_pdf_sha256": "3b30e218ac20b91c356d32d71317e32966205cc6a96020b5c10b85cea30d390d",
+  "mask_input_mode": "semantic_red_green_pdf",
+  "display_image_sha256": "474e51ad2d79cd12aaba9db2dde044369b7e03a4975ebda63fd9e2b57df5e4f2",
   "source_pdf": "kerama-marazzi-2025.pdf",
   "display_image": "kerama-marazzi-2025.png",
-  "annotation_component_count": 119,
-  "annotation_pixel_count": 1433070,
+  "annotation_component_count": 97,
+  "annotation_pixel_count": 18608336,
   "obstacle_annotation": {
-    "method": "changed_red_operator_annotation",
+    "method": "semantic_red_mask",
     "boundary_cleanup_pixels": 2,
     "physical_person_halo_applied_by_engine": true,
     "remaining_red_is_absolute": true,
@@ -60,10 +68,10 @@
     "route_specific_overrides": false
   },
   "walkable_annotation": {
-    "method": "changed_green_operator_annotation",
-    "component_count": 20,
-    "pixel_count": 868464,
-    "support_pixels_added": 1124402,
+    "method": "semantic_green_mask",
+    "component_count": 6,
+    "pixel_count": 930762,
+    "support_pixels_added": 1178625,
     "closing_pixels": 10,
     "opening_pixels": 3,
     "dilation_pixels": 6,

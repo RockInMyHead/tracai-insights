@@ -77,8 +77,13 @@ except ImportError:  # pragma: no cover - package-style startup
         save_scale_aware_candidate,
     )
 
-R3_DIR = Path("/home/artem/trackai/R3")
-CONDA_RUN = ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR)]
+R3_DIR = Path(os.getenv("TRACKAI_R3_DIR", "/home/artem/trackai/R3")).resolve()
+_R3_PYTHON = os.getenv("TRACKAI_R3_PYTHON")
+CONDA_RUN = (
+    [_R3_PYTHON]
+    if _R3_PYTHON
+    else ["/home/artem/miniconda3/bin/conda", "run", "-n", "r3", "--cwd", str(R3_DIR), "python3"]
+)
 
 R3_POSE_GRAPH_EXPORT_LEGACY_MARKER = "# TRACKAI_R3_POSE_GRAPH_EXPORT_V1"
 R3_POSE_GRAPH_EXPORT_MARKER = "# TRACKAI_R3_POSE_GRAPH_EXPORT_V2"
@@ -961,7 +966,7 @@ def _build_r3_infer_cmd(frames_dir: str, output_dir: str, ckpt_name: str = "r3.s
     ckpt_path = str(R3_DIR / "ckpt" / ckpt_name)
 
     cmd = CONDA_RUN + [
-        "python3", str(R3_DIR / "infer.py"),
+        str(R3_DIR / "infer.py"),
         "--seq_path", frames_dir,
         "--output_dir", output_dir,
         "--ckpt", ckpt_path,

@@ -43,6 +43,10 @@ export interface TrajectoryData {
   mapScaleFactor?: number;
   /** R³ uses reconstruction coordinates; fit its 2D projection into the floor plan before manual calibration. */
   r3AutoFitToPlan?: boolean;
+  /** Graph-only fallback segment whose correspondence to R3 is not proven. */
+  uncertain?: boolean;
+  uncertaintyMarker?: TrajectoryPoint;
+  competingNextEdges?: TrajectoryPoint[][];
 }
 
 const ADMIN_PLAN_W = 800;
@@ -508,43 +512,51 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
     return () => { cancelled = true; };
   }, [floorPlan, usePathfinding, getTransformedTrajectories, viewBox.width, viewBox.height]);
 
-  // Generate heatmap data based on trajectory density
-  const generateHeatmapData = useMemo(() => {
-    const allTrajectories = getTransformedTrajectories.flatMap(data => data.trajectory);
-    if (allTrajectories.length === 0) return [];
+  const revisitRouteSegments = useMemo(() => {
+    const gridSize = floorPlan ? 26 : 14;
+    const segments = new Map<string, { x1: number; y1: number; x2: number; y2: number; count: number }>();
+    const density = new Map<string, number>();
+    const bucketPoint = (point: { x: number; y: number }) =>
+      `${Math.round(point.x / gridSize)},${Math.round(point.y / gridSize)}`;
 
-    // Create a grid to calculate density
-    const gridSize = 20;
-    const grid = new Map();
-
-    // Count points in each grid cell
-    allTrajectories.forEach(point => {
-      const gridX = Math.floor(point.x / gridSize);
-      const gridY = Math.floor(point.y / gridSize);
-      const key = `${gridX}-${gridY}`;
-
-      grid.set(key, (grid.get(key) || 0) + 1);
+    getTransformedTrajectories.forEach((data) => {
+      const points = data.trajectory;
+      points.forEach((point, index) => {
+        if (index % 3 !== 0) return;
+        if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+        const key = bucketPoint(point);
+        density.set(key, (density.get(key) || 0) + 1);
+      });
+      for (let index = 1; index < points.length; index += 1) {
+        const previous = points[index - 1];
+        const current = points[index];
+        if (!Number.isFinite(previous.x) || !Number.isFinite(previous.y) || !Number.isFinite(current.x) || !Number.isFinite(current.y)) continue;
+        const length = Math.hypot(current.x - previous.x, current.y - previous.y);
+        if (length < 0.01 || length > 220) continue;
+        const a = bucketPoint(previous);
+        const b = bucketPoint(current);
+        const key = a <= b ? `${a}|${b}` : `${b}|${a}`;
+        const corridorCount = Math.max(density.get(a) || 0, density.get(b) || 0);
+        const existing = segments.get(key);
+        if (existing) {
+          existing.count += 1;
+          existing.count = Math.max(existing.count, corridorCount);
+        } else {
+          segments.set(key, { x1: previous.x, y1: previous.y, x2: current.x, y2: current.y, count: Math.max(1, corridorCount) });
+        }
+      }
     });
 
-    // Convert grid to heatmap data with intensity
-    const heatmapData = [];
-    const maxDensity = Math.max(...grid.values());
+    return Array.from(segments.values()).sort((a, b) => a.count - b.count);
+  }, [floorPlan, getTransformedTrajectories]);
 
-    for (const [key, density] of grid.entries()) {
-      const [gridX, gridY] = key.split('-').map(Number);
-      const intensity = density / maxDensity;
-
-      heatmapData.push({
-        x: gridX * gridSize,
-        y: gridY * gridSize,
-        width: gridSize,
-        height: gridSize,
-        intensity,
-      });
-    }
-
-    return heatmapData;
-  }, [getTransformedTrajectories]);
+  const revisitLabelSegments = useMemo(() => {
+    const minCountForLabel = 10;
+    return revisitRouteSegments
+      .filter((segment) => segment.count >= minCountForLabel)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 40);
+  }, [revisitRouteSegments]);
 
   // Calculate movement analysis data
   const movementAnalysis = useMemo(() => {
@@ -1128,7 +1140,7 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           size="icon"
           className="h-10 w-10 shadow-lg backdrop-blur-md"
           onClick={(e) => { e.stopPropagation(); setShowHeatmap(!showHeatmap); }}
-          title={showHeatmap ? "Показать траекторию" : "Показать тепловую карту"}
+          title={showHeatmap ? "Показать траекторию" : "Показать повторные проходы"}
         >
           {showHeatmap ? <Route className="h-5 w-5" /> : <Thermometer className="h-5 w-5" />}
         </Button>
@@ -1454,18 +1466,39 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
 
             {/* Heatmap or Trajectory visualization - INSIDE scaled group */}
             {showHeatmap ? (
-              /* Heatmap visualization */
-              generateHeatmapData.map((cell, index) => (
-                <rect
-                  key={`heatmap-${index}`}
-                  x={cell.x}
-                  y={cell.y}
-                  width={cell.width}
-                  height={cell.height}
-                  fill={`rgba(255, ${Math.round(255 * (1 - cell.intensity))}, 0, ${0.3 + cell.intensity * 0.5})`}
-                  opacity={cell.intensity * 0.8}
-                />
-              ))
+              <g>
+                {getTransformedTrajectories.map((data, trajectoryIndex) => (
+                  <path
+                    key={`revisit-sampled-${trajectoryIndex}`}
+                    d={getPathString(data.trajectory)}
+                    fill="none"
+                    stroke="#ef4444"
+                    strokeWidth={floorPlan ? 14 : 8}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    opacity="0.62"
+                  />
+                ))}
+                {revisitRouteSegments.map((segment, index) => {
+                  const repeated = segment.count >= 6;
+                  const width = repeated
+                    ? Math.min(floorPlan ? 48 : 30, (floorPlan ? 20 : 12) + Math.log2(segment.count + 1) * 7.5)
+                    : floorPlan ? 10 : 6;
+                  return (
+                    <line
+                      key={`revisit-segment-${index}`}
+                      x1={segment.x1}
+                      y1={segment.y1}
+                      x2={segment.x2}
+                      y2={segment.y2}
+                      stroke={repeated ? "#a855f7" : "#ef4444"}
+                      strokeWidth={width}
+                      strokeLinecap="round"
+                      opacity={repeated ? 0.48 : 0.42}
+                    />
+                  );
+                })}
+              </g>
             ) : (
               <g>
               {/* R³ Point Cloud — все позиции камер как полупрозрачные точки */}
@@ -1504,10 +1537,14 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       strokeWidth={floorPlan ? 5 : 4}
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                      strokeDasharray={data.ownerName.includes('Тестовые') ? "4 4" : "none"}
+                      strokeDasharray={
+                        data.uncertain || data.ownerName.includes('Тестовые')
+                          ? "12 9"
+                          : "none"
+                      }
                       filter="url(#trajectoryGlow)"
                       className="animate-path-draw"
-                      opacity={0.95}
+                      opacity={data.uncertain ? 0.68 : 0.95}
                     />
 
                     {/* Trajectory points along the path */}
@@ -1525,6 +1562,46 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
                       ))}
                   </g>
                 );
+              })}
+              {getTransformedTrajectories.flatMap((data, trajectoryIndex) => {
+                const marker = data.uncertaintyMarker;
+                if (!marker) return [];
+                return [(
+                  <g key={`uncertainty-${trajectoryIndex}`}>
+                    {(data.competingNextEdges || []).slice(0, 2).map((edge, edgeIndex) => (
+                      <path
+                        key={`uncertainty-edge-${trajectoryIndex}-${edgeIndex}`}
+                        d={getPathString(edge)}
+                        fill="none"
+                        stroke="#f59e0b"
+                        strokeWidth={4}
+                        strokeDasharray="8 7"
+                        strokeLinecap="round"
+                        opacity={0.72}
+                      />
+                    ))}
+                    <circle
+                      cx={marker.x}
+                      cy={marker.y}
+                      r="9"
+                      fill="#f59e0b"
+                      stroke="white"
+                      strokeWidth="3"
+                    />
+                    <text
+                      x={marker.x + 13}
+                      y={marker.y - 12}
+                      fill="#92400e"
+                      fontSize="14"
+                      fontWeight="bold"
+                      stroke="white"
+                      strokeWidth="4"
+                      paintOrder="stroke"
+                    >
+                      Маршрут не определён
+                    </text>
+                  </g>
+                )];
               })}
             </g>)}
 
