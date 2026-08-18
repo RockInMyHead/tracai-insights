@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body, Backgr
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 import os
 import shutil
 import tempfile
@@ -10,6 +10,7 @@ import time
 import asyncio
 import aiohttp
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union, Tuple, Set, TextIO
 import threading
@@ -21,6 +22,21 @@ import math as _math
 import fitz  # PyMuPDF
 
 try:
+    from floorplan_graph import (
+        build_floorplan_graph,
+        floorplan_graph_geometry_sha256,
+        normalize_floorplan_graph,
+        validate_floorplan_graph,
+    )
+except ImportError:  # pragma: no cover
+    from backend.floorplan_graph import (
+        build_floorplan_graph,
+        floorplan_graph_geometry_sha256,
+        normalize_floorplan_graph,
+        validate_floorplan_graph,
+    )
+
+try:
     from r3_trajectory import build_r3_trajectory
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.r3_trajectory import build_r3_trajectory
@@ -30,12 +46,14 @@ try:
         DEFAULT_FLOORPLAN_ID,
         FLOORPLAN_CONSTRAINT_REVISION,
         apply_floorplan_constraints,
+        invalidate_floorplan_engine,
     )
 except ImportError:  # pragma: no cover - allows `uvicorn backend.main:app`
     from backend.floorplan_constraints import (
         DEFAULT_FLOORPLAN_ID,
         FLOORPLAN_CONSTRAINT_REVISION,
         apply_floorplan_constraints,
+        invalidate_floorplan_engine,
     )
 
 try:
@@ -75,6 +93,23 @@ LINGBOT_FUSION_KEYFRAME_INTERVAL = int(os.getenv("LINGBOT_FUSION_KEYFRAME_INTERV
 LINGBOT_FUSION_TIMEOUT_SECONDS = int(
     os.getenv("LINGBOT_FUSION_TIMEOUT_SECONDS", str(3 * 60 * 60))
 )
+
+
+def _parse_gpu_worker_error(status: int, err_text: str) -> str:
+    """Extract a human-readable message from GPU Worker HTTP error bodies."""
+    text = (err_text or "").strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+            inner = payload.get("error") or payload.get("detail") or payload.get("message")
+            if inner:
+                return str(inner)
+        except json.JSONDecodeError:
+            pass
+    if text:
+        return text[:800]
+    return f"GPU Worker вернул HTTP {status}"
+
 
 #
 # Helper: safely convert numpy/scipy types to plain JSON-serializable objects
@@ -250,6 +285,10 @@ def _set_processing_stage(video_id: str, stage: str, **fields: Any) -> None:
     elif "stage_fraction" not in fields and previous != next_stage:
         state["stage_fraction"] = 0.0
     _apply_pipeline_progress(state, now=now)
+    try:
+        _persist_live_status(video_id)
+    except Exception:
+        pass
 
 
 def _finite_status_progress(value: Any) -> float:
@@ -730,6 +769,10 @@ async def _gpu_progress_heartbeat(
             if frames_done is not None:
                 state["gpu_frames_done"] = frames_done
             _apply_pipeline_progress(state)
+            try:
+                _persist_live_status(video_id)
+            except Exception:
+                pass
             # Persist only occasionally to avoid SQLite churn every 2s.
             if int(elapsed) % 10 < 2:
                 _update_task_status(video_id, "processing", int(state.get("progress") or 0))
@@ -839,47 +882,8 @@ def _load_completed_analysis_status(video_id: str) -> Optional[Dict[str, Any]]:
         with open(analysis_file, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         result = payload.get("analysis_result") or payload
-        constraint = result.get("floorplan_constraint") if isinstance(result, dict) else None
-        saved_revision = (
-            constraint.get("constraint_revision")
-            if isinstance(constraint, dict) else None
-        )
-        if saved_revision != FLOORPLAN_CONSTRAINT_REVISION:
-            map_context = _load_task_map_context(video_id)
-            if map_context.get("reference_point") and map_context.get("direction_point"):
-                refreshed = apply_floorplan_constraints(result, map_context)
-                refreshed_constraint = refreshed.get("floorplan_constraint") or {}
-                if refreshed_constraint.get("constraint_revision") == FLOORPLAN_CONSTRAINT_REVISION:
-                    result = refreshed
-                    if isinstance(payload, dict) and "analysis_result" in payload:
-                        payload["analysis_result"] = result
-                    else:
-                        payload = result
-                    analysis_file.parent.mkdir(parents=True, exist_ok=True)
-                    with tempfile.NamedTemporaryFile(
-                        mode="w",
-                        encoding="utf-8",
-                        dir=analysis_file.parent,
-                        prefix=f".{analysis_file.name}.",
-                        suffix=".tmp",
-                        delete=False,
-                    ) as temporary:
-                        json.dump(
-                            payload,
-                            temporary,
-                            indent=2,
-                            ensure_ascii=False,
-                            default=_to_json_serializable,
-                        )
-                        temporary.flush()
-                        os.fsync(temporary.fileno())
-                        temporary_path = Path(temporary.name)
-                    os.replace(temporary_path, analysis_file)
-                    logger.info(
-                        "[%s] Refreshed persisted floorplan result to %s",
-                        video_id,
-                        FLOORPLAN_CONSTRAINT_REVISION,
-                    )
+        # Do not refresh floorplan constraints on status polls — that CPU work
+        # belongs to the R³ worker and will freeze the API on a 1‑vCPU VPS.
         return {
             "id": video_id,
             "status": "completed",
@@ -1018,11 +1022,59 @@ OUTPUT_DIR = Path("outputs")
 VIDEOS_DIR = Path("videos")  # Для хранения оригинальных видео
 VIDEO_PREVIEWS_DIR = Path("video_previews")
 MANUAL_TRAJECTORIES_PATH = Path("backend/data/manual_trajectories.json")
+PROCESSING_QUEUE_PATH = Path("backend/data/video_processing_queues.json")
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 VIDEOS_DIR.mkdir(exist_ok=True)
 VIDEO_PREVIEWS_DIR.mkdir(exist_ok=True)
+LIVE_STATUS_DIR = OUTPUT_DIR / "live_status"
+LIVE_STATUS_DIR.mkdir(exist_ok=True)
 MANUAL_TRAJECTORIES_PATH.parent.mkdir(exist_ok=True, parents=True)
+PROCESSING_QUEUE_PATH.parent.mkdir(exist_ok=True, parents=True)
+
+
+def _live_status_path(video_id: str) -> Path:
+    return LIVE_STATUS_DIR / f"{video_id}.json"
+
+
+def _persist_live_status(video_id: str) -> None:
+    """Mirror in-memory status to disk so a separate R³ worker process is visible to API.
+
+    Never embed full analysis ``result`` here — a 0.5–1MB JSON on every poll
+    wedges the single uvicorn worker (accept queue fills, /api/health dies).
+    """
+    state = processing_status.get(video_id)
+    if not isinstance(state, dict):
+        return
+    payload = {key: value for key, value in state.items() if key != "result"}
+    # Tiny completion hint only; clients load trajectories via analysis endpoints.
+    if str(state.get("status") or "").lower() in {"completed", "done", "success", "error", "failed"}:
+        result = state.get("result")
+        if isinstance(result, dict):
+            payload["result_summary"] = {
+                "method": result.get("method"),
+                "map_points": len(result.get("map_trajectory") or []),
+                "graph_points": len(result.get("graph_first_trajectory") or []),
+                "has_result": True,
+            }
+    try:
+        path = _live_status_path(video_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.warning(f"[{video_id}] Failed to persist live status: {exc}")
+
+
+def _load_live_status(video_id: str) -> Optional[Dict[str, Any]]:
+    path = _live_status_path(video_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 # Database initialization
 DB_PATH = Path(__file__).parent / "data" / "database.db"
@@ -1240,6 +1292,586 @@ def _merge_task_map_context(video_id: str, map_context: Optional[Dict[str, Any]]
         conn.close()
     except Exception as exc:
         logger.warning(f"[{video_id}] Failed to persist map context: {exc}")
+
+
+# RLock: queue helpers call each other while holding the lock (enqueue →
+# has_incomplete_before; continue_after_completion → resolve_map_context).
+_processing_queue_lock = threading.RLock()
+
+
+def _load_processing_queues() -> Dict[str, Any]:
+    if not PROCESSING_QUEUE_PATH.exists():
+        return {}
+    try:
+        with open(PROCESSING_QUEUE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning(f"Failed to load processing queues: {exc}")
+        return {}
+
+
+def _save_processing_queues(data: Dict[str, Any]) -> None:
+    with open(PROCESSING_QUEUE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_to_json_serializable(data), f, ensure_ascii=False, indent=2)
+
+
+def _queue_sort_value(item: Dict[str, Any]) -> Tuple[float, float]:
+    seq = item.get("sequence_index")
+    try:
+        seq_value = float(seq)
+    except (TypeError, ValueError):
+        seq_value = float("inf")
+    try:
+        created = float(item.get("created_at") or 0.0)
+    except (TypeError, ValueError):
+        created = 0.0
+    return seq_value, created
+
+
+def _extract_xy(point: Any) -> Optional[Tuple[float, float]]:
+    if isinstance(point, dict):
+        if "x" in point and "y" in point:
+            try:
+                return float(point["x"]), float(point["y"])
+            except (TypeError, ValueError):
+                return None
+    if isinstance(point, (list, tuple)) and len(point) >= 2:
+        try:
+            return float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+# Follow-up queue segments shorter than this keep the session input direction/start.
+QUEUE_NORMAL_VIDEO_MIN_DURATION_SEC = 120.0
+
+
+def _map_context_has_anchor(map_context: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(map_context, dict):
+        return False
+    reference = map_context.get("reference_point")
+    direction = map_context.get("direction_point")
+    if not isinstance(reference, dict) or not isinstance(direction, dict):
+        return False
+    try:
+        float(reference.get("x"))
+        float(reference.get("y"))
+        float(direction.get("x"))
+        float(direction.get("y"))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _session_anchor_from_map_context(
+    map_context: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not _map_context_has_anchor(map_context):
+        return None
+    assert isinstance(map_context, dict)
+    return {
+        "reference_point": dict(map_context["reference_point"]),
+        "direction_point": dict(map_context["direction_point"]),
+    }
+
+
+def _build_session_input_queue_context(
+    base_context: Optional[Dict[str, Any]],
+    session_anchor: Dict[str, Any],
+    *,
+    source: str = "session_input",
+) -> Dict[str, Any]:
+    context = dict(base_context or {})
+    context.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
+    context["reference_point"] = dict(session_anchor["reference_point"])
+    context["direction_point"] = dict(session_anchor["direction_point"])
+    context["queue_anchor_source"] = source
+    context.pop("queue_inherit_anchor", None)
+    return context
+
+
+def _persist_queue_session_anchor(
+    queue: Dict[str, Any],
+    map_context: Optional[Dict[str, Any]],
+) -> None:
+    session_anchor = _session_anchor_from_map_context(map_context)
+    if session_anchor:
+        queue["session_anchor"] = session_anchor
+
+
+def _find_queue_session_anchor(
+    queue: Dict[str, Any],
+    items: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    stored = queue.get("session_anchor")
+    if isinstance(stored, dict) and _map_context_has_anchor(stored):
+        return {
+            "reference_point": dict(stored["reference_point"]),
+            "direction_point": dict(stored["direction_point"]),
+        }
+    for item in sorted(items, key=_queue_sort_value):
+        session_anchor = _session_anchor_from_map_context(item.get("map_context"))
+        if session_anchor:
+            return session_anchor
+    return None
+
+
+def _get_analysis_video_duration_sec(
+    video_id: str,
+    result: Optional[Dict[str, Any]] = None,
+) -> float:
+    if isinstance(result, dict):
+        video_info = result.get("video_info")
+        if isinstance(video_info, dict):
+            try:
+                duration = float(video_info.get("duration") or 0.0)
+                if duration > 0.0:
+                    return duration
+            except (TypeError, ValueError):
+                pass
+            try:
+                frame_count = float(
+                    video_info.get("frame_count")
+                    or result.get("frame_count")
+                    or 0.0
+                )
+                fps = float(video_info.get("fps") or 0.0)
+                if frame_count > 0.0 and fps > 0.0:
+                    return frame_count / fps
+            except (TypeError, ValueError):
+                pass
+        for key in ("r3_source_timestamps_seconds", "source_timestamps_seconds"):
+            timestamps = result.get(key)
+            if isinstance(timestamps, list) and timestamps:
+                try:
+                    last = float(timestamps[-1])
+                    if last > 0.0:
+                        return last
+                except (TypeError, ValueError):
+                    pass
+    video_filename = UPLOADED_VIDEOS.get(video_id)
+    video_path = (VIDEOS_DIR / video_filename) if video_filename else None
+    if not video_path or not video_path.exists():
+        matches = list(VIDEOS_DIR.glob(f"{video_id}_*"))
+        for match in matches:
+            if match.is_file():
+                video_path = match
+                break
+    if video_path and video_path.exists():
+        duration = _get_video_duration_sec(video_path)
+        if duration > 0.0:
+            return duration
+    return 0.0
+
+
+def _result_plan_size(result: Dict[str, Any]) -> Tuple[float, float]:
+    stats = result.get("processing_stats") if isinstance(result.get("processing_stats"), dict) else {}
+    floorplan = (
+        result.get("floorplan_constraint")
+        if isinstance(result.get("floorplan_constraint"), dict)
+        else {}
+    )
+    for source in (result, floorplan, stats):
+        width = (
+            source.get("floorplan_width")
+            or source.get("plan_width")
+            or source.get("map_width")
+            or source.get("width")
+        )
+        height = (
+            source.get("floorplan_height")
+            or source.get("plan_height")
+            or source.get("map_height")
+            or source.get("height")
+        )
+        try:
+            width_f = float(width)
+            height_f = float(height)
+            if width_f > 0 and height_f > 0:
+                return width_f, height_f
+        except (TypeError, ValueError):
+            pass
+    return 800.0, 600.0
+
+
+def _derive_queue_map_context(
+    previous_video_id: str,
+    previous_result: Dict[str, Any],
+    base_context: Optional[Dict[str, Any]] = None,
+    tail_seconds: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    trajectory = (
+        previous_result.get("map_trajectory")
+        or previous_result.get("graph_first_trajectory")
+        or previous_result.get("trajectory")
+        or []
+    )
+    if not isinstance(trajectory, list) or len(trajectory) < 2:
+        return None
+    points: List[Tuple[float, float]] = []
+    for raw in trajectory:
+        xy = _extract_xy(raw)
+        if xy is not None:
+            points.append(xy)
+    if len(points) < 2:
+        return None
+
+    timestamps = (
+        previous_result.get("r3_source_timestamps_seconds")
+        or previous_result.get("source_timestamps_seconds")
+        or []
+    )
+    prior_index = max(0, len(points) - 40)
+    if isinstance(timestamps, list) and len(timestamps) == len(points):
+        try:
+            last_t = float(timestamps[-1])
+            target_t = last_t - float(tail_seconds)
+            for idx in range(len(timestamps) - 2, -1, -1):
+                value = timestamps[idx]
+                if value is None:
+                    continue
+                if float(value) <= target_t:
+                    prior_index = idx
+                    break
+        except (TypeError, ValueError):
+            pass
+
+    end_x, end_y = points[-1]
+    prior_x, prior_y = points[prior_index]
+    # If the last seconds barely moved, walk farther back until the heading is usable.
+    for idx in range(len(points) - 2, -1, -1):
+        dx = end_x - prior_x
+        dy = end_y - prior_y
+        if _math.hypot(dx, dy) >= 8.0:
+            break
+        prior_x, prior_y = points[idx]
+
+    dx = end_x - prior_x
+    dy = end_y - prior_y
+    norm = _math.hypot(dx, dy)
+    if norm < 1e-6:
+        return None
+    width, height = _result_plan_size(previous_result)
+    direction_len = max(40.0, min(width, height) * 0.08)
+    dir_x = max(0.0, min(width, end_x + dx / norm * direction_len))
+    dir_y = max(0.0, min(height, end_y + dy / norm * direction_len))
+    context = dict(base_context or {})
+    context.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
+    ref_x = max(0.0, min(100.0, end_x / width * 100.0))
+    ref_y = max(0.0, min(100.0, end_y / height * 100.0))
+    dir_pct_x = max(0.0, min(100.0, dir_x / width * 100.0))
+    dir_pct_y = max(0.0, min(100.0, dir_y / height * 100.0))
+    context["reference_point"] = {"x": ref_x, "y": ref_y}
+    context["direction_point"] = {"x": dir_pct_x, "y": dir_pct_y}
+    context["queue_anchor_source"] = "previous_video_tail"
+    context["queue_previous_video_id"] = previous_video_id
+    context["queue_tail_seconds"] = tail_seconds
+    return context
+
+
+def _load_analysis_result(video_id: str) -> Optional[Dict[str, Any]]:
+    completed = _load_completed_analysis_status(video_id)
+    if completed and isinstance(completed.get("result"), dict):
+        return completed["result"]
+    status = processing_status.get(video_id)
+    if isinstance(status, dict) and isinstance(status.get("result"), dict):
+        return status["result"]
+    analysis_file = _analysis_file_path(video_id)
+    if not analysis_file.exists():
+        return None
+    try:
+        with open(analysis_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        result = payload.get("analysis_result") if isinstance(payload, dict) else None
+        return result if isinstance(result, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_queue_map_context(
+    queue_id: str,
+    video_id: str,
+    map_context: Optional[Dict[str, Any]],
+    sequence_index: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Resolve start/direction for a queued follow-up segment.
+
+    Short clips (<2 min, e.g. operator standing still) do not move the anchor;
+    the next segment keeps the session input start/direction.  Only a normal
+    long clip publishes its tail as the next segment anchor.
+    """
+    base = dict(map_context or {})
+    base.setdefault("floorplan_id", DEFAULT_FLOORPLAN_ID)
+    try:
+        is_first = float(sequence_index) <= 0
+    except (TypeError, ValueError):
+        is_first = True
+
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        queue = queues.get(queue_id) or {}
+        items = sorted((queue.get("items") or []), key=_queue_sort_value)
+        if _map_context_has_anchor(base):
+            _persist_queue_session_anchor(queue, base)
+            if queue:
+                queues[queue_id] = queue
+                _save_processing_queues(queues)
+
+    prior_items: List[Dict[str, Any]] = []
+    for item in items:
+        if item.get("video_id") == video_id:
+            break
+        prior_items.append(item)
+
+    session_anchor = _find_queue_session_anchor(queue, items)
+
+    if is_first or not prior_items:
+        if _map_context_has_anchor(base):
+            return base
+        if session_anchor:
+            return _build_session_input_queue_context(base, session_anchor)
+        return base
+
+    for prior_item in reversed(prior_items):
+        prev_id = str(prior_item.get("video_id") or "")
+        if not prev_id:
+            continue
+        prev_result = _load_analysis_result(prev_id)
+        if not prev_result:
+            continue
+        duration_sec = _get_analysis_video_duration_sec(prev_id, prev_result)
+        if duration_sec < QUEUE_NORMAL_VIDEO_MIN_DURATION_SEC:
+            logger.info(
+                f"[{video_id}] Queue anchor skipped short prior {prev_id} "
+                f"({duration_sec:.1f}s < {QUEUE_NORMAL_VIDEO_MIN_DURATION_SEC:.0f}s)"
+            )
+            continue
+        derived = _derive_queue_map_context(prev_id, prev_result, base)
+        if derived:
+            derived["queue_anchor_source"] = "previous_long_video_tail"
+            derived["queue_anchor_video_id"] = prev_id
+            derived["queue_anchor_video_duration_sec"] = round(duration_sec, 3)
+            derived.pop("queue_inherit_anchor", None)
+            logger.info(
+                f"[{video_id}] Queue anchor inherited from long prior {prev_id} "
+                f"({duration_sec:.1f}s) "
+                f"ref=({derived['reference_point']['x']:.2f}, "
+                f"{derived['reference_point']['y']:.2f})"
+            )
+            return derived
+
+    if session_anchor:
+        resolved = _build_session_input_queue_context(
+            base,
+            session_anchor,
+            source="session_input_after_short_segments",
+        )
+        logger.info(
+            f"[{video_id}] Queue anchor kept from session input "
+            f"ref=({resolved['reference_point']['x']:.2f}, "
+            f"{resolved['reference_point']['y']:.2f})"
+        )
+        return resolved
+
+    cleaned = dict(base)
+    cleaned.pop("reference_point", None)
+    cleaned.pop("direction_point", None)
+    cleaned["queue_inherit_anchor"] = True
+    return cleaned
+
+
+def _processing_queue_has_incomplete_before(queue_id: str, video_id: str) -> bool:
+    with _processing_queue_lock:
+        queue = _load_processing_queues().get(queue_id) or {}
+        items = sorted((queue.get("items") or []), key=_queue_sort_value)
+    for item in items:
+        if item.get("video_id") == video_id:
+            break
+        if str(item.get("status") or "") not in {"completed", "failed"}:
+            return True
+    return False
+
+
+def _any_gpu_pipeline_active(exclude_video_id: Optional[str] = None) -> bool:
+    active_statuses = {
+        "uploading_to_gpu",
+        "gpu_processing",
+        "lingbot_fusion",
+        "lingbot_running",
+        "lingbot_queued",
+    }
+    for vid, status in processing_status.items():
+        if exclude_video_id and vid == exclude_video_id:
+            continue
+        if not isinstance(status, dict):
+            continue
+        stage = str(status.get("stage") or status.get("status") or "").lower()
+        if stage in active_statuses:
+            return True
+    return False
+
+
+def _enqueue_processing_queue_item(
+    queue_id: str,
+    video_id: str,
+    *,
+    original_filename: str,
+    analysis_method: str,
+    sequence_index: Optional[Any],
+    run_params: Dict[str, Any],
+    map_context: Optional[Dict[str, Any]],
+    force_reprocess: bool = False,
+) -> Tuple[Dict[str, Any], bool]:
+    now = time.time()
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        queue = queues.setdefault(queue_id, {"queue_id": queue_id, "created_at": now, "items": []})
+        items = queue.setdefault("items", [])
+        existing = None
+        for item in items:
+            if item.get("video_id") == video_id:
+                existing = item
+                break
+        item_payload = {
+            "video_id": video_id,
+            "original_filename": original_filename,
+            "analysis_method": analysis_method,
+            "sequence_index": sequence_index,
+            "run_params": run_params,
+            "map_context": map_context or {"floorplan_id": DEFAULT_FLOORPLAN_ID},
+            "updated_at": now,
+        }
+        if existing is None:
+            item_payload.update({"status": "queued", "created_at": now})
+            items.append(item_payload)
+            existing = item_payload
+        else:
+            if existing.get("status") == "completed" and not force_reprocess:
+                return dict(existing), False
+            existing.update(item_payload)
+            if existing.get("status") in {"failed"} and force_reprocess:
+                existing["status"] = "queued"
+        items.sort(key=_queue_sort_value)
+        _persist_queue_session_anchor(queue, map_context)
+        has_active_before = False
+        for item in items:
+            if item.get("video_id") == video_id:
+                break
+            if item.get("status") in {"queued", "running"}:
+                has_active_before = True
+                break
+        incomplete_before = _processing_queue_has_incomplete_before(queue_id, video_id)
+        start_now = (
+            not has_active_before
+            and not incomplete_before
+            and existing.get("status") not in {"running", "completed"}
+            and not _any_gpu_pipeline_active(exclude_video_id=video_id)
+        )
+        if start_now:
+            existing["status"] = "running"
+            existing["started_at"] = now
+        queue["updated_at"] = now
+        _save_processing_queues(queues)
+        return dict(existing), start_now
+
+
+def _mark_processing_queue_item(video_id: str, status: str, **fields: Any) -> None:
+    now = time.time()
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        changed = False
+        for queue in queues.values():
+            if not isinstance(queue, dict):
+                continue
+            for item in queue.get("items") or []:
+                if item.get("video_id") == video_id:
+                    item.update(fields)
+                    item["status"] = status
+                    item["updated_at"] = now
+                    queue["updated_at"] = now
+                    changed = True
+        if changed:
+            _save_processing_queues(queues)
+
+
+async def _continue_processing_queue_after_completion(
+    previous_video_id: str,
+    previous_result: Dict[str, Any],
+) -> None:
+    next_item: Optional[Dict[str, Any]] = None
+    next_queue_id: Optional[str] = None
+    inherited_context: Optional[Dict[str, Any]] = None
+    now = time.time()
+    with _processing_queue_lock:
+        queues = _load_processing_queues()
+        for queue_id, queue in queues.items():
+            if not isinstance(queue, dict):
+                continue
+            items = queue.get("items") or []
+            items.sort(key=_queue_sort_value)
+            for idx, item in enumerate(items):
+                if item.get("video_id") != previous_video_id:
+                    continue
+                item["status"] = "completed"
+                item["completed_at"] = now
+                item["updated_at"] = now
+                queue["updated_at"] = now
+                for candidate in items[idx + 1:]:
+                    if candidate.get("status") == "queued":
+                        inherited_context = _resolve_queue_map_context(
+                            str(queue_id),
+                            str(candidate.get("video_id") or ""),
+                            candidate.get("map_context")
+                            if isinstance(candidate.get("map_context"), dict)
+                            else None,
+                            candidate.get("sequence_index"),
+                        )
+                        if inherited_context:
+                            candidate["map_context"] = inherited_context
+                        candidate["status"] = "running"
+                        candidate["started_at"] = now
+                        candidate["updated_at"] = now
+                        next_item = dict(candidate)
+                        next_queue_id = str(queue_id)
+                        break
+                break
+            if next_item is not None:
+                break
+        _save_processing_queues(queues)
+
+    if next_item is None:
+        return
+    video_id = str(next_item.get("video_id") or "")
+    if not video_id:
+        return
+    run_params = next_item.get("run_params") if isinstance(next_item.get("run_params"), dict) else {}
+    map_context = next_item.get("map_context") if isinstance(next_item.get("map_context"), dict) else inherited_context
+    _merge_task_map_context(video_id, map_context)
+    _begin_analysis_run(video_id, message=f"Очередь {next_queue_id}: запуск после {previous_video_id}")
+    processing_status[video_id].update({
+        "queue_id": next_queue_id,
+        "queue_previous_video_id": previous_video_id,
+        "queue_anchor_source": "previous_video_tail",
+    })
+    video_filename = UPLOADED_VIDEOS.get(video_id)
+    video_path = (VIDEOS_DIR / video_filename) if video_filename else None
+    if video_path and not video_path.exists():
+        video_path = None
+    _schedule_r3_process_background(
+        None,
+        video_id,
+        video_path,
+        str(next_item.get("original_filename") or "video"),
+        float(run_params.get("scale_factor", 12.306)),
+        int(run_params.get("frame_stride", 5)),
+        int(run_params.get("max_frames", 1500)),
+        str(run_params.get("ckpt", "r3_long.safetensors")),
+        int(run_params.get("size", 392)),
+        str(run_params.get("mode", "strided")),
+        map_context,
+    )
 
 
 def _load_manual_trajectories() -> Dict[str, Any]:
@@ -3230,13 +3862,22 @@ async def process_video_background(
         logger.info(f"[{video_id}] GPU Worker completed in {processing_time}s")
 
         # ─── Сохраняем результат (общая часть) ─────────────────────
+        saved_video_path = video_path if video_path and video_path.exists() else _find_uploaded_video_path(video_id)
+        saved_video_filename = (
+            saved_video_path.name
+            if saved_video_path and saved_video_path.exists()
+            else f"{video_id}_{original_filename}"
+        )
+        uploaded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        if saved_video_path and saved_video_path.exists():
+            uploaded_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(saved_video_path.stat().st_mtime))
         analysis_data = {
             "video_id": video_id,
-            "video_filename": video_path.name,
+            "video_filename": saved_video_filename,
             "original_filename": original_filename,
             "scale_factor": scale_factor,
             "stabilized": stabilize,
-            "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(video_path.stat().st_mtime)),
+            "uploaded_at": uploaded_at,
             "analysis_result": result
         }
 
@@ -3253,6 +3894,7 @@ async def process_video_background(
         })
         _update_task_status(video_id, "completed", 100)
         logger.info(f"[{video_id}] Analysis saved and status set to completed")
+        await _continue_processing_queue_after_completion(video_id, result)
 
     except Exception as e:
         error_msg = str(e)
@@ -3266,6 +3908,7 @@ async def process_video_background(
                 "suppress_disk_completion": True,
             })
             processing_status[video_id].pop("result", None)
+        _mark_processing_queue_item(video_id, "failed", error=error_msg)
         await send_error_to_telegram(error_msg, f"Фон. обработка: {original_filename}")
 
 # ──────────────────────────────────────────────
@@ -3292,6 +3935,175 @@ async def _clear_r3_live_artifacts(video_id: str) -> bool:
     except Exception as exc:
         logger.warning(f"[{video_id}] Failed to clear stale R³ live artifacts: {exc}")
         return False
+
+
+_HEAVY_ANALYSIS_KEYS = {
+    "r3_pose_graph",
+    "r3_pose_graph_candidate",
+    "r3_scale_aware_candidate",
+    "r3_raw_camera_points",
+    "raw_trajectory_3d",
+    "r3_camera_points",
+    "pointcloud_status",
+    "r3_projection",
+    "r3_source_frame_indices",
+    "r3_source_timestamps_seconds",
+    "r3_pose_confidence",
+    "graph_first_segments",
+    "graph_first_uncertainty",
+    "graph_first_metadata",
+    "map_trajectory_source_fractions",
+    "map_metadata",
+    "video_info",
+    "processing_stats",
+    "plan_trajectory",
+    "trajectory",
+    "raw_plan_trajectory",
+}
+
+
+def _slim_analysis_result(result: Any) -> Any:
+    """Keep only desktop/map fields so status polls stay small and non-blocking."""
+    if not isinstance(result, dict):
+        return result
+    keep_keys = (
+        "method",
+        "map_trajectory",
+        "graph_first_trajectory",
+        "map_turn_points",
+        "final_turn_points",
+        "turn_points",
+        "floorplan_constraint",
+        "frame_count",
+        "trajectory_points",
+        "total_processing_time",
+        "scale_factor",
+    )
+    slim = {key: result[key] for key in keep_keys if key in result}
+    # Fallback if map fields missing: allow a capped raw trajectory for debugging.
+    if not slim.get("map_trajectory") and not slim.get("graph_first_trajectory"):
+        traj = result.get("trajectory")
+        if isinstance(traj, list) and traj:
+            slim["trajectory"] = traj[:500]
+    return slim
+
+
+def _post_raw_file_to_gpu_sync(
+    url: str,
+    *,
+    params: Dict[str, Any],
+    file_path: Optional[Path] = None,
+    timeout_sec: int = 7200,
+) -> Dict[str, Any]:
+    """Blocking GPU upload/process off the asyncio event loop."""
+    try:
+        import requests  # type: ignore
+    except ImportError:
+        requests = None
+
+    if requests is not None:
+        if file_path is not None:
+            with open(file_path, "rb") as handle:
+                response = requests.post(
+                    url,
+                    params=params,
+                    data=handle,
+                    timeout=timeout_sec,
+                )
+        else:
+            response = requests.post(
+                url,
+                params=params,
+                data=b"",
+                headers={"Content-Length": "0"},
+                timeout=timeout_sec,
+            )
+        if response.status_code != 200:
+            detail = _parse_gpu_worker_error(response.status_code, response.text)
+            raise Exception(f"GPU Worker error (HTTP {response.status_code}): {detail}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise Exception("GPU Worker returned non-object JSON")
+        return payload
+
+    # Fallback without requests (stream not available — load into memory).
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    query = urllib.parse.urlencode({str(k): str(v) for k, v in params.items()})
+    full_url = f"{url}?{query}" if query else url
+    body = file_path.read_bytes() if file_path is not None else b""
+    request = urllib.request.Request(
+        full_url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/octet-stream", "Content-Length": str(len(body))},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = getattr(resp, "status", 200)
+    except urllib.error.HTTPError as exc:
+        err_text = exc.read().decode("utf-8", "replace")
+        detail = _parse_gpu_worker_error(exc.code, err_text)
+        raise Exception(f"GPU Worker error (HTTP {exc.code}): {detail}") from exc
+    if status != 200:
+        detail = _parse_gpu_worker_error(status, raw)
+        raise Exception(f"GPU Worker error (HTTP {status}): {detail}")
+    payload = json.loads(raw or "{}")
+    if not isinstance(payload, dict):
+        raise Exception("GPU Worker returned non-object JSON")
+    return payload
+
+
+async def _post_raw_file_to_gpu(
+    url: str,
+    *,
+    params: Dict[str, Any],
+    file_path: Optional[Path] = None,
+    timeout_sec: int = 7200,
+) -> Dict[str, Any]:
+    """Upload/process on GPU via curl subprocess so the asyncio loop stays responsive."""
+    import urllib.parse
+
+    query = urllib.parse.urlencode({str(k): str(v) for k, v in params.items()})
+    full_url = f"{url}?{query}" if query else url
+    cmd = [
+        "curl",
+        "-sS",
+        "--fail-with-body",
+        "--max-time",
+        str(int(timeout_sec)),
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/octet-stream",
+    ]
+    if file_path is not None:
+        cmd.extend(["--data-binary", f"@{file_path}"])
+    else:
+        cmd.extend(["-H", "Content-Length: 0", "--data-binary", ""])
+    cmd.append(full_url)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    raw = (stdout or b"").decode("utf-8", "replace")
+    err = (stderr or b"").decode("utf-8", "replace")
+    if proc.returncode != 0:
+        detail = _parse_gpu_worker_error(proc.returncode or 500, raw or err)
+        raise Exception(f"GPU Worker curl failed (code {proc.returncode}): {detail}")
+    try:
+        payload = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise Exception(f"GPU Worker returned invalid JSON: {raw[:300]}") from exc
+    if not isinstance(payload, dict):
+        raise Exception("GPU Worker returned non-object JSON")
+    return payload
 
 
 async def process_video_r3_background(
@@ -3355,66 +4167,59 @@ async def process_video_r3_background(
         processing_status[video_id].pop("result", None)
         logger.info(f"[{video_id}] Sending to GPU Worker R³ at {GPU_WORKER_URL}")
         timeout_sec = 7200
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
-            params = {
-                'original_filename': original_filename,
-                'frame_stride': str(frame_stride),
-                'ckpt': ckpt,
-                'size': str(size),
-                'mode': mode,
-                'max_frames': str(max_frames),
-            }
+        params = {
+            'original_filename': original_filename,
+            'frame_stride': str(frame_stride),
+            'ckpt': ckpt,
+            'size': str(size),
+            'mode': mode,
+            'max_frames': str(max_frames),
+        }
 
-            _set_processing_stage(
+        _set_processing_stage(
+            video_id,
+            "gpu",
+            status="gpu_processing",
+            progress=15,
+            message="R³ реконструкция на GPU...",
+            start_time=processing_status[video_id].get("start_time") or time.time(),
+        )
+        heartbeat = asyncio.create_task(
+            _gpu_progress_heartbeat(
                 video_id,
-                "gpu",
-                status="gpu_processing",
-                progress=15,
-                message="R³ реконструкция на GPU...",
-                start_time=processing_status[video_id].get("start_time") or time.time(),
+                max_frames=max_frames,
+                label="R³ реконструкция на GPU",
+                analysis_run_id=run_id or None,
             )
-            heartbeat = asyncio.create_task(
-                _gpu_progress_heartbeat(
-                    video_id,
-                    max_frames=max_frames,
-                    label="R³ реконструкция на GPU",
-                    analysis_run_id=run_id or None,
-                )
-            )
+        )
 
+        gpu_result: Dict[str, Any] = {}
+        try:
+            gpu_url = f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}"
+            if video_path and video_path.exists():
+                # Off-loop upload: sync file streaming must not freeze /api/health.
+                logger.info(f"[{video_id}] Sending local file to GPU Worker R³: {video_path.name}")
+                gpu_result = await _post_raw_file_to_gpu(
+                    gpu_url,
+                    params=params,
+                    file_path=video_path,
+                    timeout_sec=timeout_sec,
+                )
+            else:
+                logger.info(f"[{video_id}] Video already on GPU, triggering R³ processing")
+                params = {**params, "use_uploaded": "true"}
+                gpu_result = await _post_raw_file_to_gpu(
+                    gpu_url,
+                    params=params,
+                    file_path=None,
+                    timeout_sec=timeout_sec,
+                )
+        finally:
+            heartbeat.cancel()
             try:
-                if video_path and video_path.exists():
-                    # ─── Видео есть локально — отправляем файл ──────────
-                    logger.info(f"[{video_id}] Sending local file to GPU Worker R³: {video_path.name}")
-                    async with session.post(
-                        f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
-                        params=params,
-                        data=open(video_path, 'rb'),
-                    ) as resp:
-                        if resp.status != 200:
-                            err_text = await resp.text()
-                            raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
-                        gpu_result = await resp.json()
-                else:
-                    # ─── Видео уже на GPU — триггерим обработку ────────
-                    logger.info(f"[{video_id}] Video already on GPU, triggering R³ processing")
-                    params['use_uploaded'] = 'true'
-                    async with session.post(
-                        f"{GPU_WORKER_URL}/api/r3-process-video-raw/{video_id}",
-                        params=params,
-                        data=b'',  # empty body
-                        headers={'Content-Length': '0'},
-                    ) as resp:
-                        if resp.status != 200:
-                            err_text = await resp.text()
-                            raise Exception(f"GPU Worker R³ error (HTTP {resp.status}): {err_text[:500]}")
-                        gpu_result = await resp.json()
-            finally:
-                heartbeat.cancel()
-                try:
-                    await heartbeat
-                except asyncio.CancelledError:
-                    pass
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
 
         if not _is_analysis_run_current(video_id, run_id):
             logger.warning(
@@ -3566,7 +4371,9 @@ async def process_video_r3_background(
             analysis_run_id=run_id,
         )
         _update_task_status(video_id, "completed", 100)
+        _mark_processing_queue_item(video_id, "completed")
         logger.info(f"[{video_id}] R³ analysis saved and status set to completed")
+        await _continue_processing_queue_after_completion(video_id, trajectory_data)
 
     except Exception as e:
         error_msg = str(e)
@@ -3587,6 +4394,7 @@ async def process_video_r3_background(
                 suppress_disk_completion=True,
             )
             processing_status[video_id].pop("result", None)
+        _mark_processing_queue_item(video_id, "failed", error=error_msg)
 
 
 def _schedule_r3_process_background(
@@ -3602,19 +4410,35 @@ def _schedule_r3_process_background(
     mode: str = "strided",
     map_context: Optional[Dict[str, Any]] = None,
 ) -> None:
-    if background_tasks is not None:
-        background_tasks.add_task(
-            process_video_r3_background,
-            video_id, video_path, original_filename,
-            scale_factor, frame_stride, max_frames, ckpt, size, mode, map_context,
+    """Spawn a separate Python process for R³ so uvicorn's event loop cannot freeze."""
+    _ = background_tasks
+    jobs_dir = Path("/tmp/trackai_r3_jobs")
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    job_path = jobs_dir / f"{video_id}.json"
+    job = {
+        "video_id": video_id,
+        "video_path": str(video_path) if video_path else None,
+        "original_filename": original_filename,
+        "scale_factor": scale_factor,
+        "frame_stride": frame_stride,
+        "max_frames": max_frames,
+        "ckpt": ckpt,
+        "size": size,
+        "mode": mode,
+        "map_context": map_context or {},
+    }
+    job_path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+    worker = Path(__file__).resolve().parent / "r3_job_worker.py"
+    log_path = jobs_dir / f"{video_id}.log"
+    with open(log_path, "a", encoding="utf-8") as log_handle:
+        subprocess.Popen(
+            [sys.executable, str(worker), str(job_path)],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(Path(__file__).resolve().parent),
         )
-    else:
-        asyncio.create_task(
-            process_video_r3_background(
-                video_id, video_path, original_filename,
-                scale_factor, frame_stride, max_frames, ckpt, size, mode, map_context,
-            )
-        )
+    logger.info(f"[{video_id}] Scheduled R³ worker process job={job_path}")
 
 
 # Метаданные загруженных видео (video_id -> filename) для анализа по id
@@ -3673,7 +4497,10 @@ async def init_upload(request: Request) -> Dict[str, Any]:
         # Регистрируем
         UPLOADED_VIDEOS[video_id] = video_filename
 
-        map_context = {"client_source": client_source} if client_source else {}
+        provided_map_context = body.get("map_context")
+        map_context = provided_map_context if isinstance(provided_map_context, dict) else {}
+        if client_source:
+            map_context["client_source"] = client_source
 
         # Создаём задачу в tracking_tasks
         try:
@@ -3702,6 +4529,153 @@ async def init_upload(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _forward_uploaded_video_to_gpu_background(
+    video_id: str,
+    local_video_path: Path,
+    original_filename: str,
+    file_size: int,
+    is_desktop_upload: bool,
+    upload_source: str,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> None:
+    """Forward a locally saved upload to the GPU worker without blocking the API worker."""
+    gpu_url = f"{GPU_WORKER_URL}/api/upload-video-stream/{video_id}"
+    try:
+        processing_status[video_id] = {
+            "status": "uploading_to_gpu",
+            "progress": 0,
+            "message": "Отправка видео на GPU-сервер...",
+            "start_time": time.time(),
+            "stage": "upload",
+            "suppress_disk_completion": is_desktop_upload,
+        }
+        def _post_video_to_gpu() -> tuple[int, str, dict]:
+            import http.client
+            import json as _json
+            import ssl
+            import urllib.parse
+
+            query = urllib.parse.urlencode({"original_filename": original_filename})
+            parsed = urllib.parse.urlparse(f"{gpu_url}?{query}")
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            file_len = local_video_path.stat().st_size
+            if parsed.scheme == "https":
+                conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    host, port, timeout=7200, context=ssl.create_default_context(),
+                )
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=7200)
+            conn.putrequest("POST", path)
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(file_len))
+            conn.endheaders()
+            with open(local_video_path, "rb") as video_file:
+                while True:
+                    chunk = video_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+            response = conn.getresponse()
+            text = response.read().decode("utf-8", "replace")
+            try:
+                payload = _json.loads(text)
+            except Exception:
+                payload = {}
+            return response.status, text, payload
+
+        status_code, response_text, result = await asyncio.to_thread(_post_video_to_gpu)
+        if status_code != 200:
+            raise Exception(f"GPU Worker upload failed ({status_code}): {response_text[:200]}")
+        file_size = int(result.get("file_size", file_size) or file_size)
+
+        logger.info(f"[{video_id}] Uploaded {file_size} bytes to GPU Worker")
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
+            row = cursor.fetchone()
+            try:
+                map_context = json.loads(row[0]) if row and row[0] else {}
+            except Exception:
+                map_context = {}
+            if is_desktop_upload:
+                map_context["client_source"] = "desktop"
+            map_context["gpu_upload_url"] = gpu_url
+            cursor.execute(
+                "UPDATE tracking_tasks SET status = 'uploaded', map_context = ? WHERE id = ?",
+                (json.dumps(map_context), video_id),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        if is_desktop_upload:
+            processing_status[video_id] = {
+                "status": "uploaded",
+                "progress": 0,
+                "message": "Видео загружено, ожидает запуска R3",
+                "start_time": time.time(),
+                "stage": "queued",
+                "suppress_disk_completion": True,
+            }
+            _update_task_status(video_id, "uploaded", 0)
+            logger.info(f"[{video_id}] Desktop upload completed; waiting for explicit R3 analysis")
+        else:
+            logger.info(f"[{video_id}] Starting GPU processing")
+            _schedule_process_video_background(
+                background_tasks,
+                video_id,
+                None,
+                original_filename,
+                12.306,
+                True,
+                3,
+                3,
+                True,
+                None,
+            )
+
+        if background_tasks is not None:
+            background_tasks.add_task(
+                send_desktop_upload_notification,
+                video_id,
+                original_filename,
+                file_size,
+                gpu_url,
+                upload_source,
+            )
+            background_tasks.add_task(broadcast_new_processing_for_video, video_id)
+        else:
+            asyncio.create_task(
+                send_desktop_upload_notification(
+                    video_id,
+                    original_filename,
+                    file_size,
+                    gpu_url,
+                    upload_source,
+                )
+            )
+            asyncio.create_task(broadcast_new_processing_for_video(video_id))
+    except Exception as e:
+        logger.error(f"[{video_id}] Background GPU upload failed: {e}", exc_info=True)
+        processing_status[video_id] = {
+            "status": "error",
+            "progress": 0,
+            "message": str(e)[:500],
+            "stage": "upload",
+        }
+        try:
+            _update_task_status(video_id, "error", 0)
+        except Exception:
+            pass
+
+
 @app.post("/api/upload-video/{video_id}")
 async def upload_video_proxy(video_id: str, request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """Принять raw-байты видео, отправить на GPU и сохранить локально для R³ анализа.
@@ -3711,6 +4685,24 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
     """
     try:
         video_info = UPLOADED_VIDEOS.get(video_id)
+        if not video_info:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute(
+                    "SELECT video_filename, original_filename FROM tracking_tasks WHERE id = ?",
+                    (video_id,),
+                ).fetchone()
+                conn.close()
+                if row:
+                    video_filename, original_filename = row
+                    video_info = video_filename or (
+                        f"{video_id}_{original_filename}" if original_filename else None
+                    )
+                    if video_info:
+                        UPLOADED_VIDEOS[video_id] = video_info
+                        logger.info(f"[{video_id}] Restored upload registration from DB: {video_info}")
+            except Exception as restore_err:
+                logger.warning(f"[{video_id}] Failed to restore upload registration from DB: {restore_err}")
         if not video_info:
             raise HTTPException(status_code=404, detail=f"Video {video_id} not registered")
         
@@ -3726,95 +4718,93 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
 
         # ─── Буферизируем во временный файл ──────────────────────
         file_size = 0
-        with open(local_tmp, "wb") as tmp:
-            async for chunk in request.stream():
-                if chunk:
-                    tmp.write(chunk)
-                    file_size += len(chunk)
+        try:
+            with open(local_tmp, "wb") as tmp:
+                async for chunk in request.stream():
+                    if chunk:
+                        tmp.write(chunk)
+                        file_size += len(chunk)
+        except ClientDisconnect:
+            local_tmp.unlink(missing_ok=True)
+            processing_status[video_id] = {
+                "status": "error",
+                "progress": 0,
+                "message": "Выгрузка оборвалась: камера или приложение закрыли соединение",
+                "stage": "upload",
+            }
+            try:
+                _update_task_status(video_id, "error", 0)
+            except Exception as status_err:
+                logger.warning(f"[{video_id}] Failed to persist upload disconnect status: {status_err}")
+            logger.warning(f"[{video_id}] Upload disconnected after {file_size} bytes")
+            raise HTTPException(
+                status_code=499,
+                detail="Upload disconnected before the video file was fully received",
+            )
 
         if file_size == 0:
             local_tmp.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail="Пустой файл видео")
 
         # Перемещаем из временного в постоянное место
-        local_tmp.rename(local_video_path)
+        if local_tmp.exists():
+            local_tmp.rename(local_video_path)
+        elif not local_video_path.exists():
+            raise HTTPException(status_code=500, detail="Временный файл загрузки не найден")
+        else:
+            logger.warning(f"[{video_id}] Temp upload file missing but final file exists; continuing")
 
         # Регистрируем локальный файл
         UPLOADED_VIDEOS[video_id] = local_video_path.name
         logger.info(f"[{video_id}] Saved locally: {local_video_path} ({file_size} bytes)")
-        _schedule_video_preview(video_id)
-
-        # ─── Отправляем на GPU ────────────────────────────────────
-        gpu_url = f"{GPU_WORKER_URL}/api/upload-video-stream/{video_id}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                gpu_url,
-                params={'original_filename': original_filename},
-                data=open(local_video_path, 'rb'),
-                timeout=aiohttp.ClientTimeout(total=7200),
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"[{video_id}] GPU Worker upload failed ({resp.status}): {error_text[:200]}")
-                    raise HTTPException(status_code=500, detail=f"GPU Worker upload failed: {error_text[:200]}")
-                result = await resp.json()
-                file_size = result.get("file_size", file_size)
-
-        logger.info(f"[{video_id}] Uploaded {file_size} bytes to GPU Worker")
-
-        # Обновляем статус задачи
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT map_context FROM tracking_tasks WHERE id = ?", (video_id,))
-            row = cursor.fetchone()
-            try:
-                map_context = json.loads(row[0]) if row and row[0] else {}
-            except Exception:
-                map_context = {}
-            if is_desktop_upload:
-                map_context["client_source"] = "desktop"
-                map_context["gpu_upload_url"] = gpu_url
-            cursor.execute(
-                "UPDATE tracking_tasks SET status = 'uploaded', map_context = ? WHERE id = ?",
-                (json.dumps(map_context), video_id)
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
 
         upload_source = client_source or "web"
-        if background_tasks is not None:
-            background_tasks.add_task(
-                send_desktop_upload_notification,
-                video_id,
-                original_filename,
-                file_size,
-                gpu_url,
-                upload_source,
-            )
+        if is_desktop_upload:
+            # Desktop R³ uploads the local file during analyze — skip duplicate GPU forward.
+            processing_status[video_id] = {
+                "status": "uploaded",
+                "progress": 0,
+                "message": "Видео загружено, ожидает запуска R3",
+                "start_time": time.time(),
+                "stage": "queued",
+                "suppress_disk_completion": True,
+            }
+            _update_task_status(video_id, "uploaded", 0)
+            # Skip admin MP4 preview on the 1‑vCPU API box: ffmpeg is often
+            # missing and a stuck/heavy preview thread + R³ worker OOMs the host.
         else:
-            asyncio.create_task(
-                send_desktop_upload_notification(video_id, original_filename, file_size, gpu_url, upload_source)
-            )
-
-        # Запускаем SLAM обработку (с video_path=None — use_uploaded на GPU)
-        logger.info(f"[{video_id}] Starting GPU processing")
-        _schedule_process_video_background(
-            background_tasks,
-            video_id,
-            None,
-            original_filename,
-            12.306, True, 3, 3, True, None,
-        )
-
-        # Notify subscribers
-        if background_tasks is not None:
-            background_tasks.add_task(broadcast_new_processing_for_video, video_id)
-        else:
-            asyncio.create_task(broadcast_new_processing_for_video(video_id))
+            _schedule_video_preview(video_id)
+            processing_status[video_id] = {
+                "status": "uploading_to_gpu",
+                "progress": 0,
+                "message": "Отправка видео на GPU-сервер...",
+                "start_time": time.time(),
+                "stage": "upload",
+            }
+            # Не блокируем единственный uvicorn worker на пересылке 2+ GB на GPU.
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    _forward_uploaded_video_to_gpu_background,
+                    video_id,
+                    local_video_path,
+                    original_filename,
+                    file_size,
+                    is_desktop_upload,
+                    upload_source,
+                    background_tasks,
+                )
+            else:
+                asyncio.create_task(
+                    _forward_uploaded_video_to_gpu_background(
+                        video_id,
+                        local_video_path,
+                        original_filename,
+                        file_size,
+                        is_desktop_upload,
+                        upload_source,
+                        None,
+                    )
+                )
 
         return {
             "success": True,
@@ -3822,7 +4812,8 @@ async def upload_video_proxy(video_id: str, request: Request, background_tasks: 
             "filename": video_info,
             "original_filename": original_filename,
             "file_size": file_size,
-            "message": "Видео отправлено на обработку на GPU-сервер"
+            "auto_analysis_started": False,
+            "message": "Видео сохранено, отправка на GPU в фоне" if is_desktop_upload else "Видео сохранено, отправка на GPU в фоне",
         }
     except HTTPException:
         raise
@@ -3972,6 +4963,101 @@ async def register_existing_video_task(video_id: str, request: Request) -> Dict[
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/desktop/archive-video/{video_id}")
+async def archive_desktop_video(
+    video_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    filename: str = Query("video.mp4"),
+) -> Dict[str, Any]:
+    """Archive a locally processed desktop video without launching remote inference."""
+    safe_filename = Path(filename).name or "video.mp4"
+    target = VIDEOS_DIR / f"{video_id}_{safe_filename}"
+    total = 0
+    with target.open("wb") as output:
+        async for chunk in request.stream():
+            total += len(chunk)
+            output.write(chunk)
+    if total <= 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Пустое видео")
+    UPLOADED_VIDEOS[video_id] = target.name
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO tracking_tasks (
+            id, video_filename, original_filename, map_context, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            video_filename=excluded.video_filename,
+            original_filename=excluded.original_filename,
+            map_context=excluded.map_context,
+            status=excluded.status,
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (video_id, target.name, safe_filename, json.dumps({
+            "client_source": "desktop_local",
+            "floorplan_id": "kerama_marazzi_2025",
+        }), "processing_local"),
+    )
+    conn.commit()
+    conn.close()
+    client_source = (
+        request.headers.get("X-TrackAI-Client") or "desktop_local"
+    ).strip()
+    background_tasks.add_task(
+        send_desktop_upload_notification,
+        video_id,
+        safe_filename,
+        total,
+        "local-desktop",
+        client_source,
+    )
+    return {"success": True, "video_id": video_id, "bytes": total}
+
+
+@app.post("/api/desktop/local-analysis/{video_id}")
+async def save_desktop_local_analysis(
+    video_id: str,
+    payload: Dict[str, Any] = Body(default={}),
+) -> Dict[str, Any]:
+    """Store a trusted local desktop result so admins can review or redraw it."""
+    result = payload.get("data")
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=400, detail="Некорректный результат")
+    result["video_id"] = video_id
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT video_filename, original_filename FROM tracking_tasks WHERE id = ?",
+        (video_id,),
+    )
+    task = cursor.fetchone()
+    video_filename = task[0] if task else ""
+    original_filename = task[1] if task else video_filename
+    output_path = OUTPUT_DIR / f"{video_id}_analysis.json"
+    output_path.write_text(json.dumps({
+        "video_id": video_id,
+        "video_filename": video_filename,
+        "original_filename": original_filename,
+        "scale_factor": 1.0,
+        "stabilized": False,
+        "analysis_result": result,
+    }, ensure_ascii=False), encoding="utf-8")
+    processing_status[video_id] = {
+        "status": "completed", "progress": 100, "message": "Готово",
+        "result": result, "start_time": time.time(),
+    }
+    cursor.execute(
+        "UPDATE tracking_tasks SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        ("completed", video_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"success": True, "video_id": video_id}
+
+
 async def _submit_lingbot_session(
     video_path: Optional[Path],
     fps: int = 10,
@@ -4098,8 +5184,24 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
         turn_vote_threshold = int(body.get("turn_vote_threshold", 3))
         use_ml_roi = bool(body.get("use_ml_roi", True))
         map_context = _extract_map_context(body)
-        _merge_task_map_context(video_id, map_context)
         force_reprocess = bool(body.get("force_reprocess", False))
+        employee_name = body.get("employee_name")
+        analysis_method = body.get("analysis_method", "slam")
+        queue_id = (
+            body.get("queue_id")
+            or body.get("processing_queue_id")
+            or body.get("shift_id")
+            or body.get("batch_id")
+        )
+        sequence_index = body.get("sequence_index")
+        if queue_id:
+            map_context = _resolve_queue_map_context(
+                str(queue_id),
+                video_id,
+                map_context,
+                sequence_index,
+            )
+        _merge_task_map_context(video_id, map_context)
 
         # При явном новом анализе ручная траектория больше не должна подменять результат.
         # Иначе выбранное с сервера видео с прежней админ-разметкой сразу возвращает manual_result.
@@ -4155,17 +5257,74 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
                 else:
                     raise HTTPException(status_code=404, detail=f"Видео {video_id} не найдено на сервере")
 
+        if queue_id:
+            if analysis_method != "r3":
+                raise HTTPException(status_code=400, detail="Очередь смены сейчас поддерживает только analysis_method='r3'")
+            run_params = {
+                "scale_factor": scale_factor,
+                "frame_stride": int(body.get("frame_stride", 5)),
+                "max_frames": int(body.get("max_frames", 1500)),
+                "ckpt": body.get("ckpt", "r3_long.safetensors"),
+                "size": int(body.get("size", 392)),
+                "mode": body.get("mode", "strided"),
+            }
+            queue_item, queue_start_now = _enqueue_processing_queue_item(
+                str(queue_id),
+                video_id,
+                original_filename=original_filename,
+                analysis_method=analysis_method,
+                sequence_index=sequence_index,
+                run_params=run_params,
+                map_context=map_context,
+                force_reprocess=force_reprocess,
+            )
+            if not queue_start_now:
+                if queue_item.get("status") == "completed" and not force_reprocess:
+                    completed = _load_completed_analysis_status(video_id)
+                    return {
+                        "success": True,
+                        "video_id": video_id,
+                        "status": "completed",
+                        "message": "Анализ уже выполнен",
+                        "data": (completed or {}).get("result"),
+                        "analysis_run_id": (completed or {}).get("analysis_run_id"),
+                        "queue_id": str(queue_id),
+                    }
+                processing_status[video_id] = {
+                    "status": "queued",
+                    "progress": 0,
+                    "message": f"Ожидает предыдущий ролик в очереди {queue_id}",
+                    "start_time": time.time(),
+                    "stage": "queued",
+                    "stage_started_at": time.time(),
+                    "stage_timings": {},
+                    "queue_id": str(queue_id),
+                    "queue_sequence_index": sequence_index,
+                    "suppress_disk_completion": True,
+                }
+                _update_task_status(video_id, "queued", 0)
+                return {
+                    "success": True,
+                    "video_id": video_id,
+                    "status": "queued",
+                    "message": "Видео добавлено в очередь и ждёт предыдущий сегмент",
+                    "queue_id": str(queue_id),
+                    "queue_item": queue_item,
+                }
+
         # Invalidate prior *_analysis.json and arm a run id so /api/status cannot
         # return the previous completed payload while this job is still running.
         analysis_run_id = _begin_analysis_run(
             video_id,
             message="Поставлено в очередь на обработку",
         )
+        if queue_id:
+            processing_status[video_id].update({
+                "queue_id": str(queue_id),
+                "queue_sequence_index": sequence_index,
+            })
 
         # ─── НЕМЕДЛЕННО запускаем обработку на GPU Worker ────────
-        employee_name = body.get("employee_name")
-        analysis_method = body.get("analysis_method", "slam")
-
         if analysis_method == "lingbot":
             lingbot_result = await _start_lingbot_session(
                 video_id,
@@ -4228,6 +5387,24 @@ async def analyze_video_by_id(background_tasks: BackgroundTasks, request: Reques
     except Exception as e:
         logger.error(f"Error in analyze_video_by_id: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/processing-queue/{queue_id}")
+async def get_processing_queue(queue_id: str) -> Dict[str, Any]:
+    queues = _load_processing_queues()
+    queue = queues.get(queue_id)
+    if not isinstance(queue, dict):
+        raise HTTPException(status_code=404, detail=f"Очередь {queue_id} не найдена")
+    items = queue.get("items") or []
+    return {
+        "success": True,
+        "queue_id": queue_id,
+        "queue": {
+            **queue,
+            "items": sorted(items, key=_queue_sort_value),
+        },
+    }
+
 
 @app.post("/api/analyze-video")
 async def analyze_video(background_tasks: BackgroundTasks, request: Request) -> Dict[str, Any]:
@@ -4339,6 +5516,11 @@ async def health_check():
 @app.get("/api/processing-status/{video_id}")
 async def get_processing_status(video_id: str):
     """Get processing status for a video"""
+    return await asyncio.to_thread(_build_processing_status_payload, video_id)
+
+
+def _build_processing_status_payload(video_id: str) -> Dict[str, Any]:
+    """Sync status builder — always run via asyncio.to_thread from the route."""
     live = processing_status.get(video_id) or {}
     suppress_disk = bool(live.get("suppress_disk_completion"))
     live_state = str(live.get("status") or "").lower()
@@ -4362,10 +5544,106 @@ async def get_processing_status(video_id: str):
             }
     if video_id in processing_status:
         payload = dict(processing_status[video_id])
+        file_live = _load_live_status(video_id)
+        # Prefer worker-persisted live status when the API process only has the
+        # initial "queued" placeholder from analyze-video-by-id.
+        file_state = str((file_live or {}).get("status") or "").lower()
+        file_progress = 0
+        try:
+            file_progress = float((file_live or {}).get("progress") or 0)
+        except (TypeError, ValueError):
+            file_progress = 0
+        if file_live and (
+            file_state in _LIVE_BUSY_STATES
+            or file_state in {"completed", "done", "success", "error", "failed"}
+            or file_progress > float(payload.get("progress") or 0)
+        ):
+            payload = dict(file_live)
+            live_busy = file_state in _LIVE_BUSY_STATES
+        # Live file must stay small; never re-hydrate full analysis into busy polls.
+        payload.pop("result", None)
         if live_busy:
-            payload.pop("result", None)
+            return payload
+        completed = _load_completed_analysis_status(video_id)
+        if completed and isinstance(completed.get("result"), dict):
+            payload = {**payload, **{k: completed[k] for k in ("status", "progress", "message", "analysis_run_id") if k in completed}}
+            payload["status"] = completed.get("status") or payload.get("status")
+            payload["progress"] = completed.get("progress", 100)
+            payload["result"] = _slim_analysis_result(completed.get("result"))
         return payload
+    file_live = _load_live_status(video_id)
+    if file_live:
+        file_state = str(file_live.get("status") or "").lower()
+        if file_state in _LIVE_BUSY_STATES:
+            light = dict(file_live)
+            light.pop("result", None)
+            return light
+        if file_state in {"queued", "completed", "done", "success", "error", "failed"}:
+            if file_state in {"completed", "done", "success"}:
+                completed = _load_completed_analysis_status(video_id)
+                if completed and isinstance(completed.get("result"), dict):
+                    out = dict(file_live)
+                    out.pop("result", None)
+                    out["status"] = "completed"
+                    out["progress"] = 100
+                    out["result"] = _slim_analysis_result(completed.get("result"))
+                    if completed.get("analysis_run_id"):
+                        out["analysis_run_id"] = completed.get("analysis_run_id")
+                    return out
+            light = dict(file_live)
+            if isinstance(light.get("result"), dict):
+                light["result"] = _slim_analysis_result(light.get("result"))
+            return light
+    completed = _load_completed_analysis_status(video_id)
+    if completed:
+        if isinstance(completed.get("result"), dict):
+            completed = dict(completed)
+            completed["result"] = _slim_analysis_result(completed.get("result"))
+        return completed
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT video_filename, original_filename, status, progress, updated_at FROM tracking_tasks WHERE id = ?",
+            (video_id,),
+        ).fetchone()
+        conn.close()
+        if row:
+            status = str(row["status"] or "registered").lower()
+            progress_value = row["progress"] if row["progress"] is not None else 0
+            try:
+                progress = int(float(progress_value))
+            except Exception:
+                progress = 0
+            if status == "registered":
+                upload_name = row["video_filename"] or f"{video_id}_{row['original_filename'] or 'video.avi'}"
+                suffix = Path(upload_name).suffix or ".avi"
+                temp_upload = VIDEOS_DIR / f".{video_id}_uploading{suffix}"
+                saved_upload = VIDEOS_DIR / upload_name
+                uploading = temp_upload.exists()
+                return {
+                    "status": "uploading" if uploading else "registered",
+                    "progress": max(1 if uploading else 0, min(99, progress)),
+                    "message": "Выгружается на сервер" if uploading else "Видео зарегистрировано, ждём файл",
+                    "stage": "upload",
+                    "uploaded_bytes": temp_upload.stat().st_size if uploading else (saved_upload.stat().st_size if saved_upload.exists() else 0),
+                    "updated_at": str(row["updated_at"] or ""),
+                }
+            return {
+                "status": status,
+                "progress": max(0, min(100, progress)),
+                "message": "Статус восстановлен из базы",
+                "stage": status,
+                "updated_at": str(row["updated_at"] or ""),
+            }
+    except Exception as db_err:
+        logger.warning(f"[{video_id}] Failed to load DB processing status fallback: {db_err}")
     raise HTTPException(status_code=404, detail="Video processing not found")
+
+@app.get("/api/status/{video_id}")
+async def get_processing_status_compat(video_id: str):
+    """Backward-compatible status endpoint used by older desktop builds."""
+    return await get_processing_status(video_id)
 
 @app.get("/api/test")
 async def test_endpoint():
@@ -4375,31 +5653,224 @@ async def test_endpoint():
 @app.get("/api/uploaded-videos")
 async def get_uploaded_videos_list():
     """Список всех загруженных на сервер видео (для выбора перед анализом)"""
-    videos = []
-    try:
-        for f in VIDEOS_DIR.glob("*_*"):
-            if f.is_file():
+    def _collect() -> List[Dict[str, Any]]:
+        videos = []
+        try:
+            for f in VIDEOS_DIR.glob("*_*"):
+                if not f.is_file():
+                    continue
                 name = f.name
-                if "_" in name:
-                    vid = name.split("_", 1)[0]
-                    if len(vid) == 36 and vid.count("-") == 4:
-                        try:
-                            stat = f.stat()
-                            videos.append({
-                                "video_id": vid,
-                                "filename": name,
-                                "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
-                                "file_size": stat.st_size,
-                                "scale_factor": 12.306,
-                                "stabilized": False,
-                                "has_analysis": False
-                            })
-                        except Exception as e:
-                            logger.warning(f"Error stat {f}: {e}")
-        return {"success": True, "videos": videos}
-    except Exception as e:
-        logger.error(f"Error getting uploaded videos: {e}")
-        return {"success": False, "videos": [], "error": str(e)}
+                if "_" not in name:
+                    continue
+                vid = name.split("_", 1)[0]
+                if not (len(vid) == 36 and vid.count("-") == 4):
+                    continue
+                try:
+                    stat = f.stat()
+                    videos.append({
+                        "video_id": vid,
+                        "filename": name,
+                        "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(stat.st_mtime)),
+                        "file_size": stat.st_size,
+                        "size_bytes": stat.st_size,
+                        "original_filename": name.split("_", 1)[1],
+                        "scale_factor": 12.306,
+                        "stabilized": False,
+                        "has_analysis": _analysis_file_path(vid).is_file(),
+                    })
+                except OSError:
+                    continue
+        except Exception as exc:
+            logger.warning(f"uploaded-videos scan failed: {exc}")
+        return videos
+
+    videos = await asyncio.to_thread(_collect)
+    # Keep remaining DB enrichment off the event loop as well.
+    def _enrich(videos_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        videos_out = list(videos_in)
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            conn.row_factory = sqlite3.Row
+            known = {v["video_id"] for v in videos_out}
+            for row in conn.execute(
+                "SELECT id, video_filename, original_filename, created_at FROM tracking_tasks ORDER BY created_at DESC LIMIT 200"
+            ):
+                vid = str(row["id"])
+                if vid in known:
+                    continue
+                videos_out.append({
+                    "video_id": vid,
+                    "filename": row["video_filename"] or "",
+                    "uploaded_at": str(row["created_at"] or ""),
+                    "size_bytes": 0,
+                    "original_filename": row["original_filename"] or "",
+                })
+            conn.close()
+        except Exception as db_err:
+            logger.warning(f"uploaded-videos DB enrich failed: {db_err}")
+        videos_out.sort(key=lambda item: item.get("uploaded_at") or "", reverse=True)
+        return videos_out[:300]
+
+    return {"success": True, "videos": await asyncio.to_thread(_enrich, videos)}
+
+
+@app.get("/api/admin/floorplans/{map_id}/topology-graph")
+async def admin_generate_floorplan_topology_graph(
+    map_id: str,
+    minimum_edge_meters: float = Query(1.5, ge=0.25, le=20.0),
+    graph_scale_pixels: int = Query(8, ge=2, le=32),
+) -> Dict[str, Any]:
+    """Generate an editable corridor graph without mutating production assets."""
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    try:
+        return _to_json_serializable(build_floorplan_graph(
+            metadata_path,
+            minimum_edge_meters=minimum_edge_meters,
+            graph_scale_pixels=graph_scale_pixels,
+        ))
+    except Exception as exc:
+        logger.exception("Failed to generate topology graph for %s", map_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Topology graph generation failed: {exc}",
+        ) from exc
+
+
+@app.get("/api/admin/floorplans/{map_id}/topology-graph/production")
+async def admin_get_production_floorplan_topology_graph(
+    map_id: str,
+) -> Dict[str, Any]:
+    """Return the exact graph consumed by production map matching."""
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    graph_name = str(metadata.get("topology_graph_file") or "")
+    graph_path = assets / graph_name
+    if not graph_name or not graph_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Production topology graph not configured",
+        )
+    payload = json.loads(graph_path.read_text(encoding="utf-8"))
+    file_sha256 = __import__("hashlib").sha256(graph_path.read_bytes()).hexdigest()
+    expected_sha256 = str(metadata.get("topology_graph_sha256") or "")
+    if expected_sha256 and file_sha256 != expected_sha256:
+        raise HTTPException(
+            status_code=409,
+            detail="Production topology graph SHA mismatch",
+        )
+    payload["production_validation"] = {
+        "file_sha256": file_sha256,
+        "expected_file_sha256": expected_sha256,
+        "file_sha256_matches": file_sha256 == expected_sha256,
+        "geometry_sha256": floorplan_graph_geometry_sha256(payload),
+        "embedded_geometry_sha256": (
+            (payload.get("source") or {}).get("geometry_sha256")
+        ),
+    }
+    return _to_json_serializable(payload)
+
+
+@app.post("/api/admin/floorplans/{map_id}/topology-graph/production")
+async def admin_save_production_floorplan_topology_graph(
+    map_id: str,
+    graph: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """Atomically persist the exact graph edited by the administrator."""
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if str(graph.get("map_id") or "") != map_id:
+        raise HTTPException(status_code=422, detail="Graph map_id mismatch")
+    if (
+        int(graph.get("width") or 0) != int(metadata.get("width") or 0)
+        or int(graph.get("height") or 0) != int(metadata.get("height") or 0)
+    ):
+        raise HTTPException(status_code=422, detail="Graph dimensions mismatch")
+    payload = json.loads(json.dumps(graph))
+    payload.pop("production_validation", None)
+    if any(
+        not isinstance(edge.get("points"), list)
+        or len(edge.get("points") or []) != 2
+        for edge in payload.get("edges", [])
+    ):
+        payload = normalize_floorplan_graph(payload)
+    try:
+        validation = validate_floorplan_graph(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    payload["validation"] = {
+        **(payload.get("validation") or {}),
+        **validation,
+    }
+    source = dict(payload.get("source") or {})
+    source["geometry_sha256"] = floorplan_graph_geometry_sha256(payload)
+    source["saved_from_admin"] = True
+    source["saved_at_unix"] = round(time.time(), 3)
+    payload["source"] = source
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    file_sha256 = __import__("hashlib").sha256(encoded).hexdigest()
+    graph_name = str(
+        metadata.get("topology_graph_file")
+        or f"{map_id}.topology-graph.v1.json"
+    )
+    graph_path = assets / graph_name
+    updated_metadata = {
+        **metadata,
+        "topology_graph_file": graph_name,
+        "topology_graph_sha256": file_sha256,
+    }
+    metadata_encoded = json.dumps(
+        updated_metadata,
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    token = uuid.uuid4().hex
+    graph_temporary = graph_path.with_name(f".{graph_path.name}.{token}.tmp")
+    metadata_temporary = metadata_path.with_name(
+        f".{metadata_path.name}.{token}.tmp"
+    )
+    try:
+        graph_temporary.write_bytes(encoded)
+        metadata_temporary.write_bytes(metadata_encoded)
+        os.replace(graph_temporary, graph_path)
+        os.replace(metadata_temporary, metadata_path)
+    finally:
+        graph_temporary.unlink(missing_ok=True)
+        metadata_temporary.unlink(missing_ok=True)
+    invalidate_floorplan_engine(map_id)
+    payload["production_validation"] = {
+        "file_sha256": file_sha256,
+        "expected_file_sha256": file_sha256,
+        "file_sha256_matches": True,
+        "geometry_sha256": floorplan_graph_geometry_sha256(payload),
+        "embedded_geometry_sha256": source["geometry_sha256"],
+    }
+    return _to_json_serializable(payload)
+
+
+@app.get("/api/admin/floorplans/{map_id}/support-mask.png")
+async def admin_floorplan_support_mask(map_id: str) -> FileResponse:
+    assets = Path(__file__).resolve().parent / "assets" / "floorplans"
+    metadata_path = assets / f"{map_id}.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=404, detail="Floorplan not found")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    support_path = assets / str(metadata.get("support_mask_file") or "")
+    if not support_path.exists():
+        raise HTTPException(status_code=404, detail="Support mask not found")
+    return FileResponse(support_path, media_type="image/png")
 
 
 @app.get("/api/admin/tasks")
@@ -4673,25 +6144,30 @@ async def get_videos_list():
         return {"success": False, "videos": [], "error": str(e)}
 
 @app.get("/api/video/{video_id}")
-async def get_video_analysis(video_id: str):
+async def get_video_analysis(video_id: str, full: bool = Query(False)):
     """Get analysis results for a specific video"""
     try:
         analysis_file = OUTPUT_DIR / f"{video_id}_analysis.json"
         if not analysis_file.exists():
             raise HTTPException(status_code=404, detail="Analysis not found")
 
-        import json
-        with open(analysis_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        def _read_payload() -> Dict[str, Any]:
+            with open(analysis_file, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+
+        data = await asyncio.to_thread(_read_payload)
+        result = data.get("analysis_result") or {}
+        if not full:
+            result = _slim_analysis_result(result)
 
         return {
             "success": True,
-            "data": data["analysis_result"],
+            "data": result,
             "video_info": {
-                "filename": data["original_filename"],
-                "scale_factor": data["scale_factor"],
-                "stabilized": data["stabilized"]
-            }
+                "filename": data.get("original_filename"),
+                "scale_factor": data.get("scale_factor"),
+                "stabilized": data.get("stabilized"),
+            },
         }
     except HTTPException:
         raise

@@ -14,6 +14,36 @@ async function agentFetch(input: RequestInfo | URL, init?: RequestInit): Promise
   return globalThis.fetch(input, init);
 }
 
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function fetchWithTransientRetry(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+  attempts: number = 4,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await agentFetch(input, init);
+      if (!RETRYABLE_HTTP_STATUSES.has(response.status) || attempt >= attempts) {
+        return response;
+      }
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) {
+        throw error;
+      }
+    }
+    await delay(Math.min(15000, 1000 * 2 ** (attempt - 1)));
+  }
+  throw lastError instanceof Error ? lastError : new Error("Сетевая ошибка");
+}
+
 function isDesktopClient(): boolean {
   if (typeof window === 'undefined') return false;
   const trackai = (window as unknown as { trackai?: { isDesktop?: boolean } }).trackai;
@@ -41,6 +71,21 @@ export interface VideoAnalysisResult {
     method: string;
     trajectory: number[][];
     map_trajectory?: number[][];
+    graph_first_trajectory?: number[][];
+    graph_first_segments?: Array<{
+      start_index: number;
+      end_index: number;
+      status: "confirmed" | "uncertain";
+      edge_ids?: string[];
+    }>;
+    graph_first_metadata?: Record<string, unknown>;
+    graph_first_uncertainty?: {
+      marker?: number[] | null;
+      competing_next_edges?: Array<{
+        edge_id: string;
+        points: number[][];
+      }>;
+    };
     map_trajectory_timestamps_seconds?: number[];
     map_trajectory_source_fractions?: number[];
     floorplan_constraint?: Record<string, unknown>;
@@ -109,6 +154,49 @@ export interface VideoAnalysisResult {
   message: string;
 }
 
+export interface FloorplanGraphNode {
+  id: string;
+  kind: 'junction' | 'endpoint' | 'manual';
+  x: number;
+  y: number;
+  degree: number;
+  enabled: boolean;
+}
+
+export interface FloorplanGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  points: number[][];
+  length_meters: number;
+  minimum_width_meters: number | null;
+  median_width_meters: number | null;
+  bidirectional: boolean;
+  enabled: boolean;
+  source_edge_id?: string;
+  source_segment_index?: number;
+}
+
+export interface FloorplanTopologyGraph {
+  schema_version: 'trackai.floorplan_graph.v1';
+  map_id: string;
+  coordinate_system: 'plan_pixels_x_right_y_down';
+  width: number;
+  height: number;
+  meters_per_pixel: number;
+  source: Record<string, string | number | boolean | null>;
+  nodes: FloorplanGraphNode[];
+  edges: FloorplanGraphEdge[];
+  validation: Record<string, number>;
+  production_validation?: {
+    file_sha256: string;
+    expected_file_sha256: string;
+    file_sha256_matches: boolean;
+    geometry_sha256: string;
+    embedded_geometry_sha256?: string | null;
+  };
+}
+
 export type R3TrajectorySource = "raw" | "robust_candidate" | "scale_aware_candidate";
 
 export interface TrackingOptions {
@@ -123,6 +211,7 @@ export interface MapContext {
   drawn_plan?: unknown[] | null;
   reference_point?: { x: number; y: number } | null;
   direction_point?: { x: number; y: number } | null;
+  queue_inherit_anchor?: boolean;
   batch_id?: string | null;
   batch_size?: number | null;
   employee_name?: string | null;
@@ -133,11 +222,17 @@ export interface MapContext {
 export interface VideoListItem {
   video_id: string;
   filename: string;
+  original_filename?: string;
   uploaded_at: string;
   file_size: number;
   scale_factor: number;
   stabilized: boolean;
   has_analysis: boolean;
+  status?: string;
+  progress?: number;
+  message?: string;
+  client_source?: string | null;
+  updated_at?: string;
 }
 
 export interface Plan {
@@ -256,7 +351,8 @@ export class ApiClient {
     employeeName?: string,
     analysisMethod?: 'slam' | 'r3' | 'lingbot',
     r3Options?: { frame_stride?: number; max_frames?: number; ckpt?: string; size?: number; mode?: string },
-    forceReprocess: boolean = false
+    forceReprocess: boolean = false,
+    queueOptions?: { queue_id?: string; sequence_index?: number },
   ): Promise<VideoAnalysisResult> {
     const body: Record<string, unknown> = {
       video_id: videoId,
@@ -275,6 +371,12 @@ export class ApiClient {
       analysis_method: analysisMethod || 'slam',
       force_reprocess: forceReprocess,
     };
+    if (queueOptions?.queue_id) {
+      body.queue_id = queueOptions.queue_id;
+      if (typeof queueOptions.sequence_index === "number") {
+        body.sequence_index = queueOptions.sequence_index;
+      }
+    }
     if (analysisMethod === 'r3') {
       body.frame_stride = r3Options?.frame_stride ?? 3;
       body.max_frames = r3Options?.max_frames ?? 2000;
@@ -288,11 +390,20 @@ export class ApiClient {
       body.lingbot_mask_sky = false;
     }
 
-    const response = await agentFetch(`${this.baseUrl}/api/analyze-video-by-id`, {
+    const analyzeInit: RequestInit = {
       method: 'POST',
       headers: clientHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(body),
-    });
+    };
+    const timeoutMs = isDesktopClient() ? 60_000 : 180_000;
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      analyzeInit.signal = AbortSignal.timeout(timeoutMs);
+    }
+    const response = await fetchWithTransientRetry(
+      `${this.baseUrl}/api/analyze-video-by-id`,
+      analyzeInit,
+      isDesktopClient() ? 2 : 1,
+    );
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
@@ -451,6 +562,61 @@ export class ApiClient {
     return response.json();
   }
 
+  async generateFloorplanTopologyGraph(
+    mapId: string,
+    minimumEdgeMeters = 1.5,
+    graphScalePixels = 8,
+  ): Promise<FloorplanTopologyGraph> {
+    const query = new URLSearchParams({
+      minimum_edge_meters: String(minimumEdgeMeters),
+      graph_scale_pixels: String(graphScalePixels),
+    });
+    const response = await agentFetch(
+      `${this.baseUrl}/api/admin/floorplans/${mapId}/topology-graph?${query}`,
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || 'Не удалось построить граф проходов');
+    }
+    return response.json();
+  }
+
+  async getProductionFloorplanTopologyGraph(
+    mapId: string,
+  ): Promise<FloorplanTopologyGraph> {
+    const response = await agentFetch(
+      `${this.baseUrl}/api/admin/floorplans/${mapId}/topology-graph/production`,
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || 'Не удалось загрузить production-граф');
+    }
+    return response.json();
+  }
+
+  async saveProductionFloorplanTopologyGraph(
+    mapId: string,
+    graph: FloorplanTopologyGraph,
+  ): Promise<FloorplanTopologyGraph> {
+    const response = await agentFetch(
+      `${this.baseUrl}/api/admin/floorplans/${mapId}/topology-graph/production`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(graph),
+      },
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || 'Не удалось сохранить production-граф');
+    }
+    return response.json();
+  }
+
+  getFloorplanSupportMaskUrl(mapId: string): string {
+    return `${this.baseUrl}/api/admin/floorplans/${mapId}/support-mask.png`;
+  }
+
   async getAdminTask(id: string): Promise<TrackingTask> {
     const response = await agentFetch(`${this.baseUrl}/api/admin/tasks/${id}`);
     if (!response.ok) {
@@ -605,10 +771,24 @@ export class ApiClient {
     suppress_disk_completion?: boolean;
     result?: VideoAnalysisResult["data"];
   }> {
-    const response = await agentFetch(`${this.baseUrl}/api/status/${videoId}`);
+    const response = await agentFetch(`${this.baseUrl}/api/processing-status/${videoId}`);
     if (!response.ok) {
-      // If status endpoint returns 404 or other error, return default unknown status
-      return { status: "unknown", progress: 0, message: "Status not available" };
+      try {
+        const list = await this.getUploadedVideosList();
+        const video = (list.videos || []).find((item) => item.video_id === videoId);
+        if (video) {
+          const status = String(video.status || "registered");
+          const progress = Number(video.progress || 0);
+          return {
+            status,
+            progress: Number.isFinite(progress) ? progress : 0,
+            message: video.message || (status === "registered" ? "Выгружается на сервер" : `Сервер: ${status}`),
+          };
+        }
+      } catch {
+        // Fall through to a neutral status below.
+      }
+      return { status: "registered", progress: 0, message: "Выгружается на сервер" };
     }
     return response.json();
   }
@@ -900,6 +1080,21 @@ export class ApiClient {
     /** Cleaned c2w translations for Three.js only; never use these as map X/Y. */
     raw_trajectory_3d?: number[][];
     map_trajectory?: number[][];
+    graph_first_trajectory?: number[][];
+    graph_first_segments?: Array<{
+      start_index: number;
+      end_index: number;
+      status: "confirmed" | "uncertain";
+      edge_ids?: string[];
+    }>;
+    graph_first_metadata?: Record<string, unknown>;
+    graph_first_uncertainty?: {
+      marker?: number[] | null;
+      competing_next_edges?: Array<{
+        edge_id: string;
+        points: number[][];
+      }>;
+    };
     map_trajectory_timestamps_seconds?: number[];
     map_trajectory_source_fractions?: number[];
     map_turn_points?: Array<Record<string, unknown>>;
@@ -984,6 +1179,21 @@ export class ApiClient {
     raw_plan_trajectory?: number[][];
     raw_trajectory_3d?: number[][];
     map_trajectory?: number[][];
+    graph_first_trajectory?: number[][];
+    graph_first_segments?: Array<{
+      start_index: number;
+      end_index: number;
+      status: "confirmed" | "uncertain";
+      edge_ids?: string[];
+    }>;
+    graph_first_metadata?: Record<string, unknown>;
+    graph_first_uncertainty?: {
+      marker?: number[] | null;
+      competing_next_edges?: Array<{
+        edge_id: string;
+        points: number[][];
+      }>;
+    };
     map_trajectory_timestamps_seconds?: number[];
     map_trajectory_source_fractions?: number[];
     map_turn_points?: Array<{

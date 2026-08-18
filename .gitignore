@@ -71,3 +71,13 @@ test.txt
 test_small.txt
 outputs/
 tmp/
+
+# Local ops / debug scripts (may contain credentials)
+_*
+!.github/**
+
+# Local release artifacts
+.release/
+release-*/
+.tooling/
+_desktop_testdata/

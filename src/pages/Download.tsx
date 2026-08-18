@@ -2,15 +2,17 @@ import { Link } from "react-router-dom";
 import { Activity, ArrowLeft, Download, Monitor, Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 
-const DISPLAY_VERSION = "1.18.1";
-const WIN_INSTALLER = "TrackAI-Setup-1.18.1.exe";
+const DISPLAY_VERSION = "1.18.23";
+const WIN_INSTALLER = "TrackAI-1.18.23-win-unpacked.zip";
+const WIN_SETUP = "TrackAI-Setup-1.18.23.exe";
 const MAC_INSTALLER = "TrackAI-1.18.1.dmg";
 
 const DownloadPage = () => {
   const base = typeof window !== "undefined" ? window.location.origin : "";
   const winUrl = `${base}/downloads/${WIN_INSTALLER}`;
+  const winSetupUrl = `${base}/downloads/${WIN_SETUP}`;
   const macUrl = `${base}/downloads/${MAC_INSTALLER}`;
-  const [available, setAvailable] = useState({ win: true, mac: true });
+  const [available, setAvailable] = useState({ win: false, setup: false, mac: false });
 
   useEffect(() => {
     const check = async (url: string) => {
@@ -23,10 +25,10 @@ const DownloadPage = () => {
       }
     };
 
-    Promise.all([check(winUrl), check(macUrl)]).then(([win, mac]) => {
-      setAvailable({ win, mac });
+    Promise.all([check(winUrl), check(winSetupUrl), check(macUrl)]).then(([win, setup, mac]) => {
+      setAvailable({ win, setup, mac });
     });
-  }, [winUrl, macUrl]);
+  }, [winUrl, winSetupUrl, macUrl]);
 
   return (
     <main className="min-h-screen bg-[#07111f] text-white">
@@ -65,18 +67,31 @@ const DownloadPage = () => {
 
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
               <a
-                href={available.win ? winUrl : undefined}
-                download={available.win ? WIN_INSTALLER : undefined}
-                aria-disabled={!available.win}
+                href={available.setup ? winSetupUrl : available.win ? winUrl : undefined}
+                download={available.setup ? WIN_SETUP : available.win ? WIN_INSTALLER : undefined}
+                aria-disabled={!available.win && !available.setup}
                 className={`inline-flex h-14 items-center justify-center gap-3 rounded-xl px-7 text-base font-semibold shadow-[0_0_40px_rgba(34,211,238,0.25)] ${
-                  available.win
+                  available.win || available.setup
                     ? "bg-cyan-300 text-slate-950 hover:bg-cyan-200"
                     : "pointer-events-none border border-white/10 bg-white/5 text-slate-500 shadow-none"
                 }`}
               >
                 <Download className="h-5 w-5" />
-                {available.win ? "Скачать для Windows" : "Windows файл не загружен"}
+                {available.setup
+                  ? "Установить для Windows"
+                  : available.win
+                    ? "Скачать для Windows (ZIP)"
+                    : "Windows файл не загружен"}
               </a>
+              {(available.win || available.setup) && (
+                <p className="text-sm text-slate-400">
+                  {available.setup && available.win
+                    ? "Доступны установщик (.exe) и portable ZIP."
+                    : available.setup
+                      ? "Рекомендуется установщик (.exe)."
+                      : "Portable ZIP без установки."}
+                </p>
+              )}
               <a
                 href={available.mac ? macUrl : undefined}
                 download={available.mac ? MAC_INSTALLER : undefined}
@@ -105,7 +120,8 @@ const DownloadPage = () => {
 
               <div className="space-y-3">
                 {[
-                  ["Windows installer", WIN_INSTALLER],
+                  ["Windows setup", WIN_SETUP],
+                  ["Windows portable", WIN_INSTALLER],
                   ["macOS image", MAC_INSTALLER],
                   ["Сервер", base || "текущий домен"],
                 ].map(([label, value]) => (

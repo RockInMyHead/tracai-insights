@@ -1,7 +1,20 @@
 const fs = require('fs');
 const path = require('path');
 const { app } = require('electron');
-const { uploadFileFromPath } = require('./uploadFromPath.cjs');
+
+function loadUploadFileFromPath() {
+  const modulePath = require.resolve('./uploadFromPath.cjs');
+  delete require.cache[modulePath];
+  let uploadModule = require(modulePath);
+  if (typeof uploadModule.uploadFileFromPath !== 'function') {
+    delete require.cache[modulePath];
+    uploadModule = require(modulePath);
+  }
+  if (typeof uploadModule.uploadFileFromPath !== 'function') {
+    throw new Error('uploadFileFromPath недоступен — перезапустите TrackAI Desktop');
+  }
+  return uploadModule.uploadFileFromPath;
+}
 
 const VIDEO_EXTENSIONS = new Set([
   '.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.3gp', '.mts', '.m2ts',
@@ -29,6 +42,20 @@ const CAMERA_VOLUME_HINTS = [
   'camera',
   'dcim',
 ];
+
+function createAbortError() {
+  const error = new Error('Импорт с камеры остановлен пользователем');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function isAbortError(error) {
+  if (!error) return false;
+  if (error.name === 'AbortError' || error.code === 'ABORT_ERR') return true;
+  const message = String(error.message || error);
+  return /aborted|AbortError|остановлен пользователем|Upload cancelled/i.test(message);
+}
 
 function getStatePath() {
   return path.join(app.getPath('userData'), 'camera-import-state.json');
@@ -252,6 +279,7 @@ function createCameraImportService(options) {
     isEnabled,
     onStatus,
     onProgress,
+    onFileImported,
     onBatchComplete,
     onError,
     manualOnly = false,
@@ -259,6 +287,7 @@ function createCameraImportService(options) {
 
   let pollTimer = null;
   let importInProgress = false;
+  let importAbortController = null;
   let currentStatus = {
     enabled: false,
     scanning: false,
@@ -274,12 +303,12 @@ function createCameraImportService(options) {
     }
   };
 
-  const getPendingFiles = (volumes, state) => {
+  const getPendingFiles = (volumes, state, { ignoreImported = false } = {}) => {
     const imported = new Set(state.imported);
     const pending = [];
     for (const volume of volumes) {
       for (const file of volume.files) {
-        if (!imported.has(file.fingerprint)) {
+        if (ignoreImported || !imported.has(file.fingerprint)) {
           pending.push({ ...file, volumeName: volume.name });
         }
       }
@@ -287,7 +316,7 @@ function createCameraImportService(options) {
     return pending;
   };
 
-  const importFiles = async (files, ownerName) => {
+  const importFiles = async (files, ownerName, analysisContext = null) => {
     if (!files.length || importInProgress) return [];
     if (!ownerName?.trim()) {
       const error = new Error('Укажите имя сотрудника для автоимпорта с камеры');
@@ -298,6 +327,7 @@ function createCameraImportService(options) {
     }
 
     importInProgress = true;
+    importAbortController = new AbortController();
     currentStatus.importing = true;
     currentStatus.lastError = null;
     emitStatus();
@@ -305,12 +335,16 @@ function createCameraImportService(options) {
     const state = loadState();
     const uploaded = [];
 
+    const failedFiles = [];
     try {
       for (let index = 0; index < files.length; index += 1) {
+        if (importAbortController.signal.aborted) {
+          break;
+        }
         const file = files[index];
         if (typeof onProgress === 'function') {
           onProgress({
-            index,
+            index: index + 1,
             total: files.length,
             fileName: file.name,
             filePath: file.path,
@@ -319,53 +353,125 @@ function createCameraImportService(options) {
           });
         }
 
-        const importer = importFile || ((input) => uploadFileFromPath({ serverUrl, ...input }));
-        const result = await importer({
-          filePath: file.path,
-          fileName: file.name,
-          employeeName: ownerName.trim(),
-          onProgress: (percent) => {
-            if (typeof onProgress === 'function') {
-              onProgress({
-                index,
-                total: files.length,
-                fileName: file.name,
-                filePath: file.path,
-                percent,
-                phase: 'uploading',
-              });
-            }
-          },
-        });
+        try {
+          const importer = importFile || ((input) => loadUploadFileFromPath()({ serverUrl, ...input }));
+          const result = await importer({
+            filePath: file.path,
+            fileName: file.name,
+            employeeName: ownerName.trim(),
+            analysisContext,
+            signal: importAbortController.signal,
+            onProgress: (percent) => {
+              if (typeof onProgress === 'function') {
+                onProgress({
+                  index: index + 1,
+                  total: files.length,
+                  fileName: file.name,
+                  filePath: file.path,
+                  percent,
+                  phase: 'uploading',
+                });
+              }
+            },
+          });
 
-        state.imported.push(file.fingerprint);
-        saveState(state);
+          state.imported.push(file.fingerprint);
+          saveState(state);
 
-        uploaded.push({
-          ...result,
-          ownerName: ownerName.trim(),
-          sourcePath: file.path,
-          volumeName: file.volumeName || null,
-        });
+          uploaded.push({
+            ...result,
+            ownerName: ownerName.trim(),
+            sourcePath: file.path,
+            volumeName: file.volumeName || null,
+          });
+          if (typeof onFileImported === 'function') {
+            // Await so UI can analyze this video (and inherit plan anchor)
+            // before the next camera file starts uploading.
+            await Promise.resolve(onFileImported(uploaded[uploaded.length - 1]));
+          }
+        } catch (error) {
+          if (isAbortError(error) || importAbortController?.signal?.aborted) {
+            break;
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          failedFiles.push({ fileName: file.name, error: message });
+          currentStatus.lastError = `${file.name}: ${message}`;
+          emitStatus();
+          if (typeof onError === 'function') {
+            onError(new Error(`Не удалось загрузить ${file.name}: ${message}`));
+          }
+          // Ошибка одного файла не останавливает всю очередь.
+        }
+      }
+
+      if (importAbortController?.signal?.aborted) {
+        currentStatus.lastError = null;
+        return uploaded;
       }
 
       if (typeof onBatchComplete === 'function' && uploaded.length > 0) {
         onBatchComplete(uploaded);
       }
+
+      if (failedFiles.length > 0 && uploaded.length === 0) {
+        const summary = new Error(
+          `Не удалось загрузить видео с камеры (${failedFiles[0].fileName}: ${failedFiles[0].error})`,
+        );
+        currentStatus.lastError = summary.message;
+        emitStatus();
+        throw summary;
+      }
+
       return uploaded;
     } catch (error) {
+      if (isAbortError(error) || importAbortController?.signal?.aborted) {
+        currentStatus.lastError = null;
+        currentStatus.importing = false;
+        emitStatus();
+        return uploaded;
+      }
       currentStatus.lastError = error instanceof Error ? error.message : String(error);
       emitStatus();
-      if (typeof onError === 'function') onError(error);
+      if (typeof onError === 'function' && failedFiles.length === 0) onError(error);
       throw error;
     } finally {
       importInProgress = false;
+      importAbortController = null;
       currentStatus.importing = false;
       emitStatus();
     }
   };
 
-  const scanNow = async ({ forceImport = false } = {}) => {
+  const cancelImport = () => {
+    currentStatus.enabled = false;
+    const controller = importAbortController;
+    if (controller && !controller.signal.aborted) {
+      controller.abort(createAbortError());
+    }
+    currentStatus.lastError = null;
+    currentStatus.importing = false;
+    currentStatus.scanning = false;
+    emitStatus();
+    return { cancelled: true, wasImporting: Boolean(controller) };
+  };
+
+  const resetImportedState = () => {
+    const state = loadState();
+    const removed = state.imported.length;
+    saveState({ ...state, imported: [] });
+    currentStatus.pendingFiles = [];
+    currentStatus.lastError = null;
+    emitStatus();
+    return { reset: true, removed };
+  };
+
+  const scanNow = async ({
+    forceImport = false,
+    ignoreImported = false,
+    analysisContext = null,
+    maxFiles = 0,
+    fileNameIncludes = null,
+  } = {}) => {
     if (currentStatus.scanning) return currentStatus;
     currentStatus.scanning = true;
     currentStatus.enabled = isEnabled();
@@ -374,7 +480,14 @@ function createCameraImportService(options) {
     try {
       const volumes = scanConnectedCameraVolumes();
       const state = loadState();
-      const pendingFiles = getPendingFiles(volumes, state);
+      let allPendingFiles = getPendingFiles(volumes, state, { ignoreImported });
+      const nameFilter = typeof fileNameIncludes === 'string' ? fileNameIncludes.trim().toLowerCase() : '';
+      if (nameFilter) {
+        allPendingFiles = allPendingFiles.filter((file) => String(file.name || '').toLowerCase().includes(nameFilter));
+      }
+      const pendingFiles = Number.isFinite(maxFiles) && maxFiles > 0
+        ? allPendingFiles.slice(0, maxFiles)
+        : allPendingFiles;
 
       currentStatus.volumes = volumes.map(({ files, ...rest }) => rest);
       currentStatus.pendingFiles = pendingFiles;
@@ -384,7 +497,7 @@ function createCameraImportService(options) {
       if (isEnabled() && pendingFiles.length > 0 && (forceImport || !importInProgress)) {
         const ownerName = getOwnerName();
         if (ownerName?.trim()) {
-          await importFiles(pendingFiles, ownerName);
+          await importFiles(pendingFiles, ownerName, analysisContext);
         }
       }
 
@@ -403,6 +516,7 @@ function createCameraImportService(options) {
       return;
     }
     pollTimer = setInterval(() => {
+      if (!isEnabled()) return;
       scanNow().catch((error) => {
         currentStatus.lastError = error instanceof Error ? error.message : String(error);
         emitStatus();
@@ -431,6 +545,8 @@ function createCameraImportService(options) {
     stop,
     scanNow,
     importFiles,
+    cancelImport,
+    resetImportedState,
     setEnabled,
     getStatus: () => ({ ...currentStatus }),
   };

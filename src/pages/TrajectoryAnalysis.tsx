@@ -1139,9 +1139,22 @@ const LegacyTrajectoryAnalysisPage = () => {
 };
 
 const TrajectoryAnalysisPage = () => {
+  const hashQuery = typeof window !== "undefined"
+    ? window.location.hash.split("?")[1] || ""
+    : "";
+  const trackai = typeof window !== "undefined"
+    ? (window as unknown as { trackai?: { isDesktop?: boolean; cameraImport?: unknown }; electronAPI?: unknown }).trackai
+    : undefined;
+  const electronBridge = typeof window !== "undefined"
+    ? (window as unknown as { electronAPI?: unknown }).electronAPI
+    : undefined;
   const isDesktop = typeof window !== "undefined" && (
-    (window as unknown as { trackai?: { isDesktop?: boolean } }).trackai?.isDesktop === true
+    trackai?.isDesktop === true
+    || Boolean(trackai?.cameraImport)
+    || Boolean(electronBridge)
+    || window.location.protocol === "file:"
     || new URLSearchParams(window.location.search).get("desktop") === "1"
+    || new URLSearchParams(hashQuery).get("desktop") === "1"
   );
   return isDesktop ? <WindowsCameraDesktop /> : <LegacyTrajectoryAnalysisPage />;
 };

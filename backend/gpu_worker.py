@@ -1566,8 +1566,6 @@ async def r3_process_video(
     _reset_r3_output_dir(video_output_dir)
 
     try:
-        await _ensure_shared_gpu_for_r3(video_id)
-        # Run R³ wrapper via subprocess
         logger.info(f"[{video_id}] Starting R³ inference (frame_stride={frame_stride}, ckpt={ckpt})")
 
         conda_cmd = [
@@ -1585,13 +1583,7 @@ async def r3_process_video(
         env = os.environ.copy()
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-        result = await _run_r3_inference_subprocess(conda_cmd, env=env)
-
-        if result.returncode != 0:
-            error_src = (result.stderr or result.stdout or "").strip()
-            error_msg = error_src[-6000:]
-            logger.error(f"[{video_id}] R³ failed: {error_msg}")
-            raise Exception(f"R³ error: {error_msg}")
+        result = await _run_r3_inference_with_retry(video_id, conda_cmd, env=env)
 
         # Parse JSON output (last line with "complete" event)
         output_lines = result.stdout.strip().split("\n")
@@ -1662,7 +1654,7 @@ async def r3_process_video_raw(
         return JSONResponse(status_code=409, content={
             "success": False,
             "video_id": video_id,
-            "error": "R³ processing is already running for this video_id",
+            "error": "GPU занят: на RTX 3090 уже выполняется другой R³. Повторите через 1–2 мин.",
         })
 
     ext = Path(original_filename).suffix or ".mp4"
@@ -1693,7 +1685,6 @@ async def r3_process_video_raw(
     _reset_r3_output_dir(video_output_dir)
 
     try:
-        await _ensure_shared_gpu_for_r3(video_id)
         logger.info(f"[{video_id}] Starting R³ inference (frame_stride={frame_stride}, ckpt={ckpt})")
 
         conda_cmd = [
@@ -1711,12 +1702,7 @@ async def r3_process_video_raw(
         env = os.environ.copy()
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-        result = await _run_r3_inference_subprocess(conda_cmd, env=env)
-
-        if result.returncode != 0:
-            error_src = (result.stderr or result.stdout or "").strip()
-            error_msg = error_src[-6000:]
-            raise Exception(f"R³ error: {error_msg}")
+        result = await _run_r3_inference_with_retry(video_id, conda_cmd, env=env)
 
         output_lines = result.stdout.strip().split("\n")
         final_result = None
@@ -1771,6 +1757,7 @@ async def r3_process_video_raw(
 _r3_active_processes: Dict[str, subprocess.Popen] = {}
 _r3_active_lock = threading.Lock()
 _r3_busy_video_ids: Set[str] = set()
+_r3_gpu_slot_owner: Optional[str] = None
 _R3_MIN_FREE_VRAM_MIB = int(os.getenv("R3_MIN_FREE_VRAM_MIB", "8000"))
 
 
@@ -1790,8 +1777,14 @@ def _gpu_free_vram_mib() -> int:
 
 
 def _stop_lingbot_batch_jobs() -> None:
-    """Stop LingBot batch_demo jobs that block R³ on the shared RTX 3090."""
-    for pattern in ("demo_render/batch_demo.py", "lingbot-map/demo_render/batch_demo.py"):
+    """Stop LingBot jobs that block R³ on the shared RTX 3090."""
+    for pattern in (
+        "demo_render/batch_demo.py",
+        "lingbot-map/demo_render/batch_demo.py",
+        "lingbot_worker/service.py",
+        "lingbot_adapter.py",
+        "lingbot-map",
+    ):
         try:
             subprocess.run(
                 ["pkill", "-f", pattern],
@@ -1804,43 +1797,91 @@ def _stop_lingbot_batch_jobs() -> None:
             pass
 
 
-async def _ensure_shared_gpu_for_r3(video_id: str, *, min_free_mib: Optional[int] = None) -> None:
+def _is_r3_oom_error(error: Exception | str) -> bool:
+    text = str(error)
+    return "OutOfMemoryError" in text or "CUDA out of memory" in text.lower()
+
+
+async def _ensure_shared_gpu_for_r3(
+    video_id: str,
+    *,
+    min_free_mib: Optional[int] = None,
+    aggressive: bool = False,
+) -> None:
+    """Free shared GPU memory before R³ — always stops LingBot, not only when VRAM looks low."""
     required = _R3_MIN_FREE_VRAM_MIB if min_free_mib is None else int(min_free_mib)
-    free = _gpu_free_vram_mib()
-    if free >= required:
-        return
-    logger.warning(
-        f"[{video_id}] GPU VRAM low ({free} MiB free, need {required}); stopping LingBot batch jobs"
+    logger.info(
+        f"[{video_id}] Preparing shared GPU for R³ (need ≥{required} MiB free, aggressive={aggressive})"
     )
     await asyncio.to_thread(_stop_lingbot_batch_jobs)
-    for _ in range(15):
-        await asyncio.sleep(2.0)
+    if aggressive:
+        await asyncio.sleep(4.0)
+    loops = 20 if aggressive else 8
+    for i in range(loops):
         free = _gpu_free_vram_mib()
         if free >= required:
-            logger.info(f"[{video_id}] GPU VRAM recovered to {free} MiB")
+            logger.info(f"[{video_id}] GPU VRAM ready: {free} MiB free")
             return
+        if i == 0 or (i + 1) % 4 == 0:
+            logger.info(f"[{video_id}] Waiting for GPU VRAM ({max(free, 0)} MiB free, need {required})...")
+        await asyncio.sleep(2.0)
+    free = _gpu_free_vram_mib()
+    borderline = max(6000, int(required * 0.75))
+    if free >= borderline:
+        logger.warning(f"[{video_id}] Starting R³ with borderline VRAM: {max(free, 0)} MiB free")
+        return
     raise RuntimeError(
         f"GPU занят: свободно {max(free, 0)} MiB, нужно ≥{required} MiB. "
-        "LingBot занял видеопамять — дождитесь завершения или перезапустите GPU worker."
+        "LingBot или предыдущий R³ заняли видеопамять — повторите через 1–2 мин."
     )
+
+
+async def _run_r3_inference_with_retry(
+    video_id: str,
+    conda_cmd: list[str],
+    *,
+    env: Dict[str, str],
+    attempts: int = 2,
+) -> subprocess.CompletedProcess[str]:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max(1, attempts) + 1):
+        await _ensure_shared_gpu_for_r3(video_id, aggressive=attempt > 1)
+        result = await _run_r3_inference_subprocess(conda_cmd, env=env)
+        if result.returncode == 0:
+            return result
+        error_src = (result.stderr or result.stdout or "").strip()
+        error_msg = error_src[-6000:]
+        last_error = Exception(f"R³ error: {error_msg}")
+        if attempt < attempts and _is_r3_oom_error(error_msg):
+            logger.warning(
+                f"[{video_id}] R³ OOM on attempt {attempt}/{attempts}, retrying after GPU cleanup"
+            )
+            await asyncio.sleep(6.0)
+            continue
+        raise last_error
+    raise last_error or Exception("R³ inference failed")
 
 
 def _format_r3_failure(error: Exception) -> str:
     text = str(error)
-    if "OutOfMemoryError" in text or "CUDA out of memory" in text:
+    if _is_r3_oom_error(text):
         free = _gpu_free_vram_mib()
         return (
-            "Недостаточно VRAM на GPU для R³"
-            f" (свободно ~{max(free, 0)} MiB). "
-            "Скорее всего параллельно работает LingBot — повторите анализ через 1–2 мин."
+            "Не хватило VRAM для R³"
+            f" (сейчас свободно ~{max(free, 0)} MiB). "
+            "GPU мог быть занят LingBot или предыдущим роликом — повторите анализ через 1–2 мин."
         )
     return text
 
 
 def _r3_try_mark_busy(video_id: str) -> bool:
+    global _r3_gpu_slot_owner
     with _r3_active_lock:
+        if _r3_gpu_slot_owner is not None and _r3_gpu_slot_owner != video_id:
+            return False
         if video_id in _r3_busy_video_ids:
             return False
+        _r3_gpu_slot_owner = video_id
         _r3_busy_video_ids.add(video_id)
         return True
 
@@ -1851,8 +1892,11 @@ def _r3_is_busy(video_id: str) -> bool:
 
 
 def _r3_clear_busy(video_id: str) -> None:
+    global _r3_gpu_slot_owner
     with _r3_active_lock:
         _r3_busy_video_ids.discard(video_id)
+        if _r3_gpu_slot_owner == video_id:
+            _r3_gpu_slot_owner = None
 
 
 async def _run_r3_inference_subprocess(

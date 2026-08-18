@@ -339,7 +339,9 @@ const TrajectoryMap = ({ trajectory, turnPoints, trajectories, stats, floorPlan,
           autoFitScale = fitted;
         }
       }
-      const renderScale = trajScale * (dataScale > 0 ? dataScale : 1);
+      const renderScale = data.r3AutoFitToPlan
+        ? (dataScale > 0 ? dataScale : 1)
+        : trajScale * (dataScale > 0 ? dataScale : 1);
       const finalRenderScale = renderScale * autoFitScale;
 
       let transformed: { x: number; y: number; z?: number }[] = [];
